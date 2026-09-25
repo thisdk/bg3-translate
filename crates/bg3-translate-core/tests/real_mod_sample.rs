@@ -4,22 +4,59 @@
 //! 这个测试就是从真实样本里发现「`meta.lsx` 的 `Name` 其实是模块内部标识符
 //! （`GustavDev`），类型同样是 `LSString`，翻译它会让 MOD 失效」之后补上的。
 //!
-//! 样本缺失时自动跳过（不影响本地开发），CI 上样本随仓库一起 checkout。
+//! 样本缺失时**直接失败**，不再 `eprintln!` 后跳过：样本
+//! （`samples/Appearance Edit Enhanced-899-3-1-3-1769898497.zip`）随仓库提交且
+//! 非 Git LFS，缺失只可能是 checkout 不完整 —— 跳过会让这 4 个真实数据用例
+//! 静默变空，而 `cargo test` 依然全绿。
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use bg3_translate_core::translation::{check_fidelity, is_faithful};
 use bg3_translate_core::types::{PakFileKind, TranslationEntry};
 use bg3_translate_core::{formats, pak};
 
 const SAMPLE_ZIP: &str = "samples/Appearance Edit Enhanced-899-3-1-3-1769898497.zip";
 
-fn sample_zip() -> Option<PathBuf> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()?
-        .parent()?
-        .join(SAMPLE_ZIP);
-    path.is_file().then_some(path)
+/// 真实样本路径；缺失即测试失败（附可操作提示）。
+fn sample_zip() -> PathBuf {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("crate 应位于 <repo>/crates/bg3-translate-core");
+    sample_zip_at(repo_root)
+}
+
+/// 在指定仓库根目录下找样本（抽出来是为了能测「缺失时必须炸」这条防线本身）。
+fn sample_zip_at(repo_root: &Path) -> PathBuf {
+    let path = repo_root.join(SAMPLE_ZIP);
+    assert!(
+        path.is_file(),
+        "真实样本缺失：{}。该文件随仓库提交（非 Git LFS），缺失说明 checkout 不完整；\
+         请执行 `git checkout -- samples/` 或重新 clone 后重跑 \
+         `cargo test -p bg3-translate-core --all-targets`。",
+        path.display()
+    );
+    path
+}
+
+/// 这条测试是「测试防线」的防线：样本缺失必须炸，而不是静默跳过。
+///
+/// 这个用例会往 stderr 打一行 panic 信息：那是被 `catch_unwind` 捕获的预期输出。
+#[test]
+fn missing_sample_fails_loudly_instead_of_skipping() {
+    let panic = std::panic::catch_unwind(|| sample_zip_at(Path::new("/definitely/not/a/repo")))
+        .expect_err("样本缺失必须 panic");
+    let message = panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_string()))
+        .unwrap_or_default();
+    assert!(message.contains("真实样本缺失"), "实际: {message}");
+    assert!(
+        message.contains("git checkout -- samples/"),
+        "提示必须可操作: {message}"
+    );
 }
 
 fn read_all(work_dir: &Path, name: &str, kind: PakFileKind) -> Vec<TranslationEntry> {
@@ -29,10 +66,7 @@ fn read_all(work_dir: &Path, name: &str, kind: PakFileKind) -> Vec<TranslationEn
 
 #[test]
 fn real_nexus_mod_unpacks_and_classifies_correctly() {
-    let Some(zip) = sample_zip() else {
-        eprintln!("跳过：未找到 {SAMPLE_ZIP}");
-        return;
-    };
+    let zip = sample_zip();
     let tmp = tempfile::tempdir().unwrap();
     let (_work_dir, files) = pak::open_and_extract_in(zip.to_str().unwrap(), tmp.path()).unwrap();
 
@@ -76,10 +110,7 @@ fn real_nexus_mod_unpacks_and_classifies_correctly() {
 
 #[test]
 fn real_localization_files_read_without_errors() {
-    let Some(zip) = sample_zip() else {
-        eprintln!("跳过：未找到 {SAMPLE_ZIP}");
-        return;
-    };
+    let zip = sample_zip();
     let tmp = tempfile::tempdir().unwrap();
     let (work_dir, files) = pak::open_and_extract_in(zip.to_str().unwrap(), tmp.path()).unwrap();
 
@@ -112,12 +143,186 @@ fn real_localization_files_read_without_errors() {
     );
 }
 
+/// 结构保真校验在**真实文本 + 真实富文本形态**上不许误报。
+///
+/// 语料 = 真实样本里 41 条原文，各自套上几种真实 MOD 里常见的标记形态
+/// （`<LSTag Type=... Tooltip=...>`、`<i>`、`<b>`、`<br/>`、`{1}`、比较用的 `<`）。
+/// 对每条语料做三种**合法翻译**，三种都必须判为保真：
+/// 1. 只翻正文，标记逐字照抄；
+/// 2. 把译文里的 `<` 重新转义成 `&lt;`（解析层本来也还原过一次，不算结构变化）；
+/// 3. 连标签属性值一起翻译（系统 prompt 不允许，但属性值本来就不参与结构比较）。
+///
+/// 这是"接进主流程前先证明不会误报"的证据；断言失败会直接打印原文与问题。
+#[test]
+fn realistic_translations_are_never_flagged_by_structure_check() {
+    let sources = real_sample_sources();
+    assert!(sources.len() >= 40, "真实样本条目太少: {}", sources.len());
+
+    let mut variants_checked = 0usize;
+    let mut translations_checked = 0usize;
+    for source in &sources {
+        for variant in markup_variants(source) {
+            variants_checked += 1;
+            let translated = keep_markup_translate_text(&variant);
+            let candidates = [
+                ("保留标记", translated.clone()),
+                ("转义尖括号", escape_angle_brackets(&translated)),
+                ("改写属性值", rewrite_attribute_values(&translated)),
+            ];
+            for (label, candidate) in candidates {
+                translations_checked += 1;
+                if !is_faithful(&variant, &candidate) {
+                    let issues = check_fidelity(&variant, &candidate);
+                    panic!(
+                        "[{label}] 真实文本被误报: {variant:?} → {candidate:?}，问题: {issues:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    assert!(variants_checked >= 240, "语料太少: {variants_checked}");
+    assert!(
+        translations_checked >= 700,
+        "检查过的译文太少: {translations_checked}"
+    );
+}
+
+/// 真实样本里所有可翻译条目的原文。
+fn real_sample_sources() -> Vec<String> {
+    let zip = sample_zip();
+    let tmp = tempfile::tempdir().unwrap();
+    let (work_dir, files) = pak::open_and_extract_in(zip.to_str().unwrap(), tmp.path()).unwrap();
+
+    let mut sources = Vec::new();
+    for file in files.iter().filter(|f| f.kind.is_translatable()) {
+        for entry in read_all(&work_dir, &file.name, file.kind) {
+            if !entry.source.trim().is_empty() {
+                sources.push(entry.source);
+            }
+        }
+    }
+    sources
+}
+
+/// 真实 MOD 里常见的富文本 / 占位符形态（拿真实原文当正文）。
+fn markup_variants(source: &str) -> Vec<String> {
+    vec![
+        source.to_string(),
+        format!(r#"<LSTag Type="Spell" Tooltip="Deals {{1}} damage">{source}</LSTag>"#),
+        format!("<i>{source}</i> 造成 {{1}} 点伤害"),
+        format!("<b>{source}</b><br/>{{2}}"),
+        format!("{source} (HP < 5%)"),
+        format!("{source} (HP &lt; 5%)"),
+    ]
+}
+
+/// 朴素版「保留标记、翻译正文」：标签与占位符原样拷贝，其余字符换成 `译`。
+///
+/// 刻意不复用 `fidelity` 的内部扫描器 —— 两边独立，才能互相验证。
+fn keep_markup_translate_text(source: &str) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let mut out = String::new();
+    let mut index = 0usize;
+    while index < chars.len() {
+        match chars[index] {
+            '<' | '{' => {
+                let closer = if chars[index] == '<' { '>' } else { '}' };
+                match chars[index..].iter().position(|c| *c == closer) {
+                    Some(offset) => {
+                        out.extend(&chars[index..=index + offset]);
+                        index += offset + 1;
+                    }
+                    None => {
+                        out.push(chars[index]);
+                        index += 1;
+                    }
+                }
+            }
+            _ => {
+                // 一整个中文词块只留一个字符，避免输出过长
+                if !out.ends_with('译') {
+                    out.push('译');
+                }
+                index += 1;
+            }
+        }
+    }
+    out
+}
+
+/// 把译文里的尖括号重新转义成实体（模型偶尔会这么干）。
+fn escape_angle_brackets(text: &str) -> String {
+    text.replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// 改写每个标签的属性值 —— 属性值不参与结构比较，不该因此判失败。
+///
+/// 注意占位符必须原样保留：`Tooltip="Deals {1} damage"` 里的 `{1}` 是给游戏填参数的，
+/// 属性值可以重写，但把它丢了就是真的结构损坏（`fidelity` 会、也应该报出来）。
+fn rewrite_attribute_values(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find('<') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start..];
+        let Some(end) = after.find('>') else {
+            out.push_str(after);
+            return out;
+        };
+        let trimmed = after[1..end].trim();
+        out.push('<');
+        if let Some(name) = trimmed.strip_prefix('/') {
+            // 结束标签没有属性
+            out.push('/');
+            out.push_str(name.trim());
+        } else {
+            let self_closing = trimmed.ends_with('/');
+            let body = trimmed.trim_end_matches('/').trim_end();
+            let (name, attrs) = match body.find(char::is_whitespace) {
+                Some(idx) => (&body[..idx], &body[idx..]),
+                None => (body, ""),
+            };
+            out.push_str(name);
+            if !attrs.trim().is_empty() {
+                out.push(' ');
+                out.push_str(&keep_placeholders(attrs));
+            }
+            if self_closing {
+                out.push('/');
+            }
+        }
+        out.push('>');
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// 把除 `{...}` 占位符之外的内容整体压成一个 `字`。
+fn keep_placeholders(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::new();
+    let mut index = 0usize;
+    while index < chars.len() {
+        if chars[index] == '{' {
+            if let Some(offset) = chars[index..].iter().position(|c| *c == '}') {
+                out.extend(&chars[index..=index + offset]);
+                index += offset + 1;
+                continue;
+            }
+        }
+        if !out.ends_with('字') {
+            out.push('字');
+        }
+        index += 1;
+    }
+    out
+}
+
 #[test]
 fn real_meta_lsx_name_is_not_translatable() {
-    let Some(zip) = sample_zip() else {
-        eprintln!("跳过：未找到 {SAMPLE_ZIP}");
-        return;
-    };
+    let zip = sample_zip();
     let tmp = tempfile::tempdir().unwrap();
     let (work_dir, _) = pak::open_and_extract_in(zip.to_str().unwrap(), tmp.path()).unwrap();
 
@@ -146,10 +351,7 @@ fn real_meta_lsx_name_is_not_translatable() {
 
 #[test]
 fn real_mod_survives_translate_write_repack_roundtrip() {
-    let Some(zip) = sample_zip() else {
-        eprintln!("跳过：未找到 {SAMPLE_ZIP}");
-        return;
-    };
+    let zip = sample_zip();
     let tmp = tempfile::tempdir().unwrap();
     let work_root = tmp.path().join("work");
     fs::create_dir_all(&work_root).unwrap();

@@ -38,6 +38,35 @@
 
 如果某个 MOD 有特殊语境，可以在翻译界面里填一条提示，模型会按这个方向处理。
 
+### 占位符和标签：写回前会校验结构
+
+提示词里要求模型原样保留 `{1}` 这类占位符和 `<LSTag ...>` 这类富文本标签，
+现在拿到译文后还会**真的校验一遍结构**，不合格不会被当成成功译文：
+
+- **比什么**：比的是原文与译文的**结构签名**——占位符（`{1}` / `{10}` / `{name}`）
+  的多重集，加上白名单富文本标签（`<LSTag>` / `</LSTag>` / `<br/>`）的标签名序列。
+  属性值改了、标签之间的正文被翻译了都不算问题：只比结构，不比内容。
+  占位符顺序不算问题（`{1} {2}` ↔ `{2} {1}` 保真）；缺一处 / 多一处 / 重复，
+  以及标签的顺序或嵌套与原文不同，都算问题。
+- **怎么处理**：第一次拿到结构不合格的译文，会带上具体原因（例如「上一轮译文缺少占位符
+  `{1}`，请重新只输出译文……」）自动重试一次。这条纠错重试不占用网络重试的额度，
+  网络失败仍然是 500ms → 1000ms → 2000ms 退避、最多 3 次，语义不变。
+- **还是不合格**：该条目标记为**出错**，表格里直接显示原因
+  （形如 `大模型调用错误: 结构校验未通过：占位符 {1} 缺失（已重试 1 次）`），
+  可以单独「重试」，也可以手工改好再保存。
+- **写回 PAK 时退回原文**：能不能写回只看这一条——译文非空**且**状态不是「出错」。
+  出错条目在写回时退回原文（导出的 MOD 里该字段保持原样，等于这条没翻），
+  所以不修也不会把坏译文写进文件；手工改好并保存后状态变成「已编辑」，
+  才按你改的内容写回。（取消翻译时残留的半截流式文本，前端会回滚成「待翻译」
+  并清空译文，同样退回原文。）
+- **防误报**：`HP < 5`、`a < b`、`<5>` 这类不良好的尖括号按普通文本处理；白名单之外的
+  标签名（`<name>`、`<color>`）不算标签；`&lt;` 会先还原成字面 `<` 再比较，
+  模型把 `<` 转义回去也不会误判——代价是这种转义写法会被原样写回，
+  游戏里显示成字面 `&lt;`（这条防线拦的是结构丢失，不是转义风格）。
+- 系列变体（只差后缀的一组文本，例如 `Silver's Hair` / `Silver's Hair 9b`，
+  基础部分只翻一次再拼后缀）是在**合成后的完整译文**上逐成员校验的，
+  所以拆到后缀里的占位符同样不会漏。
+
 ### 术语表
 
 内置 102 条 BG3 官方核心译名（职业、种族、地名、角色、法术、机制……）开箱即用。
@@ -92,13 +121,14 @@ crates/bg3-translate-core/     # 纯逻辑核心，零 GUI 依赖
   src/pak.rs                   #   PAK / ZIP 解包与重打包
   src/formats/                 #   contentList XML / LSX / LOCA 三种格式
   src/glossary/                #   术语表数据、清洗、命中匹配
-  src/translation/             #   LLM 流式翻译引擎
+  src/translation/             #   LLM 流式翻译引擎（含占位符 / 标签结构保真校验）
   tests/e2e_pak_flow.rs        #   真实 PAK 的端到端闭环测试
 src-tauri/                     # Tauri 薄壳：命令层 + 事件桥 + 插件注册
 src/                           # React 前端
 docs/ARCHITECTURE.md           # 架构说明与冻结的 IPC 契约
 docs/VERIFICATION.md           # 一次独立验证的完整记录（含已知限制与无法验证项）
 scripts/check_ipc_contract.py  # 跨层契约检查（CI meta job 调用）
+scripts/verify.sh              # 一键跑完全部门禁（CI 的 core / web job 也走它）
 ```
 
 **为什么要拆 crate**：核心逻辑不依赖任何 GUI 系统库，所以在没有
@@ -106,6 +136,28 @@ webkit2gtk / gtk / dbus 的机器（以及 ubuntu-latest 的 CI）上都能直�
 `cargo test`，几十秒出结果；同时 Tauri 壳保持得很薄，命令层不做业务计算。
 
 ### 常用检查
+
+一条命令跑完本地能跑的全部质量门禁（CI 的 core / web job 走的是同一个脚本）：
+
+```bash
+bun run verify              # = bash scripts/verify.sh，六道门禁依次执行
+```
+
+依次是：跨层 IPC 契约检查 → `cargo fmt --all --check` → `cargo clippy -p bg3-translate-core --all-targets -- -D warnings`
+→ `cargo test -p bg3-translate-core --all-targets` → `bun run test` → `bun run build`（含 tsc 类型检查）。
+每道门禁都有标题与耗时，任何一道失败立刻非零退出、后面的不再跑。
+
+```bash
+bash scripts/verify.sh --core-only   # 只跑 IPC + Rust 核心（跳过前端）
+bash scripts/verify.sh --web-only    # 只跑 IPC + 前端（跳过 Rust 核心）
+bash scripts/verify.sh --no-ipc      # 跳过 IPC 契约检查（CI meta job 已单独跑）
+bash scripts/verify.sh --list        # 只打印门禁清单，不需要任何工具链
+```
+
+工具链缺失时会一次性说清楚缺什么（退出码 2）。脚本不写任何受版本控制的文件，
+产物只落在 `target/`、`dist/` 这些 gitignore 目录里。
+
+单独的某项检查：
 
 ```bash
 # 核心逻辑：不需要任何 GUI 系统库
@@ -117,6 +169,10 @@ cargo fmt --all --check
 bun run test
 bun run build
 ```
+
+Tauri 壳（`src-tauri`）依赖 webkit2gtk / gtk / dbus，多数开发机上编不了，
+所以 **不在** `verify.sh` 里：它的 `cargo check` / `clippy` 固定由 CI 的
+Windows `tauri-shell` job 负责。
 
 ### 端到端测试
 
@@ -150,18 +206,32 @@ python3 scripts/check_ipc_contract.py
 
 ## CI / 发布
 
-- `.github/workflows/ci.yml`：4 个并行 job —— 版本号一致性、核心库
-  （fmt + clippy + 单测）、前端（单测 + 构建）、Windows 上的 Tauri 壳编译检查。
+- `.github/workflows/ci.yml`：4 个并行 job。
+  - `meta`：版本号三处一致（`package.json` / `Cargo.toml` / `tauri.conf.json`，
+    并断言两个 crate 都用 `version.workspace = true` 继承，不留第四处版本号）、
+    跨层 IPC 契约检查，以及「`scripts/verify.sh` 的六道门禁没被删改」的一致性断言
+    （`--list` 毫秒级、不需要工具链）。几秒出结果，不需要 cargo / bun。
+  - `core` / `web`：直接调用 `scripts/verify.sh --core-only --no-ipc` /
+    `--web-only --no-ipc`，所以 CI 和本地跑的是同一串命令，不会各写一份慢慢漂移。
+  - `tauri-shell`：Windows 上复用 `web` 的 `dist` 制品做 `cargo check` + `clippy`。
 - `.github/workflows/release.yml`：只用 `windows-latest` 构建 NSIS + MSI + 便携版，
   整理成 4 个文件上传到 Actions 制品；打 tag 时同时创建 GitHub Release。
-  手动触发时留空 `tag_name` 就只构建、不发布。
+  手动触发时留空 `tag_name` 就只构建、不发布。发布链路上的闸门：
+  - 构建前校验标签与 `tauri.conf.json` 版本一致（`v0.2.0` ⇔ 版本 `0.2.0`）；
+  - 整理产物时按类型分别断言 `*-Portable.zip` / `*.msi` / `*-Setup.exe` /
+    `SHA256SUMS.txt` 各 ≥1（只看文件总数会漏掉「少打了一个安装包」），
+    并拒绝 0 字节产物；
+  - 发布前查标签指向：不存在则在本次构建的提交上创建，已存在但指向别的提交直接失败；
+  - 权限最小化：workflow 级 `contents: read`，只有 `publish` job 拿 `contents: write`。
 
 ---
 
 ## 备注
 
-工具会尽量保留标签、占位符、`contentuid` 和 `version`（这三样是游戏查表的句柄，
-改了就会失效），但打包前最好还是抽几条关键文本进游戏里看一眼。
+`contentuid` 和 `version` 是游戏查表的句柄，改了就会失效，工具不会动它们。
+标签与占位符除了在提示词里要求原样保留，拿到译文后还会再做一次结构校验
+（见上面「占位符和标签：写回前会校验结构」）：校验不过的条目标成「出错」，
+打包时退回原文而不是写回那条译文。不过打包前最好还是抽几条关键文本进游戏里看一眼。
 
 `.lsx` 里只翻译白名单字段（`Description` / `DisplayName` / `Title` / `Tooltip` /
 `TooltipDescription`）且类型必须是 `LSString` / `LSWString`。

@@ -206,14 +206,30 @@ impl TranslationEntry {
         !self.source.trim().is_empty() && self.target.trim().is_empty()
     }
 
-    /// 是否有可用译文（供写回使用）。
+    /// 是否有译文文本（**不代表可以写回**，见 [`Self::has_writable_target`]）。
     pub fn has_target(&self) -> bool {
         !self.target.trim().is_empty()
     }
 
-    /// 写回时使用的文本：优先译文，译文为空则保留原文。
+    /// 是否有「可以写回 PAK」的译文：`target` 非空 **且** 状态不是 [`TranslationStatus::Error`]。
+    ///
+    /// 为什么必须看状态：结构保真校验失败（或网络中断）时条目会被置为 `error`，
+    /// 但 `target` 里仍留着被拒译文 / 半截流式文本（前端要展示给用户看）。
+    /// 用户不点「重试失败」直接打包时，如果写回只看「target 非空」，坏译文
+    /// （漏 `{1}`、漏标签、两轮拼接）就会照样进 PAK —— 正是保真防线要拦的东西。
+    ///
+    /// 人工编辑过的条目状态会变成 [`TranslationStatus::Edited`]，不受影响，
+    /// 因此「翻译失败 → 手动改好 → 打包」这条路仍然通。
+    pub fn has_writable_target(&self) -> bool {
+        self.has_target() && self.status != TranslationStatus::Error
+    }
+
+    /// 写回时使用的文本：有可写回的译文用译文，否则保留原文。
+    ///
+    /// `error` 条目一律退回原文 —— 写回链路（content_list / loca / lsx）
+    /// 都只看这个方法，所以「坏译文不进 PAK」这条不变量只在这里定义一次。
     pub fn effective_text(&self) -> &str {
-        if self.has_target() {
+        if self.has_writable_target() {
             &self.target
         } else {
             &self.source
@@ -513,6 +529,63 @@ mod tests {
         entry.mark_error("boom");
         assert_eq!(entry.status, TranslationStatus::Error);
         assert_eq!(entry.error.as_deref(), Some("boom"));
+        // target 留着给用户看，但已经不算「可写回」了（F-01）
+        assert!(entry.has_target());
+        assert!(!entry.has_writable_target());
+        assert_eq!(entry.effective_text(), "Hello");
+    }
+
+    /// F-01：`error` 条目没有「可写回的译文」，写回文本退回原文；
+    /// 人工编辑（`edited`）后照常写回。
+    #[test]
+    fn error_entries_have_no_writable_target() {
+        let mut entry = TranslationEntry::new("f.loca", "h1", "1", "Deals {1} damage");
+        entry.mark_translated("造成伤害"); // 漏占位符的坏译文
+        assert!(entry.has_target());
+        assert!(entry.has_writable_target());
+        assert_eq!(entry.effective_text(), "造成伤害");
+
+        entry.mark_error("结构校验未通过：占位符 {1} 缺失（已重试 1 次）");
+        assert!(entry.has_target(), "target 仍要保留，前端展示被拒译文");
+        assert!(!entry.has_writable_target(), "error 条目不得写回");
+        assert_eq!(entry.effective_text(), "Deals {1} damage", "写回退回原文");
+
+        // 人工编辑抢救（前端把状态置为 edited）之后可以照常写回
+        entry.target = "造成 {1} 点伤害".into();
+        entry.status = TranslationStatus::Edited;
+        assert!(entry.has_writable_target());
+        assert_eq!(entry.effective_text(), "造成 {1} 点伤害");
+
+        // 抢救过的译文再次被判失败，同样不写回
+        entry.mark_error("又错了");
+        assert_eq!(entry.effective_text(), "Deals {1} damage");
+    }
+
+    /// 流式增量（`translating`）与空 target 的既有语义不变。
+    #[test]
+    fn writable_target_covers_all_statuses() {
+        let mut entry = TranslationEntry::new("f.loca", "h1", "1", "Fireball");
+
+        // 没有译文：退回原文
+        entry.status = TranslationStatus::Pending;
+        assert!(!entry.has_writable_target());
+        assert_eq!(entry.effective_text(), "Fireball");
+
+        // 流式中间态：行为与改动前一致（有文本就写）
+        entry.append_delta("火球");
+        assert_eq!(entry.status, TranslationStatus::Translating);
+        assert!(entry.has_writable_target());
+        assert_eq!(entry.effective_text(), "火球");
+
+        entry.mark_translated("火球术");
+        assert_eq!(entry.status, TranslationStatus::Translated);
+        assert_eq!(entry.effective_text(), "火球术");
+
+        // 只有空白字符的译文不算译文
+        entry.target = "   ".into();
+        assert!(!entry.has_target());
+        assert!(!entry.has_writable_target());
+        assert_eq!(entry.effective_text(), "Fireball");
     }
 
     #[test]

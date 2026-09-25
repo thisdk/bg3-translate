@@ -343,21 +343,28 @@ mod tests {
         assert!(glossary.delete("Not There").is_err());
     }
 
-    /// 真实 20K 官方术语表（`samples/`）；不存在时单测跳过。
-    fn real_glossary_json() -> Option<String> {
+    /// 真实 20K 官方术语表（`samples/`）内容。
+    ///
+    /// 样本随仓库提交且非 Git LFS，缺失 = checkout 不完整：这里**直接失败**
+    /// 而不是跳过 —— 跳过会让这条真实数据用例静默变空，而测试依然全绿。
+    fn real_glossary_json() -> String {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()?
-            .parent()?
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crate 应位于 <repo>/crates/bg3-translate-core")
             .join("samples/bg3-official-glossary.json");
-        path.exists().then(|| std::fs::read_to_string(&path).ok())?
+        std::fs::read_to_string(&path).unwrap_or_else(|err| {
+            panic!(
+                "真实术语表样本缺失或不可读：{}（{err}）。该文件随仓库提交（非 Git LFS），\
+                 缺失说明 checkout 不完整；请执行 `git checkout -- samples/` 或重新 clone。",
+                path.display()
+            )
+        })
     }
 
     #[test]
     fn real_glossary_import_filters_noise_but_keeps_terms() {
-        let Some(json) = real_glossary_json() else {
-            eprintln!("跳过：未找到 samples/bg3-official-glossary.json");
-            return;
-        };
+        let json = real_glossary_json();
         let raw: Glossary = serde_json::from_str(&json).unwrap();
         let cleaned = Glossary::from_json(&json).unwrap();
 

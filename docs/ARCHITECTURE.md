@@ -93,6 +93,13 @@ src-tauri/                    # 薄壳：Tauri 命令 + Channel 事件桥
 {"type":"all_done","total":100,"failed":2}
 ```
 
+事件顺序：`progress` → `delta`* → `done`（失败则 `error`，最后一定有一条 `all_done`）。
+
+**每次尝试开始时都会重发一次 `progress`**（网络退避重试、结构纠错重试各算一次新尝试）：
+前端据此把该条目的流式文本清零、重新累积，否则两轮 delta 会拼成
+`坏译文 + 好译文`（`useTranslationRun.ts` 已按此实现）。`Series` 组不推 `delta`，
+所以重试时也不额外发 `progress`；取消生效后不再发任何事件。
+
 ### `LlmSettings`
 
 ```jsonc
@@ -150,6 +157,97 @@ impl TranslationEngine {
 }
 ```
 
+### `translation` 的内部子模块拆分
+
+`engine.rs` 原本 1365 行（实现 + 测试混在一起），现在按职责拆开：
+
+| 文件 | 职责 |
+| --- | --- |
+| `translation/engine.rs` | 并发调度（`Semaphore` + `FuturesUnordered`）、事件推送、job 级 panic 隔离 |
+| `translation/engine/tests.rs` | 引擎级测试（事件序列 / 并发 / 取消 / 结构校验接线） |
+| `translation/events.rs` | `EventSink` / `CollectingSink` / `CancelToken` / 进度事件 |
+| `translation/translator.rs` | `TranslateRequest` / `TextTranslator` / `HttpTranslator`（reqwest + SSE） |
+| `translation/retry.rs` | 网络退避重试 + 结构纠错重试 + 结构校验接入点 |
+| `translation/fidelity.rs` | 译文结构保真校验（纯函数，见下节） |
+| `translation/test_support.rs` | 单测共享的假翻译器（仅 `cfg(test)`） |
+
+**公开路径与签名不变**：`engine` 把 `events` / `translator` 里的名字再导出一次，
+所以 `translation::{CancelToken, CollectingSink, EventSink, RunOptions, TextTranslator,
+TranslateRequest, TranslationEngine, TranslationSummary}` 以及
+`translation::engine::{...}` 这些拆分前的路径继续成立，`src-tauri` 无需改动。
+
+### 译文结构保真校验（`translation::fidelity`）
+
+系统 prompt 一直要求「占位符原样保留、富文本标签完整保留」，但从前的代码**从不校验**：
+模型丢了占位符 / 标签也会被当成成功译文写出去。现在每个 job 拿到译文后都会比对
+**结构签名**（只比结构，不比内容）：
+
+| 检查项 | 抓什么 | 明确不抓什么（防误报） |
+| --- | --- | --- |
+| 占位符 | `{1}` / `{10}` / `{name}` / `{user_name}` 的多重集必须一致（缺失 / 多余 / 重复都报）；顺序不计（`{1} {2}` ↔ `{2} {1}` 保真） | `{}`、`{ }`、`{a b}`、`{"k": 1}`、`{#FFAA00}`、`{-1}` 都不算占位符 |
+| 标签 | 写回白名单标签（`LSTag`/`font`/`i`/`b`/`u`/`br`/`span`/`em`/`strong`）的开 / 闭 / 空元素序列必须一致；属性值与标签内文本不参与比较 | `< 5`、`a < b`、`a < b > c`、`<5>`、`x <y` 这类比较文本；白名单外的 `<name>`/`<color>`（写回时会转义成普通文本，没有配对义务）；属性值被改写 |
+| 空元素 | `<br/>`、`<br>`、`<br />` 等价，都不要求闭合；非空元素的 `<x/>` 与 `<x></x>` 也等价（XML 语义相同） | 空元素整个丢失仍然会报；代价是非空元素「空标签」与「包住文本的标签对」也分不出来（正文位置本来就不参与比对） |
+| 实体 | `&lt;` / `&gt;` 先还原成字面尖括号再比较 | 模型把译文里的 `<` 重新转义成 `&lt;` 不算结构变化（解析层本来也还原过一次） |
+
+- **取舍**：上表「转义等价」是刻意容忍，**不等于写回安全**：模型若把真标签写成
+  `&lt;LSTag&gt;`，写回层 `write_text_fragment` 会把 `&` 再转义一次，产物里是可见的
+  `&amp;lt;LSTag&amp;gt;`（玩家看到字面量 `&lt;LSTag&gt;`）。这条防线拦的是「结构丢失」，
+  不是「转义风格」；两者都拦会误伤大量正常译文。
+- `Series` 组只翻了 base，所以校验跑在**合成后的完整译文**上（成员后缀里也可能带 `{1}`）。
+- 校验不通过 → 把具体问题拼进请求**自动重试一次**（重试前重发一次 `progress`，
+  前端据此丢弃上一轮被拒的流式文本）；仍不通过 → 按失败处理，
+  发出 `Error`（message 形如 `大模型调用错误: 结构校验未通过：占位符 {1} 缺失（已重试 1 次）`），
+  **绝不发 `Done`**，坏译文不会静默当成功。
+- 纠错重试**不占用**网络重试额度（网络仍是 1 次 + 最多 3 次退避重试），
+  仍在同一个 `Semaphore` 配额内、仍照常响应取消；事件顺序语义不变
+  （`Progress` → `Delta`* → `Done` / `Error`，最后一条 `AllDone`）。
+
+```rust
+/// 一条结构保真问题；`Display` 输出简短中文原因。
+pub enum FidelityIssue {
+    MissingPlaceholder { token: String, count: usize },
+    ExtraPlaceholder { token: String, count: usize },
+    MissingTag { tag: String, count: usize },   // tag 形如 `<LSTag>` / `</LSTag>` / `<br/>`
+    ExtraTag { tag: String, count: usize },
+    TagStructureChanged,
+}
+
+pub fn check_fidelity(source: &str, target: &str) -> Vec<FidelityIssue>;
+pub fn is_faithful(source: &str, target: &str) -> bool;
+pub fn summarize(issues: &[FidelityIssue]) -> String;         // Error 事件 message 用
+pub fn correction_hint(issues: &[FidelityIssue]) -> String;   // 纠错重试请求用
+
+/// 结构纠错重试入口：默认实现忽略提示、退回 `translate`，既有实现不需要改。
+pub trait TextTranslator {
+    fn translate_with_correction<'a>(
+        &'a self,
+        request: TranslateRequest<'a>,
+        correction: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<Option<String>>>;
+}
+```
+
+## 写回不变量：`status == error` 的条目不写译文
+
+结构校验失败（或网络中断）后条目状态是 `error`，但 `target` 里仍留着被拒译文 /
+半截流式文本（前端要展示给用户看）。写回链路因此**不能只看「target 是否非空」**，
+否则用户不点「重试失败」直接打包，坏译文照样进 PAK：
+
+| 方法（`types::TranslationEntry`） | 语义 |
+| --- | --- |
+| `has_target()` | 仅表示「target 非空」，供展示 / 统计用，**不代表能写回** |
+| `has_writable_target()` | `target` 非空 **且** `status != error`，写回的唯一闸门 |
+| `effective_text()` | 有可写回译文用译文，否则保留原文（`error` 条目一律退回原文） |
+
+- 三个格式都走这条闸门：`content_list` / `loca` 用 `effective_text()`，
+  `lsx::plan_replacements` 用 `has_writable_target()`（`error` 条目不改写字段）。
+- 人工编辑过的条目状态是 `edited`，照常写回；`error` 条目被用户手工救回后也会变成
+  `edited`，所以「翻译失败 → 手动改好 → 打包」这条路仍然通。
+- 设计取舍：`error` 状态是「这条译文不可信」的唯一信号，不引入新的字段
+  （IPC 契约不变）；代价是 `translating`（取消后残留的半截译文）仍会被写回 ——
+  该路径由前端把关：`useTranslationRun.ts` 在取消 / 收尾时把未完成条目回滚成
+  `pending` + 空 `target`。
+
 ## `glossary` 模块的公开 API
 
 ```rust
@@ -188,6 +286,12 @@ pub struct MatchedTerm { pub source: String, pub target: String }
 
 - `bg3-translate-core`：单元测试与实现同文件（`#[cfg(test)] mod tests`），
   需要临时目录时用 `tempfile`；需要 HTTP 时把请求层抽象成 trait 注入 fake。
+  翻译引擎的测试放在 `translation/engine/tests.rs`（`#[cfg(test)] mod tests;`），
+  假翻译器与断言辅助集中在 `translation/test_support.rs`。
+- 真实样本用例（`tests/real_mod_sample.rs`、`glossary::store`、`glossary::matcher`）
+  在样本缺失时**直接失败**并提示 `git checkout -- samples/`，不再 `eprintln!` 后跳过：
+  `samples/` 随仓库提交（非 Git LFS），跳过只会让真实数据用例静默变空、而 `cargo test`
+  依然全绿。`missing_sample_fails_loudly_instead_of_skipping` 专门盯着这条防线本身。
 - 端到端：`crates/bg3-translate-core/tests/e2e_pak_flow.rs` 真的造一个 PAK，跑
   「解包 → 识别类型 → 读条目 → 翻译 → 写回 → 重打包 → 再解包」的完整闭环。
 - 前端：`vitest` 测纯逻辑（路径改写、store reducer、过滤统计、虚拟滚动）。

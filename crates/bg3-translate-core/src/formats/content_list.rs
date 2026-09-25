@@ -516,6 +516,25 @@ mod tests {
         assert_eq!(reparsed.entries[0].source, "你好");
     }
 
+    /// F-01 最小复现：`status == error` + 非空 target 的条目**不得**写译文。
+    ///
+    /// 结构校验失败后前端把条目置为 `error`，但 target 里留着被拒译文（给用户看）。
+    /// 用户在界面上直接打包时，写回必须退回原文，否则坏译文照样进 PAK。
+    #[test]
+    fn write_reverts_to_source_for_error_entries() {
+        let mut entry = TranslationEntry::new("t.xml", "h1", "1", "Deals {1} damage");
+        entry.mark_translated("造成伤害"); // 漏了占位符的坏译文
+        entry.mark_error("结构校验未通过：占位符 {1} 缺失（已重试 1 次）");
+
+        let xml = render(&[entry], &[]).unwrap();
+
+        assert!(
+            xml.contains("Deals {1} damage"),
+            "error 条目必须退回原文，实际: {xml}"
+        );
+        assert!(!xml.contains("造成伤害"), "被拒译文绝不能落盘，实际: {xml}");
+    }
+
     #[test]
     fn write_preserves_bom_and_root_attributes() {
         let dir = tempfile::tempdir().unwrap();

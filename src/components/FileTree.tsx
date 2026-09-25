@@ -78,11 +78,14 @@ function TreeRow({
   depth,
   selectedPaths,
   onToggleFile,
+  onToggleFiles,
 }: {
   node: TreeNode;
   depth: number;
   selectedPaths: Set<string>;
   onToggleFile: (file: PakFile) => void;
+  /** 整组勾选/取消（只回调一次，避免逐条回调互相覆盖） */
+  onToggleFiles: (files: PakFile[], checked: boolean) => void;
 }) {
   const isFolder = node.children.size > 0;
 
@@ -108,13 +111,10 @@ function TreeRow({
           : "indeterminate";
 
     const toggleFolder = () => {
-      // indeterminate 或 unchecked → 全选；checked → 全不选
-      const targetChecked = folderState !== "checked";
-      filesInFolder.forEach((f) => {
-        const currently = selectedPaths.has(f.name);
-        if (targetChecked && !currently) onToggleFile(f);
-        if (!targetChecked && currently) onToggleFile(f);
-      });
+      // indeterminate 或 unchecked → 全选；checked → 全不选。
+      // 整组操作只回调一次：逐条调用会拿到同一份陈旧 props，
+      // 取消全选时最后一次回调会把前面的取消结果覆盖掉。
+      onToggleFiles(filesInFolder, folderState !== "checked");
     };
 
     return (
@@ -142,6 +142,7 @@ function TreeRow({
             depth={depth + 1}
             selectedPaths={selectedPaths}
             onToggleFile={onToggleFile}
+            onToggleFiles={onToggleFiles}
           />
         ))}
       </div>
@@ -233,6 +234,28 @@ export function FileTree({
     }
   };
 
+  /**
+   * 整组勾选 / 取消：一次算出结果并只回调一次。
+   * （逐条 onToggleFile 会读到同一份陈旧 props，多文件取消时会互相覆盖。）
+   */
+  const onToggleFiles = (files: PakFile[], checked: boolean) => {
+    const groupNames = new Set(files.map((f) => f.name));
+    if (!checked) {
+      onSelectionChange(selectedFiles.filter((f) => !groupNames.has(f.name)));
+      return;
+    }
+    // 已选中的保持原顺序，组内新勾选的按文件树顺序追加
+    const next = [...selectedFiles];
+    const picked = new Set(next.map((f) => f.name));
+    for (const file of files) {
+      if (!picked.has(file.name)) {
+        picked.add(file.name);
+        next.push(file);
+      }
+    }
+    onSelectionChange(next);
+  };
+
   const allSelected = locFiles.length > 0 && selectedFiles.length === locFiles.length;
   const noneSelected = selectedFiles.length === 0;
 
@@ -294,6 +317,7 @@ export function FileTree({
               depth={0}
               selectedPaths={selectedPaths}
               onToggleFile={onToggleFile}
+              onToggleFiles={onToggleFiles}
             />
           ))
         )}

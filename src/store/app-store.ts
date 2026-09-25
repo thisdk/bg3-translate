@@ -41,6 +41,15 @@ interface AppState {
   entriesByFile: EntriesByFile;
   /** entryId → fileName 反查索引，加速 delta 高频更新 */
   entryIdToFile: Record<string, string>;
+  /**
+   * entryId → 在该文件数组里的下标。
+   *
+   * 与 `entryIdToFile` 一起构成「文件 + 下标」定位，使 updateEntry /
+   * appendDelta 从 O(N) 线性扫描降为 O(1)。条目数组只做整体替换或
+   * 单元素替换（从不在中间插入/删除），所以下标保持稳定；
+   * `setFileEntries` 整体替换某个文件时会重建该文件的索引。
+   */
+  entryIdToIndex: Record<string, number>;
   // ── LLM 设置 ──
   settings: LlmSettings;
   settingsLoaded: boolean;
@@ -63,6 +72,13 @@ interface AppState {
   updateEntry: (id: string, patch: Partial<TranslationEntry>) => void;
   setEntryStatus: (id: string, status: TranslationStatus) => void;
   appendDelta: (id: string, delta: string) => void;
+  /**
+   * 一次提交一帧内累积的所有 delta（同一条目可多次出现，文本按顺序拼接）。
+   *
+   * 关键点：整个批次只发 **一次** `set()`，也就是一次订阅通知、一次派生重算；
+   * 同一个文件只 `slice()` 一次数组。这样一帧内 6 条并发流不会打出 6 次通知。
+   */
+  applyDeltas: (batch: { id: string; text: string }[]) => void;
   /** 获取所有选中文件的扁平化条目（派生） */
   getAllEntries: () => TranslationEntry[];
   /** 获取某个文件的条目，用于写回 */
@@ -125,6 +141,25 @@ function applyTheme(theme: Theme) {
   }
 }
 
+/**
+ * 用「文件 + 下标」索引 O(1) 定位条目（不再线性扫描条目数组）。
+ *
+ * 下标越界、或下标处已经是别的条目（例如整表被替换过、索引尚未重建）时
+ * 返回 null：宁可放弃这次更新，也不能把文本写到错误的条目上。
+ */
+function locateEntry(
+  state: Pick<AppState, "entriesByFile" | "entryIdToFile" | "entryIdToIndex">,
+  id: string,
+): { fileName: string; list: TranslationEntry[]; index: number } | null {
+  const fileName = state.entryIdToFile[id];
+  if (!fileName) return null;
+  const list = state.entriesByFile[fileName];
+  const index = state.entryIdToIndex[id];
+  if (!list || index === undefined) return null;
+  if (list[index]?.id !== id) return null;
+  return { fileName, list, index };
+}
+
 export const useAppStore = create<AppState>((set, get) => ({
   stage: "home",
   modFilePath: null,
@@ -134,6 +169,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   loadedFileNames: new Set(),
   entriesByFile: {},
   entryIdToFile: {},
+  entryIdToIndex: {},
   settings: DEFAULT_SETTINGS,
   settingsLoaded: false,
   theme: loadTheme(),
@@ -151,52 +187,73 @@ export const useAppStore = create<AppState>((set, get) => ({
       loadedFileNames: new Set(),
       entriesByFile: {},
       entryIdToFile: {},
+      entryIdToIndex: {},
       error: null,
     }),
   setSelectedFiles: (files) => set({ selectedFiles: files }),
   setFileEntries: (fileName, entries) =>
     set((s) => {
-      // 建立 entryId → fileName 反查索引，避免 delta 高频更新时遍历所有条目
+      // 重建该文件的 id → (文件, 下标) 索引：
+      // 先删掉旧条目（整表替换后旧下标可能指向别的条目），再按新顺序写入
       const entryIdToFile = { ...s.entryIdToFile };
-      for (const e of entries) entryIdToFile[e.id] = fileName;
+      const entryIdToIndex = { ...s.entryIdToIndex };
+      for (const old of s.entriesByFile[fileName] ?? []) {
+        delete entryIdToFile[old.id];
+        delete entryIdToIndex[old.id];
+      }
+      for (let i = 0; i < entries.length; i += 1) {
+        const id = entries[i].id;
+        entryIdToFile[id] = fileName;
+        entryIdToIndex[id] = i;
+      }
       return {
         entriesByFile: { ...s.entriesByFile, [fileName]: entries },
         loadedFileNames: new Set([...s.loadedFileNames, fileName]),
         entryIdToFile,
+        entryIdToIndex,
       };
     }),
   updateEntry: (id, patch) =>
     set((s) => {
-      const fileName = s.entryIdToFile[id];
-      if (!fileName) return s;
-      const list = s.entriesByFile[fileName];
-      if (!list) return s;
-      const idx = list.findIndex((e) => e.id === id);
-      if (idx < 0) return s;
-      const updated = [...list];
-      updated[idx] = { ...updated[idx], ...patch };
+      const hit = locateEntry(s, id);
+      if (!hit) return s;
+      const updated = hit.list.slice();
+      updated[hit.index] = { ...updated[hit.index], ...patch };
       return {
-        entriesByFile: { ...s.entriesByFile, [fileName]: updated },
+        entriesByFile: { ...s.entriesByFile, [hit.fileName]: updated },
       };
     }),
   setEntryStatus: (id, status) => get().updateEntry(id, { status }),
-  appendDelta: (id, delta) =>
+  appendDelta: (id, delta) => get().applyDeltas([{ id, text: delta }]),
+  applyDeltas: (batch) =>
     set((s) => {
-      const fileName = s.entryIdToFile[id];
-      if (!fileName) return s;
-      const list = s.entriesByFile[fileName];
-      if (!list) return s;
-      const idx = list.findIndex((e) => e.id === id);
-      if (idx < 0) return s;
-      const updated = [...list];
-      updated[idx] = {
-        ...updated[idx],
-        target: updated[idx].target + delta,
-        status: "translating",
-      };
-      return {
-        entriesByFile: { ...s.entriesByFile, [fileName]: updated },
-      };
+      /** fileName → (元素下标 → 本批累积文本)，同一条目多次出现会拼接 */
+      const updates = new Map<string, Map<number, string>>();
+      for (const { id, text } of batch) {
+        if (text === "") continue;
+        const hit = locateEntry(s, id);
+        if (!hit) continue;
+        const byIndex = updates.get(hit.fileName) ?? new Map<number, string>();
+        byIndex.set(hit.index, (byIndex.get(hit.index) ?? "") + text);
+        updates.set(hit.fileName, byIndex);
+      }
+      if (updates.size === 0) return s;
+
+      const entriesByFile: EntriesByFile = { ...s.entriesByFile };
+      for (const [fileName, byIndex] of updates) {
+        const list = s.entriesByFile[fileName];
+        // 每个文件只拷贝一次数组，随后在同一份拷贝里改完所有命中条目
+        const updated = list.slice();
+        for (const [index, text] of byIndex) {
+          updated[index] = {
+            ...updated[index],
+            target: updated[index].target + text,
+            status: "translating",
+          };
+        }
+        entriesByFile[fileName] = updated;
+      }
+      return { entriesByFile };
     }),
   getAllEntries: () => {
     const { selectedFiles, entriesByFile } = get();
@@ -226,6 +283,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       loadedFileNames: new Set(),
       entriesByFile: {},
       entryIdToFile: {},
+      entryIdToIndex: {},
       error: null,
     }),
 }));

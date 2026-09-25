@@ -7,6 +7,14 @@ name: 构建与发布（Windows x64）
 #
 # 只出 Windows x64 产物：这个工具的使用场景就是「在 Windows 上翻译 MOD，
 # 然后在 Windows 上玩游戏」，没有跨平台打包的必要。
+#
+# 发布标签的两道校验：
+#   * 版本一致（build-windows，构建前）——标签必须等于 v + tauri.conf.json 的版本
+#   * 标签冲突（publish，发布前）——标签不存在则在本次构建的提交上创建；
+#     已存在但指向别的提交则直接失败，绝不把非该标签的产物挂上去
+#
+# 标签语义：RELEASE_TAG 非空 = 要发布；为空（dispatch 且没填 tag_name）= 只构建。
+# 这样 dispatch 一个不以 v 开头的分支名时不会误触发版本校验。
 
 on:
   push:
@@ -29,12 +37,14 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+  # push tag → 标签名；workflow_dispatch → 填写的 tag_name（留空即空字符串）
+  RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag_name }}
 
 jobs:
   build-windows:
     name: 构建 Windows x64
     runs-on: windows-latest
+    timeout-minutes: 90
     steps:
       - name: 拉取代码
         uses: actions/checkout@v7
@@ -63,15 +73,25 @@ jobs:
           "value=$version" >> $env:GITHUB_OUTPUT
           Write-Host "版本号: $version"
 
+      - name: 发布意图
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RELEASE_TAG)) {
+            Write-Host "RELEASE_TAG 为空：只构建并上传 Actions 制品，不创建 Release。"
+          } else {
+            Write-Host "RELEASE_TAG = $env:RELEASE_TAG（构建后还会再校验标签与版本/提交是否匹配）"
+          }
+
       - name: 校验发布标签与应用版本一致
-        if: startsWith(env.RELEASE_TAG, 'v')
+        # 只在真的要发布时校验：push tag 或 dispatch 填了 tag_name（RELEASE_TAG 非空）
+        if: env.RELEASE_TAG != ''
         shell: pwsh
         env:
           APP_VERSION: ${{ steps.version.outputs.value }}
         run: |
           $expected = "v$env:APP_VERSION"
           if ($env:RELEASE_TAG -ne $expected) {
-            throw "标签 $env:RELEASE_TAG 与 tauri.conf.json 的版本 $env:APP_VERSION 不一致（应为 $expected）。请先同步三处版本号再打标签。"
+            throw "标签 $env:RELEASE_TAG 与 tauri.conf.json 的版本 $env:APP_VERSION 不一致（应为 $expected，标签必须以 v 开头）。请先同步三处版本号再打标签。"
           }
           Write-Host "标签与版本一致: $env:RELEASE_TAG"
 
@@ -151,6 +171,14 @@ jobs:
           }
           Write-Host "四类产物齐全：便携版 zip / MSI / NSIS / SHA256SUMS"
 
+          # 再兜一道：Compress-Archive / Copy-Item 半途失败会留下 0 字节文件，
+          # 上面只按文件名判断，这里按体积判断，避免把空壳产物发出去。
+          $empty = @(Get-ChildItem -Path $out -File | Where-Object { $_.Length -eq 0 })
+          if ($empty.Count -gt 0) {
+            throw "存在 0 字节产物：$($empty.Name -join '、')"
+          }
+          Get-ChildItem -Path $out -File | ForEach-Object { Write-Host ("  {0,-56} {1,10:N0} 字节" -f $_.Name, $_.Length) }
+
       - name: 上传构建制品
         uses: actions/upload-artifact@v7
         with:
@@ -163,6 +191,8 @@ jobs:
     name: 发布到 GitHub Release
     runs-on: ubuntu-latest
     needs: build-windows
+    timeout-minutes: 15
+    # 只有这个 job 需要写权限（创建/更新 Release）；其余 job 继承 workflow 级的只读
     permissions:
       contents: write
     if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.tag_name != '') }}
@@ -178,10 +208,50 @@ jobs:
           set -euo pipefail
           find release-assets -type f -printf '%s\t%p\n' | sort -k2
 
+      # 标签冲突校验（发布前的最后一道闸）：
+      #   * 标签不存在 → 放行，下面会把它创建在本次构建的提交上
+      #   * 标签存在且指向本次构建的提交 → 放行（重建 Release 的常见场景）
+      #   * 标签存在但指向别的提交 → 失败，绝不把别的提交的产物挂到这个标签上
+      # 若要把「失败」提前到构建之前，可以把这段搬到 build-windows（pwsh +
+      # Invoke-WebRequest -SkipHttpErrorCheck），代价是要在 Windows 上多写一段网络代码。
+      - name: 校验发布标签（存在性与冲突）
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${RELEASE_TAG:?RELEASE_TAG 为空，不应该走到发布 job}"
+          sha="$GITHUB_SHA"
+          echo "标签：$tag"
+          echo "本次构建提交：$sha"
+          code=$(curl -sS -o /tmp/tag_commit.json -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/commits/$tag")
+          case "$code" in
+          200)
+            remote=$(python3 -c 'import json;print(json.load(open("/tmp/tag_commit.json"))["sha"])')
+            if [ "$remote" != "$sha" ]; then
+              echo "::error::标签 $tag 已存在，但指向 $remote，与本次构建提交 $sha 不一致。请删除该标签，或从标签所在提交重新触发本工作流。"
+              exit 1
+            fi
+            echo "标签已存在且指向本次构建提交：按「更新既有 Release」处理"
+            ;;
+          404)
+            echo "标签不存在：发布时会创建在本次构建的提交 $sha 上"
+            ;;
+          *)
+            echo "::error::查询标签 $tag 失败（HTTP $code）"
+            cat /tmp/tag_commit.json || true
+            exit 1
+            ;;
+          esac
+
       - name: 创建或更新 Release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
+          # 标签不存在时，明确创建在「本次构建的提交」上，而不是仓库默认分支的最新提交
+          target_commitish: ${{ github.sha }}
           name: BG3 MOD 汉化工具 ${{ env.RELEASE_TAG }}
           draft: false
           generate_release_notes: true

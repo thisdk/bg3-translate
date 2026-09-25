@@ -94,6 +94,19 @@ mod tests {
     }
 
     #[test]
+    fn error_entries_are_written_as_source() {
+        // F-01：status == error 的条目即使 target 非空也必须退回原文
+        let mut entries = sample_entries();
+        entries[0].mark_translated("坏译文 {1} 丢了");
+        entries[0].mark_error("结构校验未通过：占位符 {1} 缺失（已重试 1 次）");
+
+        let resource = entries_to_resource(&entries);
+
+        assert_eq!(resource.entries[0].text, "Hello", "error 条目必须退回原文");
+        assert_eq!(resource.entries[1].text, "World");
+    }
+
+    #[test]
     fn invalid_version_falls_back_to_one() {
         let entry = TranslationEntry::new("a.loca", "h1", "not-a-number", "x");
         let resource = entries_to_resource(&[entry]);

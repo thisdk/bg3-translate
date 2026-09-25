@@ -1,10 +1,18 @@
 name: CI
 
-# 三个并行任务：
-#   meta          —— 版本号是否三处一致（几秒）
+# 四个并行任务：
+#   meta          —— 版本号是否三处一致 + IPC 契约 + 一键脚本门禁完整性（几秒）
 #   core           —— 纯逻辑核心库：fmt / clippy / 单元测试 + 端到端 PAK 闭环
 #   web            —— 前端：单测 / 类型检查 / 构建，并把 dist 作为制品上传
 #   tauri-shell    —— Windows 上编译 Tauri 壳（复用 web 的 dist 制品）
+#
+# core / web 两道 Rust/前端门禁直接调用仓库里的 `scripts/verify.sh`：
+# 这样「本地 bun run verify」与 CI 跑的是同一串命令，不会各写一份、慢慢漂移。
+# meta job 会用 `scripts/verify.sh --list` 断言这 6 道门禁没被删改（毫秒级、不需要工具链）。
+#
+# 为什么 meta 不跑 `scripts/verify.sh --web-only`：那会重复 web job 的
+# bun install + vitest + tsc + vite build（几分钟），而 meta 的定位是
+# 「几秒内、零工具链依赖地把版本/契约问题拦住」。前端门禁已经在 web job 里跑过一遍。
 #
 # 核心库刻意不依赖任何 GUI 系统库，所以能跑在 ubuntu-latest 上，几十秒出结果。
 
@@ -27,6 +35,7 @@ jobs:
   meta:
     name: 版本号一致性与 IPC 契约
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
 
@@ -48,10 +57,52 @@ jobs:
             echo "::error::三处版本号不一致，请同步更新"
             exit 1
           fi
+          # 两个 crate 都用 version.workspace = true 继承 workspace 版本，
+          # 所以这三处就是全部事实来源。用 tomllib 精确判断（只认字符串值），
+          # 避免将来某个 crate 自己写死一个版本号，让版本门禁出现盲区。
+          python3 - <<'PY'
+          import pathlib
+          import sys
+          import tomllib
+
+          offenders = []
+          for manifest in ("src-tauri/Cargo.toml", "crates/bg3-translate-core/Cargo.toml"):
+              package = tomllib.loads(pathlib.Path(manifest).read_text(encoding="utf-8")).get("package", {})
+              if isinstance(package.get("version"), str):
+                  offenders.append(manifest)
+          if offenders:
+              print("::error::子 crate 不应自己声明 version，请改用 version.workspace = true：" + "、".join(offenders))
+              sys.exit(1)
+          print("子 crate 均继承 workspace 版本（version.workspace = true）")
+          PY
+
+      # scripts/verify.sh 是本地与 CI 的统一门禁入口（core / web job 直接调用它）。
+      # 这里断言它声明的 6 道门禁没有被悄悄删掉或改弱：--list 只打印清单，
+      # 不需要 cargo / bun，毫秒级完成。
+      - name: 校验一键脚本的门禁完整性
+        run: |
+          set -euo pipefail
+          bash -n scripts/verify.sh
+          expected="$(printf '%s\n' \
+            'python3 scripts/check_ipc_contract.py' \
+            'cargo fmt --all --check' \
+            'cargo clippy -p bg3-translate-core --all-targets -- -D warnings' \
+            'cargo test -p bg3-translate-core --all-targets' \
+            'bun run test' \
+            'bun run build')"
+          actual="$(bash scripts/verify.sh --list | cut -f2)"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::scripts/verify.sh 的门禁清单与 CI 期望不一致（是不是漏了一道门禁？）"
+            diff <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") || true
+            exit 1
+          fi
+          echo "verify.sh 门禁清单一致（$(printf '%s\n' "$actual" | wc -l) 道）"
+          printf '%s\n' "$actual" | sed 's/^/  - /'
 
   core:
     name: 核心库（fmt / clippy / test）
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
@@ -63,21 +114,19 @@ jobs:
       - name: 缓存 Rust 构建
         uses: Swatinem/rust-cache@v2
         with:
-          # workspace 只有一个 target 目录，key 里带上包名避免互相污染
+          # key 是附加前缀（动作自己还会拼上 job 名与 Cargo.lock 哈希），
+          # 与 tauri-shell 的 shell-windows 不同，两个 job 的缓存不会互相顶掉
           key: core
 
-      - name: 代码格式
-        run: cargo fmt --all --check
-
-      - name: Clippy（零告警）
-        run: cargo clippy -p bg3-translate-core --all-targets -- -D warnings
-
-      - name: 单元测试 + 端到端闭环
-        run: cargo test -p bg3-translate-core --all-targets
+      # 直接调用仓库里的一键脚本，保证与本地 `bun run verify --core-only`
+      # 跑的是同一串命令；--no-ipc 是因为 IPC 契约已由 meta job 例行检查。
+      - name: 一键校验（fmt / clippy / test）
+        run: bash scripts/verify.sh --core-only --no-ipc
 
   web:
     name: 前端（test / typecheck / build）
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
@@ -89,11 +138,11 @@ jobs:
       - name: 安装依赖
         run: bun install --frozen-lockfile
 
-      - name: 单元测试
-        run: bun run test
-
-      - name: 构建（含 tsc 类型检查）
-        run: bun run build
+      # `bun run build` = `tsc -b && vite build`，类型检查已经包含在内
+      # （package.json 的 scripts.build），所以不再单独跑一遍 typecheck；
+      # 这条链路由下面的一键脚本统一执行，避免 CI 和本地各写一份。
+      - name: 一键校验（vitest + tsc + vite build）
+        run: bash scripts/verify.sh --web-only --no-ipc
 
       - name: 上传前端产物
         uses: actions/upload-artifact@v7
@@ -107,6 +156,9 @@ jobs:
     name: Tauri 壳编译检查（Windows）
     runs-on: windows-latest
     needs: web
+    timeout-minutes: 60
+    # 这个 job 刻意不走 scripts/verify.sh：脚本面向「本地/ubuntu 能跑的门禁」，
+    # Tauri 壳依赖 GUI 系统库，只能在 Windows 上 check + clippy，且要复用 web 的 dist。
     steps:
       - uses: actions/checkout@v7
 
@@ -128,11 +180,24 @@ jobs:
       - name: 安装前端依赖
         run: bun install --frozen-lockfile
 
+      # web job 上传的是 dist/（upload-artifact 会去掉公共前缀 dist/），
+      # 所以这里解包到 dist 得到的正是 vite 产物根目录：index.html + assets/，
+      # 正好落在 tauri.conf.json 的 frontendDist 能直接读到的位置。
       - name: 取回前端产物（tauri 需要 frontendDist 已存在）
         uses: actions/download-artifact@v8
         with:
           name: web-dist
           path: dist
+
+      # 把「解包位置对不对」变成显式断言：一旦制品根目录变了（例如变成
+      # dist/dist/index.html），这里立刻报错，而不是等到 tauri 构建时才莫名其妙失败。
+      - name: 确认 dist 制品就位
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist/index.html")) {
+            throw "dist/index.html 不存在：制品解包路径与 tauri.conf.json 的 frontendDist (../dist) 不一致"
+          }
+          Get-ChildItem dist | Select-Object -First 10 Name
 
       - name: cargo check
         run: cargo check -p bg3-translate --all-targets

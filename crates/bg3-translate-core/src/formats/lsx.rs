@@ -102,15 +102,16 @@ pub fn entries_from_fields(fields: &[LsxField], file_name: &str) -> Vec<Translat
 
 /// 计算需要替换的 `(字节区间, 新值)`，按顺序返回。
 ///
-/// 只处理「能解析出 contentuid 且有译文」的条目；找不到对应字段的条目会被
-/// 记 warning 并跳过（而不是静默写错位置）。
+/// 只处理「能解析出 contentuid 且有**可写回**译文」的条目（`error` 状态的条目
+/// 即使 target 非空也要退回原文，见 [`TranslationEntry::has_writable_target`]）；
+/// 找不到对应字段的条目会被记 warning 并跳过（而不是静默写错位置）。
 pub fn plan_replacements(
     fields: &[LsxField],
     entries: &[TranslationEntry],
 ) -> Vec<(Range<usize>, String)> {
     let mut plan = Vec::new();
     for entry in entries {
-        if !entry.has_target() {
+        if !entry.has_writable_target() {
             continue;
         }
         let Some((id, occurrence)) = decode_contentuid(&entry.contentuid) else {
@@ -544,6 +545,37 @@ mod tests {
         let entry = TranslationEntry::new("Meta.lsx", "Description#0", "1", "x");
         write(&path, &[entry]).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), SAMPLE);
+    }
+
+    /// F-01：`status == error` 的条目即使 target 非空也不得改写字段。
+    #[test]
+    fn error_entries_are_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Meta.lsx");
+        std::fs::write(&path, SAMPLE).unwrap();
+
+        let mut entry = TranslationEntry::new(
+            "Meta.lsx",
+            "Description#0",
+            "1",
+            "A sturdy blade & shield-breaker.",
+        );
+        entry.mark_translated("坏译文：丢了 & 与标签");
+        entry.mark_error("结构校验未通过：占位符 {1} 缺失（已重试 1 次）");
+
+        assert!(entry.has_target(), "target 仍然保留给用户看");
+        let fields = scan_translatable(SAMPLE);
+        assert!(
+            plan_replacements(&fields, std::slice::from_ref(&entry)).is_empty(),
+            "error 条目不参与替换"
+        );
+
+        write(&path, &[entry]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            SAMPLE,
+            "error 条目必须退回原文（字段保持原样）"
+        );
     }
 
     #[test]

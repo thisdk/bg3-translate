@@ -379,3 +379,138 @@ fn writing_to_a_not_yet_existing_target_file_creates_it() {
         fs::read_to_string(verify_dir.join("unpacked/Localization/Chinese/test.xml")).unwrap();
     assert!(created.contains("中文：Hello, adventurer."));
 }
+
+/// F-01 端到端：`status == error` 的条目**绝不能**把 target 带进 PAK。
+///
+/// 复现路径：结构校验失败 → 前端把条目置为 `error` 但保留被拒译文（给用户看），
+/// 用户不点「重试失败」直接打包。修复前坏译文照样写进中文文件与 PAK；
+/// 修复后写回退回原文，且「人工编辑成 edited」的条目仍然照常写回。
+#[test]
+fn error_entries_never_reach_the_packed_pak() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("src");
+    let work_root = tmp.path().join("work");
+    fs::create_dir_all(&work_root).unwrap();
+
+    const XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<contentList>
+  <content contentuid="h11111111g2222u3333i4444" version="1">Hello, adventurer.</content>
+  <content contentuid="h55555555g6666u7777i8888" version="2">Cast <LSTag Tag="Fire">Fireball</LSTag> for {1} damage</content>
+  <content contentuid="h99999999g0000u1111i2222" version="3">Cast <LSTag Tag="Ice">Ice Storm</LSTag> for {2} damage</content>
+  <content contentuid="haaaaaaaagbbbbuccccidddd" version="4">Sword of Doom</content>
+</contentList>"#;
+    let localization = source.join("Localization/English");
+    fs::create_dir_all(&localization).unwrap();
+    fs::write(localization.join("test.xml"), XML).unwrap();
+
+    let input_pak = tmp.path().join("TestMod.pak");
+    pack(&source, &input_pak, 7);
+    let (work_dir, _) = pak::open_and_extract_in(input_pak.to_str().unwrap(), &work_root).unwrap();
+
+    let source_entries = formats::read_entries(
+        work_dir.to_str().unwrap(),
+        "Localization/English/test.xml",
+        PakFileKind::LocalizationXml,
+    )
+    .unwrap();
+    assert_eq!(source_entries.len(), 4);
+
+    // ① 网络中断：target 里是半截文本，状态 error
+    let mut interrupted = source_entries[0].clone();
+    interrupted.mark_translated("[坏]你好，冒险");
+    interrupted.mark_error("大模型调用错误: 请求失败: timeout");
+
+    // ② 结构校验失败：漏了 `{1}` 与 `<LSTag>`，状态 error
+    let mut rejected = source_entries[1].clone();
+    rejected.mark_translated("造成火焰伤害");
+    rejected.mark_error("结构校验未通过：占位符 {1} 缺失（已重试 1 次）");
+
+    // ③ 对照组：合法译文，必须照常写回
+    let mut good = source_entries[2].clone();
+    good.mark_translated(r#"施放 <LSTag Tag="Ice">冰风暴</LSTag>，造成 {2} 点伤害"#);
+
+    // ④ 人工抢救：先失败，用户改成 edited，编辑内容必须写回
+    let mut rescued = source_entries[3].clone();
+    rescued.mark_translated("坏译文");
+    rescued.mark_error("结构校验未通过：占位符 {9} 缺失（已重试 1 次）");
+    rescued.target = "末日之剑".into();
+    rescued.status = bg3_translate_core::types::TranslationStatus::Edited;
+
+    let entries = vec![interrupted, rejected, good, rescued];
+    formats::write_entries(
+        work_dir.to_str().unwrap(),
+        "Localization/Chinese/test.xml",
+        PakFileKind::LocalizationXml,
+        &entries,
+    )
+    .unwrap();
+
+    // ── 落盘内容：error 条目是原文，edited / translated 是译文 ──
+    let written =
+        fs::read_to_string(work_dir.join("unpacked/Localization/Chinese/test.xml")).unwrap();
+    assert!(
+        written.contains("Hello, adventurer."),
+        "① error 条目必须退回原文: {written}"
+    );
+    assert!(
+        !written.contains("[坏]你好，冒险"),
+        "① 半截流式文本不许落盘"
+    );
+    assert!(
+        written.contains(r#"Cast <LSTag Tag="Fire">Fireball</LSTag> for {1} damage"#),
+        "② error 条目必须原样退回原文（标签与占位符都在）: {written}"
+    );
+    assert!(!written.contains("造成火焰伤害"), "② 被拒译文不许落盘");
+    assert!(
+        written.contains(r#"施放 <LSTag Tag="Ice">冰风暴</LSTag>，造成 {2} 点伤害"#),
+        "③ 合法译文必须照常写回: {written}"
+    );
+    assert!(written.contains("末日之剑"), "④ 人工抢救的译文必须写回");
+
+    // contentuid / version 原样保留
+    for entry in &source_entries {
+        let attr = format!(
+            r#"contentuid="{}" version="{}""#,
+            entry.contentuid, entry.version
+        );
+        assert!(written.contains(&attr), "缺少 {attr}: {written}");
+    }
+
+    // ── 打包 → 重新解包：坏译文依然不在 PAK 里 ──
+    let output_pak = tmp.path().join("TestMod_zh.pak");
+    pak::repack(work_dir.to_str().unwrap(), output_pak.to_str().unwrap()).unwrap();
+
+    let verify_root = tmp.path().join("verify");
+    fs::create_dir_all(&verify_root).unwrap();
+    let (verify_dir, verify_files) =
+        pak::open_and_extract_in(output_pak.to_str().unwrap(), &verify_root).unwrap();
+    assert!(
+        verify_files
+            .iter()
+            .any(|f| f.name == "Localization/Chinese/test.xml"),
+        "打包后应包含中文文件"
+    );
+
+    let chinese_path = verify_dir.join("unpacked/Localization/Chinese/test.xml");
+    let packed = fs::read_to_string(&chinese_path).unwrap();
+    assert!(!packed.contains("[坏]你好，冒险"));
+    assert!(!packed.contains("造成火焰伤害"));
+
+    let reparsed = formats::read_entries(
+        verify_dir.to_str().unwrap(),
+        "Localization/Chinese/test.xml",
+        PakFileKind::LocalizationXml,
+    )
+    .unwrap();
+    assert_eq!(reparsed.len(), 4);
+    // 解出来的「原文」就是写进 PAK 的文本：前两条是原文，后两条是译文
+    assert_eq!(reparsed[0].source, "Hello, adventurer.");
+    assert_eq!(reparsed[1].source, source_entries[1].source);
+    assert_eq!(reparsed[0].contentuid, source_entries[0].contentuid);
+    assert_eq!(reparsed[1].contentuid, source_entries[1].contentuid);
+    assert_eq!(reparsed[1].version, source_entries[1].version);
+    assert!(reparsed[1].source.contains(r#"<LSTag Tag="Fire">"#));
+    assert!(reparsed[1].source.contains("{1}"));
+    assert!(reparsed[2].source.contains("冰风暴"));
+    assert_eq!(reparsed[3].source, "末日之剑");
+}

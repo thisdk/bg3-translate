@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_SETTINGS, THEME_STORAGE_KEY, useAppStore } from "./app-store";
 import type { PakFile, TranslationEntry } from "@/lib/types";
 
@@ -240,5 +240,132 @@ describe("reset", () => {
     // 主题与设置属于用户偏好，reset 不清空
     expect(state().theme).toBe("dungeon");
     expect(state().settings.apiKey).toBe("sk-keep");
+  });
+});
+
+describe("entryIdToIndex（O(1) 定位索引）", () => {
+  it("setFileEntries 按数组下标建立索引", () => {
+    state().setFileEntries("a.xml", [entry("1"), entry("2"), entry("3")]);
+    expect(state().entryIdToIndex).toEqual({ "1": 0, "2": 1, "3": 2 });
+  });
+
+  it("整表替换时清理旧下标，旧 id 不再命中", () => {
+    state().setFileEntries("a.xml", [entry("1"), entry("2")]);
+    state().setFileEntries("a.xml", [entry("9")]);
+    expect(state().entryIdToIndex).toEqual({ "9": 0 });
+    expect(state().entryIdToFile).toEqual({ "9": "a.xml" });
+
+    // 旧 id 已经不在表里：更新是空操作，不会写到别的条目上
+    state().appendDelta("1", "污染");
+    expect(state().entriesByFile["a.xml"][0]).toMatchObject({
+      id: "9",
+      target: "",
+    });
+  });
+
+  it("索引错位时拒绝写入（宁可丢更新也不写错条目）", () => {
+    state().setFileEntries("a.xml", [entry("1"), entry("2")]);
+    // 人为制造陈旧索引：让 "2" 指向下标 0（实际是 "1"）
+    useAppStore.setState({ entryIdToIndex: { "1": 0, "2": 0 } });
+
+    state().appendDelta("2", "污染");
+    expect(state().entriesByFile["a.xml"][0].target).toBe("");
+    expect(state().entriesByFile["a.xml"][1].target).toBe("");
+  });
+
+  it("updateEntry / appendDelta / applyDeltas 不再线性扫描数组", () => {
+    state().setFileEntries("a.xml", [entry("1"), entry("2"), entry("3")]);
+    const findIndex = vi.spyOn(Array.prototype, "findIndex");
+
+    state().updateEntry("2", { target: "x" });
+    state().appendDelta("1", "字");
+    state().applyDeltas([
+      { id: "1", text: "a" },
+      { id: "3", text: "b" },
+    ]);
+
+    const calls = findIndex.mock.calls.length;
+    expect(calls).toBe(0);
+    expect(state().entriesByFile["a.xml"][0].target).toBe("字a");
+    expect(state().entriesByFile["a.xml"][2].target).toBe("b");
+  });
+});
+
+describe("applyDeltas（一帧一次提交）", () => {
+  /** 统计 zustand 通知次数 */
+  function countNotifications(): { count: () => number; stop: () => void } {
+    let count = 0;
+    const unsubscribe = useAppStore.subscribe(() => {
+      count += 1;
+    });
+    return { count: () => count, stop: unsubscribe };
+  }
+
+  it("一批跨文件多条 delta 只发一次通知", () => {
+    state().setFileEntries("a.xml", [entry("1"), entry("2")]);
+    state().setFileEntries("b.xml", [entry("3")]);
+    const notifications = countNotifications();
+
+    state().applyDeltas([
+      { id: "1", text: "甲" },
+      { id: "3", text: "丙" },
+      { id: "2", text: "乙" },
+    ]);
+
+    notifications.stop();
+    expect(notifications.count()).toBe(1);
+    expect(state().entriesByFile["a.xml"][0].target).toBe("甲");
+    expect(state().entriesByFile["a.xml"][1].target).toBe("乙");
+    expect(state().entriesByFile["b.xml"][0].target).toBe("丙");
+    // 同一条目在一批里出现多次 → 按出现顺序拼接
+    expect(state().entriesByFile["a.xml"][0].status).toBe("translating");
+  });
+
+  it("同一条目在一批里多次出现按顺序拼接", () => {
+    state().setFileEntries("a.xml", [entry("1")]);
+    state().applyDeltas([
+      { id: "1", text: "你" },
+      { id: "1", text: "好" },
+    ]);
+    expect(state().entriesByFile["a.xml"][0].target).toBe("你好");
+  });
+
+  it("每个文件只替换一次数组引用，未命中的文件不动", () => {
+    state().setFileEntries("a.xml", [entry("1"), entry("2")]);
+    state().setFileEntries("b.xml", [entry("3")]);
+    const aBefore = state().entriesByFile["a.xml"];
+    const bBefore = state().entriesByFile["b.xml"];
+
+    state().applyDeltas([
+      { id: "1", text: "甲" },
+      { id: "2", text: "乙" },
+    ]);
+
+    expect(state().entriesByFile["a.xml"]).not.toBe(aBefore);
+    expect(state().entriesByFile["b.xml"]).toBe(bBefore);
+  });
+
+  it("未知 id 与空文本被忽略；整批无效时不发通知", () => {
+    state().setFileEntries("a.xml", [entry("1")]);
+    const notifications = countNotifications();
+
+    state().applyDeltas([
+      { id: "ghost", text: "幽灵" },
+      { id: "1", text: "" },
+    ]);
+    state().applyDeltas([]);
+
+    notifications.stop();
+    expect(notifications.count()).toBe(0);
+    expect(state().entriesByFile["a.xml"][0].target).toBe("");
+  });
+
+  it("appendDelta 等价于单元素 applyDeltas（一次通知）", () => {
+    state().setFileEntries("a.xml", [entry("1")]);
+    const notifications = countNotifications();
+    state().appendDelta("1", "好");
+    notifications.stop();
+    expect(notifications.count()).toBe(1);
+    expect(state().entriesByFile["a.xml"][0].target).toBe("好");
   });
 });

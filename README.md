@@ -97,6 +97,8 @@ crates/bg3-translate-core/     # 纯逻辑核心，零 GUI 依赖
 src-tauri/                     # Tauri 薄壳：命令层 + 事件桥 + 插件注册
 src/                           # React 前端
 docs/ARCHITECTURE.md           # 架构说明与冻结的 IPC 契约
+docs/VERIFICATION.md           # 一次独立验证的完整记录（含已知限制与无法验证项）
+scripts/check_ipc_contract.py  # 跨层契约检查（CI meta job 调用）
 ```
 
 **为什么要拆 crate**：核心逻辑不依赖任何 GUI 系统库，所以在没有

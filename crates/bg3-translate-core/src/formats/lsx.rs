@@ -19,8 +19,15 @@ use crate::error::{AppError, Result};
 use crate::types::TranslationEntry;
 
 /// LSX 中可翻译的 attribute id 白名单。
+///
+/// **`Name` 故意不在白名单里。** `Mods/<mod>/meta.lsx` 的
+/// `<attribute id="Name" type="LSString" value="GustavDev" />` 是模块的内部
+/// 标识符（游戏按它引用这个模块），而且类型同样是 `LSString`——只看类型
+/// 分不出它和玩家可见文本。翻译它会让 MOD 直接失效。
+///
+/// 玩家可见的物品/技能名走的是 `TranslatedString`（contentuid 句柄），
+/// 由 `Localization/*.xml` 与 `.loca` 负责，根本不该在 LSX 里改。
 pub const TRANSLATABLE_FIELDS: &[&str] = &[
-    "Name",
     "Description",
     "DisplayName",
     "Title",
@@ -442,12 +449,31 @@ mod tests {
         let fields = scan_translatable(SAMPLE);
         assert_eq!(
             ids(&fields),
-            vec!["Name#0", "Description#0", "Description#1", "DisplayName#0",]
+            vec!["Description#0", "Description#1", "DisplayName#0"]
         );
-        assert_eq!(fields[0].value, "Iron Sword");
-        assert_eq!(fields[1].value, "A sturdy blade & shield-breaker.");
-        assert_eq!(fields[2].value, "Second description");
-        assert_eq!(fields[3].value, "Sword of 'Doom'");
+        assert_eq!(fields[0].value, "A sturdy blade & shield-breaker.");
+        assert_eq!(fields[1].value, "Second description");
+        assert_eq!(fields[2].value, "Sword of 'Doom'");
+    }
+
+    #[test]
+    fn module_name_is_never_treated_as_translatable() {
+        // Mods/<mod>/meta.lsx 里的 Name 是模块内部标识符，类型同样是 LSString。
+        // 翻掉它会让 MOD 直接失效，所以必须留在白名单之外。
+        let meta = r#"<?xml version="1.0" encoding="utf-8"?>
+<save>
+  <region id="Config">
+    <node id="ModuleInfo">
+      <attribute id="Name" type="LSString" value="GustavDev" />
+      <attribute id="Folder" type="LSString" value="AppearanceEditEnhanced" />
+      <attribute id="Description" type="LSString" value="Enables Race/Body Type editing." />
+    </node>
+  </region>
+</save>"#;
+        let fields = scan_translatable(meta);
+        assert_eq!(ids(&fields), vec!["Description#0"]);
+        assert!(!fields.iter().any(|f| f.value == "GustavDev"));
+        assert!(!fields.iter().any(|f| f.value == "AppearanceEditEnhanced"));
     }
 
     #[test]
@@ -464,12 +490,12 @@ mod tests {
         std::fs::write(&path, SAMPLE).unwrap();
 
         let entries = read(&path, "Mods/Meta.lsx").unwrap();
-        assert_eq!(entries.len(), 4);
-        assert_eq!(entries[0].source, "Iron Sword");
-        assert_eq!(entries[0].contentuid, "Name#0");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].source, "A sturdy blade & shield-breaker.");
+        assert_eq!(entries[0].contentuid, "Description#0");
         assert_eq!(entries[0].source_file, "Mods/Meta.lsx");
-        assert_eq!(entries[1].source, "A sturdy blade & shield-breaker.");
-        assert_eq!(entries[3].source, "Sword of 'Doom'");
+        assert_eq!(entries[1].source, "Second description");
+        assert_eq!(entries[2].source, "Sword of 'Doom'");
     }
 
     #[test]
@@ -493,13 +519,14 @@ mod tests {
         let mut entry =
             TranslationEntry::new("Meta.lsx", "Description#1", "1", "Second description");
         entry.mark_translated("第二条描述");
-        let mut name = TranslationEntry::new("Meta.lsx", "Name#0", "1", "Iron Sword");
-        name.mark_translated("铁剑");
+        let mut display =
+            TranslationEntry::new("Meta.lsx", "DisplayName#0", "1", "Sword of 'Doom'");
+        display.mark_translated("末日之剑");
 
-        write(&path, &[entry, name]).unwrap();
+        write(&path, &[entry, display]).unwrap();
         let out = std::fs::read_to_string(&path).unwrap();
 
-        assert!(out.contains(r#"value="铁剑""#));
+        assert!(out.contains(r#"value="末日之剑""#));
         assert!(out.contains(r#"value="第二条描述""#));
         // 未翻译的字段保持原样，空值字段仍然是空的
         assert!(out.contains(r#"value="A sturdy blade &amp; shield-breaker.""#));
@@ -514,7 +541,7 @@ mod tests {
         let path = dir.path().join("Meta.lsx");
         std::fs::write(&path, SAMPLE).unwrap();
 
-        let entry = TranslationEntry::new("Meta.lsx", "Name#0", "1", "Iron Sword");
+        let entry = TranslationEntry::new("Meta.lsx", "Description#0", "1", "x");
         write(&path, &[entry]).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), SAMPLE);
     }
@@ -558,8 +585,8 @@ mod tests {
         raw.extend_from_slice(SAMPLE.as_bytes());
         std::fs::write(&path, &raw).unwrap();
 
-        let mut entry = TranslationEntry::new("Meta.lsx", "Name#0", "1", "Iron Sword");
-        entry.mark_translated("铁剑");
+        let mut entry = TranslationEntry::new("Meta.lsx", "Description#0", "1", "x");
+        entry.mark_translated("第一条描述");
         write(&path, &[entry]).unwrap();
 
         let out = std::fs::read(&path).unwrap();
@@ -574,14 +601,13 @@ mod tests {
   <attribute id="Description" type="LSString" value="quote &quot; inside" />
 </root>"#;
         let fields = scan_translatable(xml);
-        assert_eq!(ids(&fields), vec!["Name#0", "Description#0"]);
-        assert_eq!(fields[0].value, "a > b");
-        assert_eq!(fields[1].value, "quote \" inside");
+        assert_eq!(ids(&fields), vec!["Description#0"]);
+        assert_eq!(fields[0].value, "quote \" inside");
     }
 
     #[test]
     fn single_quoted_attributes_are_supported() {
-        let xml = r#"<attribute id='Name' type='LSString' value='Iron Sword' />"#;
+        let xml = r#"<attribute id='Description' type='LSString' value='Iron Sword' />"#;
         let fields = scan_translatable(xml);
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].value, "Iron Sword");

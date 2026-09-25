@@ -24,7 +24,8 @@ const META_LSX: &str = r#"<?xml version="1.0" encoding="utf-8"?>
   <region id="Config">
     <node id="root">
       <attribute id="Name" type="FixedString" value="Internal_Id_Dont_Touch" />
-      <attribute id="Name" type="LSString" value="Mod Display Name" />
+      <attribute id="Name" type="LSString" value="Module Internal Name" />
+      <attribute id="DisplayName" type="LSString" value="Mod Display Name" />
       <attribute id="Description" type="LSString" value="Adds a shiny sword &amp; more." />
       <attribute id="Description" type="TranslatedString" value="h99999999g0000u1111i2222" />
     </node>
@@ -149,6 +150,13 @@ fn full_roundtrip_pak_unpack_translate_repack() {
     assert_eq!(lsx_entries[1].source, "Adds a shiny sword & more.");
     // TranslatedString（句柄）不能出现在条目里
     assert!(!lsx_entries.iter().any(|e| e.source.contains("h99999999")));
+    // Name（模块内部标识符，LSString 类型）也不能被采集：翻掉它 MOD 就废了
+    assert!(
+        !lsx_entries
+            .iter()
+            .any(|e| e.source.contains("Module Internal Name")),
+        "meta.lsx 的 Name 是模块内部标识符，不能当可翻译文本"
+    );
 
     // ── 3. 翻译 + 写回 ──
     let count = write_targets(&work_dir, "Localization/English/test.xml", |source| {
@@ -200,6 +208,9 @@ fn full_roundtrip_pak_unpack_translate_repack() {
     let lsx_final = fs::read_to_string(verify_dir.join("unpacked/Mods/Meta.lsx")).unwrap();
     assert!(lsx_final.contains("【译】Mod Display Name"));
     assert!(lsx_final.contains("Internal_Id_Dont_Touch"));
+    // 模块内部标识符与句柄字段必须一字未动
+    assert!(lsx_final.contains(r#"value="Module Internal Name""#));
+    assert!(lsx_final.contains("h99999999g0000u1111i2222"));
 
     // 未翻译的文件内容保持不变
     let lua_final = fs::read_to_string(verify_dir.join("unpacked/Scripts/boot.lua")).unwrap();

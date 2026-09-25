@@ -219,7 +219,7 @@ python3 scripts/check_ipc_contract.py
 - `.github/workflows/release.yml`：只用 `windows-latest` 构建 NSIS + MSI + 便携版，
   整理成 4 个文件上传到 Actions 制品；打 tag 时同时创建 GitHub Release。
   手动触发时留空 `tag_name` 就只构建、不发布。发布链路上的闸门：
-  - 构建前校验标签与 `tauri.conf.json` 版本一致（`v0.3.0` ⇔ 版本 `0.3.0`）；
+  - 构建前校验标签与 `tauri.conf.json` 版本一致（`v1.0.0` ⇔ 版本 `1.0.0`）；
   - 整理产物时按类型分别断言 `*-Portable.zip` / `*.msi` / `*-Setup.exe` /
     `SHA256SUMS.txt` 各 ≥1（只看文件总数会漏掉「少打了一个安装包」），
     并拒绝 0 字节产物；

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Gauge, RotateCcw, Save, Settings2, Thermometer } from "lucide-react";
+import { Gauge, Info, RotateCcw, Save, Settings2, Thermometer } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -12,10 +12,10 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { NumberInput } from "@/components/ui/number-input";
 import { ErrorBanner } from "@/components/ui/error-banner";
-import { loadLlmSettings, saveLlmSettings } from "@/lib/tauri";
+import { getAppInfo, loadLlmSettings, saveLlmSettings } from "@/lib/tauri";
 import { DEFAULT_SETTINGS, useAppStore } from "@/store/app-store";
 import { cn } from "@/lib/utils";
-import type { LlmSettings } from "@/lib/types";
+import type { AppInfo, LlmSettings } from "@/lib/types";
 
 /** 采样温度预设 */
 const TEMPERATURE_PRESETS = [
@@ -32,6 +32,7 @@ export function SettingsPanel({ compact = false }: { compact?: boolean }) {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [info, setInfo] = useState<AppInfo | null>(null);
 
   // 首次加载已保存设置
   useEffect(() => {
@@ -43,6 +44,10 @@ export function SettingsPanel({ compact = false }: { compact?: boolean }) {
       .catch(() => {
         /* 用默认值 */
       });
+    // 运行信息只用于展示，拿不到就静默隐藏
+    getAppInfo()
+      .then(setInfo)
+      .catch(() => setInfo(null));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -231,6 +236,39 @@ export function SettingsPanel({ compact = false }: { compact?: boolean }) {
           <p className="text-center text-[11px] text-amber-600 dark:text-amber-400">
             有未保存的修改
           </p>
+        )}
+
+        {/* 配置到底存在哪：便携版最常被问的问题，直接摊开给用户看 */}
+        {info && (
+          <div className="space-y-2 border-t pt-4">
+            <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+              <Info className="h-3.5 w-3.5" />
+              运行信息
+            </div>
+            <dl className="space-y-1.5 text-xs">
+              <div className="flex gap-2">
+                <dt className="shrink-0 text-muted-foreground">版本</dt>
+                <dd className="font-medium tabular-nums">{info.version}</dd>
+              </div>
+              <div className="flex gap-2">
+                <dt className="shrink-0 text-muted-foreground">配置目录</dt>
+                <dd className="min-w-0 break-all font-mono text-[11px] leading-4">
+                  {info.dataDir}
+                </dd>
+              </div>
+              <div className="flex gap-2">
+                <dt className="shrink-0 text-muted-foreground">目录来源</dt>
+                <dd>
+                  {info.dataDirSource}
+                  {info.portable && (
+                    <span className="text-muted-foreground">
+                      （便携模式，备份时连这个目录一起带走即可）
+                    </span>
+                  )}
+                </dd>
+              </div>
+            </dl>
+          </div>
         )}
       </CardContent>
     </Card>

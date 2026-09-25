@@ -70,6 +70,7 @@ src-tauri/                    # 薄壳：Tauri 命令 + Channel 事件桥
 | `read_file_entries` | `workDir`, `fileName` | `TranslationEntry[]` |
 | `write_file_entries` | `workDir`, `fileName`, `entries` | `void` |
 | `repack_mod` | `workDir`, `outputPath` | `void` |
+| `close_mod` | — | `void` |
 | `translate_entries` | `workDir`, `entries`, `styleHint`, `onEvent` | `void` |
 | `cancel_translation` | — | `void` |
 | `save_llm_settings` | `settings` | `void` |
@@ -186,11 +187,18 @@ pub struct MatchedTerm { pub source: String, pub target: String }
 ## 测试策略
 
 - `bg3-translate-core`：单元测试与实现同文件（`#[cfg(test)] mod tests`），
-  需要临时目录时用 `tempfile`；需要 HTTP 时用本地 mock 或纯函数拆分。
-- `src-tauri/tests/`：只测跨层契约（事件序列化、命令参数名）。
-- 前端：`vitest` 测纯逻辑（路径改写、store reducer、过滤统计）。
-- 端到端：`crates/bg3-translate-core/tests/` 里用真实 PAK 样本跑
-  「解包 → 读条目 → 写回 → 重打包 → 再解包」的完整闭环。
+  需要临时目录时用 `tempfile`；需要 HTTP 时把请求层抽象成 trait 注入 fake。
+- 端到端：`crates/bg3-translate-core/tests/e2e_pak_flow.rs` 真的造一个 PAK，跑
+  「解包 → 识别类型 → 读条目 → 翻译 → 写回 → 重打包 → 再解包」的完整闭环。
+- 前端：`vitest` 测纯逻辑（路径改写、store reducer、过滤统计、虚拟滚动）。
+- **跨层契约**：`scripts/check_ipc_contract.py`（Python 标准库，秒级）核对
+  命令注册 / 前端 `invoke` / 本文件命令表三处集合相等，并核对
+  `TranslationEvent`、`TranslationStatus`、`PakFileKind` 三组枚举的 serde 名称
+  与 `src/lib/types.ts` 的联合类型一致。它在 CI 的 `meta` job 里跑。
+- `src-tauri` 本身**没有**集成测试：它依赖 webkit2gtk/gtk/dbus，本机与
+  ubuntu CI 都编译不了。壳层刻意做得很薄（只做参数转发与事件桥接），
+  验证手段是 CI 里 Windows runner 上的 `cargo check` + `cargo clippy -D warnings`，
+  以及上面那个契约脚本。这是有意的取舍，不是遗漏。
 
 ## 运行
 

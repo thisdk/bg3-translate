@@ -1,6 +1,7 @@
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import type {
+  AppInfo,
   ExtractResult,
   Glossary,
   GlossaryEntry,
@@ -72,6 +73,16 @@ export async function writeFileEntries(
   entries: TranslationEntry[],
 ): Promise<void> {
   await invoke("write_file_entries", { workDir, fileName, entries });
+}
+
+/** 释放当前 MOD 的临时工作目录（开始新的 MOD 时调用；不调用也会在打开下一个 MOD 时自动清理） */
+export async function closeMod(): Promise<void> {
+  await invoke("close_mod");
+}
+
+/** 读取运行时信息（版本、配置目录来源） */
+export async function getAppInfo(): Promise<AppInfo> {
+  return invoke<AppInfo>("app_info");
 }
 
 /** 重新打包工作目录为 .pak */

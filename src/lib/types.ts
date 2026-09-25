@@ -86,6 +86,18 @@ export interface BackendError {
   message: string;
 }
 
+/** 运行时信息（`app_info` 命令返回） */
+export interface AppInfo {
+  /** 应用版本 */
+  version: string;
+  /** 配置与术语表所在目录 */
+  dataDir: string;
+  /** 目录来源（环境变量 / 便携目录 / 系统配置目录） */
+  dataDirSource: string;
+  /** 是否处于便携模式（配置写在 exe 同级 config/） */
+  portable: boolean;
+}
+
 // ── 术语表 ──
 
 /** 单条术语（与 Rust glossary::GlossaryEntry 字段一致） */

@@ -23,10 +23,15 @@ env:
 
 jobs:
   meta:
-    name: 版本号一致性
+    name: 版本号一致性与 IPC 契约
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+
+      # 纯标准库脚本，几秒钟；能在没有 GUI 系统库的机器上提前发现
+      # 「命令名写错」「前端调了不存在的命令」「文档腐烂」
+      - name: 跨层 IPC 契约检查
+        run: python3 scripts/check_ipc_contract.py
 
       - name: 校验 package.json / Cargo.toml / tauri.conf.json 版本一致
         run: |

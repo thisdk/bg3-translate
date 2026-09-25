@@ -20,6 +20,7 @@ import { TranslationTable } from "@/components/TranslationTable";
 import { useAppStore } from "@/store/app-store";
 import { planLocalizationWrites } from "@/lib/localization";
 import {
+  closeMod,
   loadLlmSettings,
   pickSavePath,
   repackMod,
@@ -97,6 +98,16 @@ function DonePage() {
   const reset = useAppStore((s) => s.reset);
   const [packing, setPacking] = useState(false);
   const [outputPath, setOutputPath] = useState<string | null>(null);
+
+  // 释放后端临时工作目录后再清空前端状态，避免临时文件堆到下次打开 MOD
+  const onStartOver = async () => {
+    try {
+      await closeMod();
+    } catch {
+      /* 清理失败不该挡住用户重新开始 */
+    }
+    reset();
+  };
 
   const onPack = async () => {
     if (!workDir || !modFilePath) return;
@@ -206,7 +217,11 @@ function DonePage() {
                 <ArrowLeft className="h-4 w-4" />
                 返回继续编辑
               </Button>
-              <Button variant="ghost" className="h-12 w-full" onClick={reset}>
+              <Button
+                variant="ghost"
+                className="h-12 w-full"
+                onClick={onStartOver}
+              >
                 <RotateCcw className="h-4 w-4" />
                 开始新的 MOD
               </Button>

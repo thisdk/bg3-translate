@@ -1,7 +1,7 @@
 //! 术语表命令。
 
+use bg3_translate_core::Result;
 use bg3_translate_core::glossary::{Glossary, GlossaryEntry};
-use bg3_translate_core::{AppError, Result};
 
 use crate::commands::blocking;
 
@@ -55,8 +55,5 @@ pub async fn reset_glossary() -> Result<Glossary> {
 /// 导入游戏提取的完整术语表 JSON（自动清洗噪音条目）。
 #[tauri::command]
 pub async fn import_glossary(json_str: String) -> Result<Glossary> {
-    blocking("导入术语表", move || {
-        Glossary::import_json(&json_str).map_err(AppError::from)
-    })
-    .await
+    blocking("导入术语表", move || Glossary::import_json(&json_str)).await
 }

@@ -301,10 +301,70 @@ fn extract_to_directory_writes_files_without_work_dir() {
 }
 
 #[test]
-fn path_helpers_target_the_chinese_localization_directory() {
-    assert_eq!(
-        bg3_translate_core::to_target_localization_path("Localization/English/test.xml"),
-        "Localization/Chinese/test.xml"
+fn writing_to_a_not_yet_existing_target_file_creates_it() {
+    // 前端会把 `Localization/English/foo.xml` 的译文写到 `Localization/Chinese/foo.xml`，
+    // 而这个文件在 MOD 里往往并不存在——后端必须能凭空创建出来。
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("src");
+    build_mod_tree(&source);
+    let input_pak = tmp.path().join("M.pak");
+    pack(&source, &input_pak, 0);
+
+    let work_root = tmp.path().join("work");
+    fs::create_dir_all(&work_root).unwrap();
+    let (work_dir, _) = pak::open_and_extract_in(input_pak.to_str().unwrap(), &work_root).unwrap();
+
+    // 先按英文原文读出条目
+    let entries = formats::read_entries(
+        work_dir.to_str().unwrap(),
+        "Localization/English/test.xml",
+        PakFileKind::LocalizationXml,
+    )
+    .unwrap();
+    let translated: Vec<TranslationEntry> = entries
+        .into_iter()
+        .map(|mut entry| {
+            let target = format!("中文：{}", entry.source);
+            entry.mark_translated(target);
+            entry
+        })
+        .collect();
+
+    // 再写到「还不存在」的中文目录
+    formats::write_entries(
+        work_dir.to_str().unwrap(),
+        "Localization/Chinese/test.xml",
+        PakFileKind::LocalizationXml,
+        &translated,
+    )
+    .unwrap();
+
+    let new_file = work_dir.join("unpacked/Localization/Chinese/test.xml");
+    assert!(new_file.is_file(), "后端应能创建目标语言目录与文件");
+    let content = fs::read_to_string(&new_file).unwrap();
+    assert!(content.contains("中文：Hello, adventurer."));
+    assert!(content.contains("<LSTag Tag=\"Fire\">"));
+
+    // 重新打包后应该同时包含英文原文与新建的中文文件
+    let output_pak = tmp.path().join("M_zh.pak");
+    pak::repack(work_dir.to_str().unwrap(), output_pak.to_str().unwrap()).unwrap();
+
+    let verify_root = tmp.path().join("verify");
+    fs::create_dir_all(&verify_root).unwrap();
+    let (verify_dir, verify_files) =
+        pak::open_and_extract_in(output_pak.to_str().unwrap(), &verify_root).unwrap();
+    assert!(
+        verify_files
+            .iter()
+            .any(|f| f.name == "Localization/Chinese/test.xml"),
+        "打包后应包含新建的中文文件"
     );
-    assert!(bg3_translate_core::is_target_language("ChineseSimplified"));
+    assert!(
+        verify_files
+            .iter()
+            .any(|f| f.name == "Localization/English/test.xml")
+    );
+    let created =
+        fs::read_to_string(verify_dir.join("unpacked/Localization/Chinese/test.xml")).unwrap();
+    assert!(created.contains("中文：Hello, adventurer."));
 }

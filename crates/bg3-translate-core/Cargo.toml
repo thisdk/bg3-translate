@@ -23,16 +23,27 @@ futures-util.workspace = true
 directories.workspace = true
 
 # TLS 后端按平台选择：
-# - Windows：走系统 schannel（native-tls），零额外原生依赖，CI 最省事
+# - Windows（唯一发布平台）：走系统 schannel（native-tls），不需要 CMake/NASM，
+#   也不编译 aws-lc-rs，Windows 构建更快更稳
 # - 其他平台：走 rustls，避免依赖系统 OpenSSL（本地开发/测试可直接编译）
+#
+# 注意 reqwest 0.13 里 `default-tls = ["rustls"]`（不是 native-tls），
+# 所以 Windows 分支必须显式关掉默认特性再打开 native-tls。
 [target.'cfg(windows)'.dependencies]
-reqwest = { version = "0.13.5", features = ["json", "stream", "http2"] }
+reqwest = { version = "0.13.5", default-features = false, features = [
+    "json",
+    "stream",
+    "http2",
+    "charset",
+    "native-tls",
+] }
 
 [target.'cfg(not(windows))'.dependencies]
 reqwest = { version = "0.13.5", default-features = false, features = [
     "json",
     "stream",
     "http2",
+    "charset",
     "rustls",
 ] }
 

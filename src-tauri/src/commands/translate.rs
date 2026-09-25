@@ -2,10 +2,8 @@
 
 use bg3_translate_core::config;
 use bg3_translate_core::glossary::Glossary;
-use bg3_translate_core::translation::{
-    EventSink, RunOptions, TranslationEngine, TranslationEvent, TranslationSummary,
-};
-use bg3_translate_core::types::{LlmSettings, TranslationEntry};
+use bg3_translate_core::translation::{EventSink, RunOptions, TranslationEngine};
+use bg3_translate_core::types::{LlmSettings, TranslationEntry, TranslationEvent};
 use bg3_translate_core::{AppError, Result};
 use tauri::State;
 use tauri::ipc::Channel;
@@ -36,11 +34,16 @@ impl EventSink for ChannelSink {
 #[tauri::command]
 pub async fn translate_entries(
     state: State<'_, AppState>,
-    _work_dir: String,
+    work_dir: String,
     entries: Vec<TranslationEntry>,
     style_hint: Option<String>,
     on_event: Channel<TranslationEvent>,
-) -> Result<TranslationSummary> {
+) -> Result<()> {
+    // 工作目录目前只在日志里用：条目自带 source_file，翻译不需要读盘。
+    // 保留这个参数是为了跟前端的既有调用保持一致（Tauri 的形参名必须能
+    // 从 JS 的 camelCase 反查回来，所以不能写成 `_work_dir`）。
+    log::debug!("翻译请求：work_dir={work_dir}，条目 {} 条", entries.len());
+
     let settings = resolve_settings(&state).await?;
     if !settings.is_configured() {
         return Err(AppError::config(
@@ -69,7 +72,16 @@ pub async fn translate_entries(
         )
         .await?;
 
-    Ok(summary)
+    // 汇总结果这里只记日志：前端已经通过 all_done 事件拿到 total/failed，
+    // 命令返回值保持 void，避免契约里多一个需要两边同步的结构。
+    log::info!(
+        "翻译结束：待翻译 {} 条，成功 {} 条，失败 {} 条，取消={}",
+        summary.total,
+        summary.translated,
+        summary.failed,
+        summary.cancelled
+    );
+    Ok(())
 }
 
 /// 请求取消当前翻译任务。

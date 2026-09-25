@@ -31,10 +31,20 @@ const BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 const INLINE_TAGS: &[&str] = &["LSTag", "font", "i", "b", "u", "br", "span", "em", "strong"];
 
 /// 从磁盘读取并解析。
+///
+/// XML 格式错误时**返回错误而不是返回残缺的条目列表**：写回是「用条目重建整个
+/// 文档」，如果带着残缺列表去写，畸形标签之后的所有原文都会被永久删掉。
+/// 宁可让用户看到一条明确的错误，也不能悄悄产出内容缺失的 PAK。
 pub fn read(path: &Path, file_name: &str) -> Result<Vec<TranslationEntry>> {
     let bytes = std::fs::read(path)?;
     let xml = decode_utf8(&bytes, "本地化 XML")?;
-    Ok(parse(&xml, file_name).entries)
+    let parsed = parse(&xml, file_name);
+    if let Some(error) = parsed.error {
+        return Err(AppError::xml(format!(
+            "{file_name} 解析失败，已中止读取以避免写回时丢失条目: {error}"
+        )));
+    }
+    Ok(parsed.entries)
 }
 
 /// 解析结果：条目 + 根元素属性（写回时保留）。
@@ -42,6 +52,9 @@ pub fn read(path: &Path, file_name: &str) -> Result<Vec<TranslationEntry>> {
 pub struct ParsedContentList {
     pub entries: Vec<TranslationEntry>,
     pub root_attributes: Vec<(String, String)>,
+    /// 解析中断的原因。`Some` 表示文档没有完整读下来，
+    /// 调用方**不应该**拿这份残缺结果去覆盖原文件。
+    pub error: Option<String>,
 }
 
 /// 解析 contentList XML，提取所有 `<content>` 条目。
@@ -119,9 +132,18 @@ pub fn parse(xml: &str, file_name: &str) -> ParsedContentList {
             Ok(Event::CData(e)) if pending.is_some() => {
                 raw.push_str(e.as_ref());
             }
-            Ok(Event::Eof) => break,
+            Ok(Event::Eof) => {
+                // quick-xml 对「文档还没闭合就到头了」不报错，只在 Eof 处停下。
+                // 这种截断必须自己发现，否则后面那些条目会静默消失。
+                if pending.is_some() {
+                    parsed.error =
+                        Some("文档在 <content> 元素内部意外结束（文件可能被截断）".into());
+                }
+                break;
+            }
             Err(err) => {
                 log::warn!("{file_name} XML 解析中断: {err}");
+                parsed.error = Some(err.to_string());
                 break;
             }
             _ => {}
@@ -490,11 +512,26 @@ mod tests {
     }
 
     #[test]
-    fn malformed_xml_keeps_what_it_could_parse() {
+    fn malformed_xml_is_reported_instead_of_silently_truncating() {
+        // 畸形标签之后的内容都读不到了。此时若返回残缺列表，写回就会把
+        // 后面所有条目删掉——所以必须把错误暴露出来。
         let xml = r#"<contentList><content contentuid="h1" version="1">ok</content><content contentuid="h2" version="1">broken"#;
         let parsed = parse(xml, "t.xml");
-        assert_eq!(parsed.entries.len(), 1);
-        assert_eq!(parsed.entries[0].source, "ok");
+        assert_eq!(parsed.entries.len(), 1, "解析器仍应保留能读到的部分");
+        assert!(parsed.error.is_some(), "解析中断必须被记录");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Broken.xml");
+        std::fs::write(&path, xml).unwrap();
+        let err = read(&path, "Broken.xml").unwrap_err();
+        assert_eq!(err.code(), "xml");
+        assert!(err.to_string().contains("Broken.xml"));
+    }
+
+    #[test]
+    fn complete_documents_report_no_error() {
+        let parsed = parse(SAMPLE, "t.xml");
+        assert!(parsed.error.is_none());
     }
 
     #[test]

@@ -2,9 +2,9 @@
 
 use std::path::PathBuf;
 
+use bg3_translate_core::Result;
 use bg3_translate_core::pak;
 use bg3_translate_core::types::{ExtractResult, PakFile};
-use bg3_translate_core::{AppError, Result};
 use tauri::State;
 
 use crate::commands::blocking;
@@ -21,8 +21,10 @@ pub async fn open_mod(state: State<'_, AppState>, file_path: String) -> Result<E
     })
     .await?;
 
+    // 记下新工作目录，并把上一个目录删掉（每次都是新建的唯一目录，
+    // 相同只可能出现在极端并发下，所以顺手判一下再删）
     if let Some(previous) = state.replace_work_dir(PathBuf::from(&work_dir)) {
-        if previous != PathBuf::from(&work_dir) {
+        if previous.as_os_str() != work_dir.as_str() {
             log::info!("清理上一个工作目录: {}", previous.display());
             pak::remove_work_dir(&previous);
         }
@@ -54,14 +56,4 @@ pub async fn close_mod(state: State<'_, AppState>) -> Result<()> {
         pak::remove_work_dir(&dir);
     }
     Ok(())
-}
-
-/// 校验工作目录是否仍然存在（前端切回旧会话时可用来兜底）。
-#[tauri::command]
-pub async fn work_dir_alive(work_dir: String) -> Result<bool> {
-    let path = PathBuf::from(&work_dir);
-    if path.as_os_str().is_empty() {
-        return Err(AppError::config("工作目录为空"));
-    }
-    Ok(pak::unpacked_dir(&path).is_dir())
 }

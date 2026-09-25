@@ -188,8 +188,9 @@ OpenAI 兼容协议的「结构」与「传输」是分开的，改代码前先�
 | 重试、退避、取消、结构纠错 | 本仓库 | `translation/{retry,events}.rs` |
 
 - **为什么只借类型**：`chat-completion-types` 不含 `_api`，所以不会带进 `reqwest` /
-  `tower` / `eventsource-stream` / `tracing`。传递依赖增量是 **7 个包**
-  （`async-openai` + `derive_builder` 一脉 + `darling` 一脉）；开完整 SDK 特性是 35 个包。
+  `tower` / `eventsource-stream` / `tracing`。本仓库依赖图的增量是 **7 个包**
+  （`async-openai` + `derive_builder` 一脉 + `darling` 一脉）；改开自带 HTTP 客户端的
+  `chat-completion` 特性集则是 35 个包。
 - **线上格式有测试钉住**：`build_chat_request_matches_the_wire_format` 断言类型化请求
   序列化出来**恰好**是 `{model, stream, temperature, messages}` 四个字段，与拆分前手写的
   `json!` 逐字段一致（async-openai 的请求结构有几十个字段，不能被填成 `null` 一起发出去）。

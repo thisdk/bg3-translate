@@ -19,8 +19,9 @@ on:
         required: false
         type: string
 
+# 默认只读；写权限只给真正需要创建 Release 的 publish job
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -61,6 +62,18 @@ jobs:
           $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
           "value=$version" >> $env:GITHUB_OUTPUT
           Write-Host "版本号: $version"
+
+      - name: 校验发布标签与应用版本一致
+        if: startsWith(env.RELEASE_TAG, 'v')
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          $expected = "v$env:APP_VERSION"
+          if ($env:RELEASE_TAG -ne $expected) {
+            throw "标签 $env:RELEASE_TAG 与 tauri.conf.json 的版本 $env:APP_VERSION 不一致（应为 $expected）。请先同步三处版本号再打标签。"
+          }
+          Write-Host "标签与版本一致: $env:RELEASE_TAG"
 
       - name: 构建应用（MSI + NSIS + 便携 exe）
         run: bun tauri build
@@ -119,7 +132,24 @@ jobs:
           $count = (Get-ChildItem -Path $out -File).Count
           Write-Host "共整理出 $count 个发布文件："
           Get-ChildItem -Path $out -File | ForEach-Object { Write-Host "  - $($_.Name)" }
-          if ($count -lt 3) { throw "发布文件数量异常（至少应有便携版 + 一个安装包 + 校验和）。" }
+
+          # 逐类校验，而不是只看文件总数：少一个安装包时总数仍然是 3，
+          # 只数个数会把「MSI 没打出来」这种问题放过去。
+          $names = Get-ChildItem -Path $out -File | ForEach-Object { $_.Name }
+          $required = @{
+            "便携版 zip" = @($names | Where-Object { $_ -like "*-Portable.zip" }).Count
+            "MSI 安装包" = @($names | Where-Object { $_ -like "*.msi" }).Count
+            "NSIS 安装程序" = @($names | Where-Object { $_ -like "*-Setup.exe" }).Count
+            "校验和文件" = @($names | Where-Object { $_ -eq "SHA256SUMS.txt" }).Count
+          }
+          $missingKinds = @()
+          foreach ($kind in $required.Keys) {
+            if ($required[$kind] -lt 1) { $missingKinds += $kind }
+          }
+          if ($missingKinds.Count -gt 0) {
+            throw "缺少发布产物：$($missingKinds -join '、')。tauri.conf.json 的 bundle.targets 应同时产出 nsis 与 msi。"
+          }
+          Write-Host "四类产物齐全：便携版 zip / MSI / NSIS / SHA256SUMS"
 
       - name: 上传构建制品
         uses: actions/upload-artifact@v7
@@ -133,6 +163,8 @@ jobs:
     name: 发布到 GitHub Release
     runs-on: ubuntu-latest
     needs: build-windows
+    permissions:
+      contents: write
     if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.tag_name != '') }}
     steps:
       - name: 下载构建制品

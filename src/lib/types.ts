@@ -64,7 +64,9 @@ export interface LlmSettings {
 
 /**
  * 流式翻译事件。Rust 端通过 Tauri Channel 推送，
- * 与 src-tauri/src/translation/events.rs 的 #[serde(tag="type")] 对齐。
+ * 与 crates/bg3-translate-core/src/types.rs 的 `TranslationEvent`
+ * （#[serde(tag = "type", rename_all = "snake_case")]）对齐，
+ * 由 scripts/check_ipc_contract.py 在 CI 上校验。
  */
 export type TranslationEvent =
   | { type: "progress"; entryId: string; status: TranslationStatus }
@@ -79,11 +81,6 @@ export interface ExtractResult {
   workDir: string;
   /** 文件列表 */
   files: PakFile[];
-}
-
-/** 调用后端的统一错误格式 */
-export interface BackendError {
-  message: string;
 }
 
 /** 运行时信息（`app_info` 命令返回） */

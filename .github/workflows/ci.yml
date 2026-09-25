@@ -16,7 +16,9 @@ on:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # PR 上取消旧运行省时间；分支 push 改为排队，否则连续提交会把
+  # 需要十几分钟的 Windows tauri-shell job 反复掐掉，永远拿不到信号。
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always

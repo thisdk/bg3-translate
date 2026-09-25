@@ -40,7 +40,7 @@
 
 ### 术语表
 
-内置约 170 条 BG3 官方核心译名（职业、种族、地名、角色、法术、机制……）开箱即用。
+内置 102 条 BG3 官方核心译名（职业、种族、地名、角色、法术、机制……）开箱即用。
 也可以导入从游戏里提取的完整官方术语表（2 万条级别），导入时会自动过滤噪音条目
 （占位符模板、UI 内部标记、破折号碎片、`of`/`the` 这类会误匹配的短词）。
 
@@ -161,9 +161,12 @@ python3 scripts/check_ipc_contract.py
 工具会尽量保留标签、占位符、`contentuid` 和 `version`（这三样是游戏查表的句柄，
 改了就会失效），但打包前最好还是抽几条关键文本进游戏里看一眼。
 
-`.lsx` 里只翻译白名单字段（`Name` / `Description` / `DisplayName` / `Title` /
-`Tooltip` / `TooltipDescription`）且类型必须是 `LSString` / `LSWString`；
-`TranslatedString` 类型存的是 contentuid 句柄，**不会**被翻译。
+`.lsx` 里只翻译白名单字段（`Description` / `DisplayName` / `Title` / `Tooltip` /
+`TooltipDescription`）且类型必须是 `LSString` / `LSWString`。
+
+`Name` **故意不在白名单里**：`Mods/<mod>/meta.lsx` 的 `Name` 是模块内部标识符
+（`GustavDev`），类型同样是 `LSString`，翻译它会让 MOD 直接失效。
+`TranslatedString` 类型存的是 contentuid 句柄，也不会被翻译。
 
 ## 许可
 

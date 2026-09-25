@@ -17,6 +17,9 @@ import { DEFAULT_SETTINGS, useAppStore } from "@/store/app-store";
 import { cn } from "@/lib/utils";
 import type { AppInfo, LlmSettings } from "@/lib/types";
 
+/** 并发上限：与后端 LlmSettings::normalized() 的 clamp(1, 64) 保持一致 */
+const MAX_CONCURRENCY = 64;
+
 /** 采样温度预设 */
 const TEMPERATURE_PRESETS = [
   { value: 0.1, label: "严谨" },
@@ -60,7 +63,7 @@ export function SettingsPanel({ compact = false }: { compact?: boolean }) {
       : DEFAULT_SETTINGS.temperature;
     const normalizedForm: LlmSettings = {
       ...form,
-      concurrency: Math.round(Math.min(100, Math.max(1, concurrency))),
+      concurrency: Math.round(Math.min(MAX_CONCURRENCY, Math.max(1, concurrency))),
       temperature: Math.min(1, Math.max(0, temperature)),
     };
     setSaving(true);
@@ -157,12 +160,13 @@ export function SettingsPanel({ compact = false }: { compact?: boolean }) {
           <NumberInput
             id="concurrency"
             min={1}
-            max={100}
+            max={MAX_CONCURRENCY}
             value={form.concurrency}
             onValueChange={(concurrency) => setForm({ ...form, concurrency })}
           />
           <p className="text-xs text-muted-foreground">
-            数值越大翻译越快，但会增加 API 并发请求量。建议 4-8，最高 100。
+            数值越大翻译越快，但会增加 API 并发请求量。建议 4-8，最高
+            {MAX_CONCURRENCY}。
           </p>
         </div>
 

@@ -112,14 +112,46 @@ pub fn resolve_disk_path(work_dir: impl AsRef<Path>, file_name: &str) -> PathBuf
     unpacked_dir(work_dir).join(normalize_entry_name(file_name))
 }
 
-/// 把 PAK 内路径安全地拼到根目录下，拒绝 `..`、绝对路径、盘符。
+/// Windows 保留设备名：写这些名字会失败或者变成设备，而不是普通文件。
+#[cfg_attr(not(windows), allow(dead_code))]
+const WINDOWS_RESERVED_NAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// 某个路径片段是否是 Windows 上不能当文件名用的名字。
+fn is_reserved_windows_component(part: &str) -> bool {
+    // `NUL.txt` 同样会被解析成设备名，所以只比较第一个 `.` 之前的部分
+    let stem = part.split('.').next().unwrap_or(part);
+    WINDOWS_RESERVED_NAMES
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(stem))
+}
+
+/// 把 PAK 内路径安全地拼到根目录下。
 ///
-/// 这是防 zip-slip / pak-slip 的关键函数。
+/// 这是防 zip-slip / pak-slip 的关键函数，拒绝：
+/// - `..`（目录穿越）与绝对路径 / 盘符
+/// - Windows 保留设备名（`CON`、`NUL`、`COM1`……）
+/// - 含 `:` 的片段（Windows 上 `a:b` 是 NTFS 数据流写法，会写到文件之外）
 pub fn safe_output_path(root: &Path, file_name: &str) -> Result<PathBuf> {
     let mut output = root.to_path_buf();
     for component in Path::new(&normalize_entry_name(file_name)).components() {
         match component {
-            Component::Normal(part) => output.push(part),
+            Component::Normal(part) => {
+                let part = part.to_string_lossy();
+                if part.contains(':') {
+                    return Err(AppError::pak(format!(
+                        "非法归档路径（含冒号）: {file_name}"
+                    )));
+                }
+                if is_reserved_windows_component(&part) {
+                    return Err(AppError::pak(format!(
+                        "非法归档路径（Windows 保留设备名）: {file_name}"
+                    )));
+                }
+                output.push(part.as_ref());
+            }
             Component::CurDir => {}
             Component::Prefix(_) | Component::RootDir | Component::ParentDir => {
                 return Err(AppError::pak(format!("非法归档路径: {file_name}")));
@@ -447,6 +479,14 @@ mod tests {
         assert!(safe_output_path(root, "a/../../evil.txt").is_err());
         assert!(safe_output_path(root, "/evil.txt").is_err());
         assert!(safe_output_path(root, r"..\evil.txt").is_err());
+        // Windows 保留设备名与 NTFS 数据流
+        assert!(safe_output_path(root, "CON").is_err());
+        assert!(safe_output_path(root, "nul.txt").is_err());
+        assert!(safe_output_path(root, "Mods/COM1.lsx").is_err());
+        assert!(safe_output_path(root, "a:b.txt").is_err());
+        // 只是名字里含保留词的不该误伤
+        assert!(safe_output_path(root, "CONFIG.lsx").is_ok());
+        assert!(safe_output_path(root, "Console.txt").is_ok());
         assert_eq!(
             safe_output_path(root, "Localization/English/test.xml").unwrap(),
             root.join("Localization").join("English").join("test.xml")

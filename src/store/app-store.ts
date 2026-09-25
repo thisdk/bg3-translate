@@ -7,7 +7,7 @@ import type {
 } from "@/lib/types";
 
 /** 应用整体流程阶段 */
-export type AppStage = "home" | "files" | "translate" | "done";
+export type AppStage = "home" | "files" | "done";
 
 /** 主题 */
 export type Theme = "light" | "dark" | "cyberpunk" | "dungeon";
@@ -41,9 +41,6 @@ interface AppState {
   entriesByFile: EntriesByFile;
   /** entryId → fileName 反查索引，加速 delta 高频更新 */
   entryIdToFile: Record<string, string>;
-  /** 当前正在翻译的条目 id 集合 */
-  translatingIds: Set<string>;
-
   // ── LLM 设置 ──
   settings: LlmSettings;
   settingsLoaded: boolean;
@@ -137,7 +134,6 @@ export const useAppStore = create<AppState>((set, get) => ({
   loadedFileNames: new Set(),
   entriesByFile: {},
   entryIdToFile: {},
-  translatingIds: new Set(),
   settings: DEFAULT_SETTINGS,
   settingsLoaded: false,
   theme: loadTheme(),
@@ -230,7 +226,6 @@ export const useAppStore = create<AppState>((set, get) => ({
       loadedFileNames: new Set(),
       entriesByFile: {},
       entryIdToFile: {},
-      translatingIds: new Set(),
       error: null,
     }),
 }));

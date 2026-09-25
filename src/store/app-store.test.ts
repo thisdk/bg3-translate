@@ -236,7 +236,6 @@ describe("reset", () => {
     expect(state().entriesByFile).toEqual({});
     expect(state().entryIdToFile).toEqual({});
     expect(state().loadedFileNames.size).toBe(0);
-    expect(state().translatingIds.size).toBe(0);
     expect(state().error).toBeNull();
     // 主题与设置属于用户偏好，reset 不清空
     expect(state().theme).toBe("dungeon");

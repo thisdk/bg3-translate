@@ -30,6 +30,9 @@ const BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 /// 解析后与标签无法区分；只放行已知标签可以避免把文本内容误写成标签。
 const INLINE_TAGS: &[&str] = &["LSTag", "font", "i", "b", "u", "br", "span", "em", "strong"];
 
+/// 空元素：写成 `<br>` 或 `<br/>` 都不需要闭合标签，配对检查时要跳过。
+const VOID_TAGS: &[&str] = &["br"];
+
 /// 从磁盘读取并解析。
 ///
 /// XML 格式错误时**返回错误而不是返回残缺的条目列表**：写回是「用条目重建整个
@@ -198,7 +201,20 @@ pub fn render(
         start.push_attribute(("contentuid", entry.contentuid.as_str()));
         start.push_attribute(("version", entry.version.as_str()));
         write_event(&mut writer, Event::Start(start))?;
-        write_text_fragment(&mut writer, entry.effective_text())?;
+        let text = entry.effective_text();
+        if is_tag_balanced(text) {
+            write_text_fragment(&mut writer, text)?;
+        } else {
+            // 模型偶尔会多吐一个 `</LSTag>` 或者漏掉闭合标签。原样写出去会让
+            // 整个本地化文件变成非法 XML，游戏可能直接放弃解析这个文件——
+            // 那样丢的是**整份译文**，代价远大于一条文本里多几个字面标签。
+            // 所以这里退化成纯文本：XML 一定合法，问题在界面上肉眼可见。
+            log::warn!(
+                "条目 {} 的译文标签不配对，已按纯文本写入以避免产出非法 XML",
+                entry.contentuid
+            );
+            write_event(&mut writer, Event::Text(BytesText::new(text)))?;
+        }
         write_event(&mut writer, Event::End(BytesEnd::new("content")))?;
     }
 
@@ -328,6 +344,46 @@ fn write_text_fragment<W: std::io::Write>(writer: &mut Writer<W>, text: &str) ->
         write_event(writer, Event::Text(BytesText::new(rest)))?;
     }
     Ok(())
+}
+
+/// 判断一段文本里的富文本标签是否配对（开闭成对、自闭合不算）。
+///
+/// 只有通过这个检查的文本才会把标签当真实标签写出去；否则整条按纯文本转义，
+/// 保证产物永远是合法 XML。
+pub fn is_tag_balanced(text: &str) -> bool {
+    let mut stack: Vec<&str> = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find('<') {
+        let after = &rest[start..];
+        let Some(rel_end) = after.find('>') else {
+            // 有个没闭合的 `<`：不是标签，当普通文本
+            break;
+        };
+        let tag = &after[..=rel_end];
+        if is_allowed_inline_tag(tag) {
+            let inner = &tag[1..tag.len() - 1];
+            let trimmed = inner.trim();
+            if trimmed.ends_with('/') {
+                // 自闭合，不入栈
+            } else if let Some(name) = trimmed.strip_prefix('/') {
+                match stack.pop() {
+                    Some(open) if open == name.trim() => {}
+                    // 闭合标签对不上栈顶：不配对
+                    _ => return false,
+                }
+            } else {
+                let name = trimmed
+                    .split(|c: char| c.is_whitespace())
+                    .next()
+                    .unwrap_or("");
+                if !VOID_TAGS.contains(&name) {
+                    stack.push(name);
+                }
+            }
+        }
+        rest = &after[rel_end + 1..];
+    }
+    stack.is_empty()
 }
 
 /// 判断 `<...>` 是否是白名单里的富文本标签（开/闭/自闭合都算）。
@@ -497,6 +553,59 @@ mod tests {
         std::fs::write(&path, [0xFF, 0xFE, 0x00, 0x41]).unwrap();
         let err = read(&path, "bad.xml").unwrap_err();
         assert_eq!(err.code(), "xml");
+    }
+
+    #[test]
+    fn tag_balance_detection() {
+        assert!(is_tag_balanced("plain text"));
+        assert!(is_tag_balanced("a <LSTag>inner</LSTag> b"));
+        assert!(is_tag_balanced(r#"<LSTag Tag="Fire">x</LSTag><i>y</i>"#));
+        assert!(is_tag_balanced("<br/>"));
+        assert!(is_tag_balanced("<br>"));
+        assert!(is_tag_balanced("a < b")); // 不是标签
+
+        // 多一个闭合标签（模型最常见的幻觉）
+        assert!(!is_tag_balanced("text </LSTag>"));
+        assert!(!is_tag_balanced("text </LSTag></LSTag>"));
+        // 只有开标签、没有闭合
+        assert!(!is_tag_balanced("text <LSTag>"));
+        // 闭合标签名字对不上
+        assert!(!is_tag_balanced("<LSTag>x</font>"));
+        // 白名单外的标签不参与配对，也不会被当成标签写出去
+        assert!(is_tag_balanced("<script>x</script>"));
+    }
+
+    #[test]
+    fn unbalanced_model_output_never_produces_invalid_xml() {
+        let entries = vec![
+            {
+                let mut e = TranslationEntry::new("t.xml", "h1", "1", "src");
+                e.mark_translated("正常 <LSTag Tag=\"Fire\">火球</LSTag> 文本");
+                e
+            },
+            {
+                let mut e = TranslationEntry::new("t.xml", "h2", "1", "src");
+                // 模型多吐了一个闭合标签
+                e.mark_translated("多余闭合 </LSTag> 文本");
+                e
+            },
+        ];
+
+        let xml = render(&entries, &[]).unwrap();
+
+        // 产物必须能被自己重新解析，且不报错
+        let reparsed = parse(&xml, "t.xml");
+        assert!(reparsed.error.is_none(), "产出的 XML 必须合法: {xml}");
+        assert_eq!(reparsed.entries.len(), 2);
+
+        // 正常的标签照旧保留
+        assert!(xml.contains(r#"<LSTag Tag="Fire">火球</LSTag>"#));
+        // 不配对的标签退化成字面文本，而不是变成非法标签
+        assert!(
+            xml.contains("&lt;/LSTag&gt;"),
+            "不配对的标签应被转义: {xml}"
+        );
+        assert!(!xml.contains("多余闭合 </LSTag>"));
     }
 
     #[test]

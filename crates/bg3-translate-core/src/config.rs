@@ -111,7 +111,10 @@ fn current_exe_dir() -> Option<PathBuf> {
         .and_then(|exe| exe.parent().map(Path::to_path_buf))
 }
 
-/// 解析并创建数据目录（带缓存，进程内只解析一次）。
+/// 解析并创建数据目录。
+///
+/// 每次调用都会重新探测（要判断 exe 同级目录是否可写），
+/// 但调用点很少（读写设置、读写术语表），这点 IO 可以忽略。
 pub fn data_dir() -> Result<DataDir> {
     let env_home = std::env::var_os(ENV_HOME).map(PathBuf::from);
     let exe_dir = current_exe_dir();

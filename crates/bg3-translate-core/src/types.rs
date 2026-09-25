@@ -360,7 +360,8 @@ fn default_temperature() -> f32 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LlmSettings {
-    /// API base URL，例如 `https://api.deepseek.com`
+    /// API base URL，例如 `https://api.deepseek.com`（带不带 `/v1` 都可以，
+    /// 见 [`LlmSettings::chat_completions_url`]）
     #[serde(default = "default_base_url")]
     pub base_url: String,
     /// API Key
@@ -407,11 +408,28 @@ impl LlmSettings {
     }
 
     /// chat/completions 完整地址。
+    ///
+    /// 用户粘进来的地址花样很多，这里统一收口（尾斜杠在 [`LlmSettings::normalized`]
+    /// 里已经去掉）：
+    ///
+    /// | 填的 baseUrl | 实际请求 |
+    /// | --- | --- |
+    /// | `https://host` | `https://host/v1/chat/completions` |
+    /// | `https://host/v1` | `https://host/v1/chat/completions` |
+    /// | `https://host/openai/v1` | `https://host/openai/v1/chat/completions` |
+    /// | `https://host/v1/chat/completions` | 原样使用 |
+    ///
+    /// 第二行是必须的：`https://api.deepseek.com/v1` 是最常见的填法之一，
+    /// 直接拼 `/v1/chat/completions` 会得到 `/v1/v1/chat/completions` → 404。
     pub fn chat_completions_url(&self) -> String {
-        format!(
-            "{}/v1/chat/completions",
-            self.base_url.trim().trim_end_matches('/')
-        )
+        let base = self.base_url.trim().trim_end_matches('/');
+        if base.ends_with("/chat/completions") {
+            base.to_string()
+        } else if base.ends_with("/v1") {
+            format!("{base}/chat/completions")
+        } else {
+            format!("{base}/v1/chat/completions")
+        }
     }
 
     /// 是否已配置到可以发起请求。
@@ -657,6 +675,50 @@ mod tests {
         assert_eq!(
             normalized.chat_completions_url(),
             "https://x.test/v1/chat/completions"
+        );
+    }
+
+    /// 用户填的 baseUrl 五花八门，四种常见写法都必须落到同一个端点。
+    #[test]
+    fn chat_completions_url_accepts_every_common_base_url_shape() {
+        let url = |base: &str| {
+            LlmSettings {
+                base_url: base.into(),
+                ..LlmSettings::default()
+            }
+            .normalized()
+            .chat_completions_url()
+        };
+
+        // 不带版本前缀 → 补 /v1
+        assert_eq!(
+            url("https://api.deepseek.com"),
+            "https://api.deepseek.com/v1/chat/completions"
+        );
+        // 已经带了 /v1（最常见的坑）→ 不能再补一次
+        assert_eq!(
+            url("https://api.deepseek.com/v1"),
+            "https://api.deepseek.com/v1/chat/completions"
+        );
+        // 尾斜杠
+        assert_eq!(
+            url("https://api.deepseek.com/v1/"),
+            "https://api.deepseek.com/v1/chat/completions"
+        );
+        // 带路径前缀的网关（Azure / 自建反代）
+        assert_eq!(
+            url("https://gw.corp.test/openai/v1"),
+            "https://gw.corp.test/openai/v1/chat/completions"
+        );
+        // 直接粘完整端点 → 原样使用，不拼出 /v1/v1/chat/completions/chat/completions
+        assert_eq!(
+            url("https://api.deepseek.com/v1/chat/completions"),
+            "https://api.deepseek.com/v1/chat/completions"
+        );
+        // 旧行为不能丢：没写 /v1 也不含端点路径时照样补
+        assert_eq!(
+            url("http://127.0.0.1:8000"),
+            "http://127.0.0.1:8000/v1/chat/completions"
         );
     }
 

@@ -166,7 +166,7 @@ impl TranslationEngine {
 | `translation/engine.rs` | 并发调度（`Semaphore` + `FuturesUnordered`）、事件推送、job 级 panic 隔离 |
 | `translation/engine/tests.rs` | 引擎级测试（事件序列 / 并发 / 取消 / 结构校验接线） |
 | `translation/events.rs` | `EventSink` / `CollectingSink` / `CancelToken` / 进度事件 |
-| `translation/translator.rs` | `TranslateRequest` / `TextTranslator` / `HttpTranslator`（reqwest + SSE） |
+| `translation/translator.rs` | `TranslateRequest` / `TextTranslator` / `HttpTranslator`（reqwest + SSE；请求体用 types-only 的协议类型构造，见下节） |
 | `translation/retry.rs` | 网络退避重试 + 结构纠错重试 + 结构校验接入点 |
 | `translation/fidelity.rs` | 译文结构保真校验（纯函数，见下节） |
 | `translation/test_support.rs` | 单测共享的假翻译器（仅 `cfg(test)`） |
@@ -175,6 +175,38 @@ impl TranslationEngine {
 所以 `translation::{CancelToken, CollectingSink, EventSink, RunOptions, TextTranslator,
 TranslateRequest, TranslationEngine, TranslationSummary}` 以及
 `translation::engine::{...}` 这些拆分前的路径继续成立，`src-tauri` 无需改动。
+
+### LLM 协议层：**类型**借第三方，**实现**自己写
+
+OpenAI 兼容协议的「结构」与「传输」是分开的，改代码前先认清这条边界：
+
+| 层 | 谁实现 | 位置 |
+| --- | --- | --- |
+| 请求体 / 流式 chunk 的**协议类型** | `async-openai 0.42` 的 **types-only 特性**（`default-features = false` + `chat-completion-types`） | `Cargo.toml`（workspace） |
+| HTTP 客户端、超时、发请求、读流 | 本仓库（`reqwest`） | `translation/translator.rs` |
+| SSE 帧解析（跨 chunk 切断 / CRLF / 多行 data / `[DONE]`） | 本仓库（纯状态机） | `translation/sse.rs` |
+| 重试、退避、取消、结构纠错 | 本仓库 | `translation/{retry,events}.rs` |
+
+- **为什么只借类型**：`chat-completion-types` 不含 `_api`，所以不会带进 `reqwest` /
+  `tower` / `eventsource-stream` / `tracing`。传递依赖增量是 **7 个包**
+  （`async-openai` + `derive_builder` 一脉 + `darling` 一脉）；开完整 SDK 特性是 35 个包。
+- **线上格式有测试钉住**：`build_chat_request_matches_the_wire_format` 断言类型化请求
+  序列化出来**恰好**是 `{model, stream, temperature, messages}` 四个字段，与拆分前手写的
+  `json!` 逐字段一致（async-openai 的请求结构有几十个字段，不能被填成 `null` 一起发出去）。
+  比对方式是 `to_string` 后再 `from_str`，**不能直接 `to_value`** —— 后者会把 f32 拓宽成
+  f64，报出一个永远上不了线的数字（`0.30000001192092896`，正是旧实现线上真实发的值）。
+- **流式 chunk 是两级解析**（`sse::parse_chat_chunk`）：先按标准协议类型反序列化，失败再
+  退回只认 `choices[0].delta.content` 的宽松结构。标准结构要求 `id`/`index`/`created`/
+  `model`/`object` 齐全，而部分网关只发最小字段 —— 只留类型化一条路会把这类响应全丢掉。
+- **两处协议级修复**（v1.0.0）：
+  1. `LlmSettings::chat_completions_url()` 收口 baseUrl 的四种写法（`types.rs` 里有对照表）。
+     过去填 `https://api.deepseek.com/v1` 会拼成 `/v1/v1/chat/completions` → 404。
+  2. 流读完却没有任何文本 → 报错，而不是返回空译文。空译文对「原文没有占位符/标签」的条目
+     能通过结构校验、被记成「已翻译」（界面一片空白），只在写回时因 target 为空退回原文；
+     现在它变成一次可重试的失败（原文本身为空时不报错）。最常见成因是网关把错误包成了 200，
+     或服务端没按 SSE 返回。
+- **已知限制（有意保留，不在本次范围）**：4xx（除 408/429）目前仍跟网络错误一样退避重试
+  3 次才失败；服务端忽略 `stream: true`、直接返回完整 JSON 时没有非流式兜底。
 
 ### 译文结构保真校验（`translation::fidelity`）
 

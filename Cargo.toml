@@ -29,6 +29,16 @@ aho-corasick = "1.1.5"
 quick-xml = "0.42.0"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 bg3rustpaklib = "0.1.5"
+
+# LLM：只借 OpenAI 兼容协议的**类型定义**，不借它的 HTTP 客户端。
+# 关掉 default-features（= ["rustls"]）只开 chat-completion-types，就不会带进
+# reqwest / tower / eventsource-stream / tracing —— 发请求与 SSE 解码仍是本仓库
+# 自研实现（crates/bg3-translate-core/src/translation/{translator,sse}.rs）。
+# 实测：整个特性集的传递依赖增量是 9 个包（含 derive_builder 一脉），
+# 而开完整 SDK 特性是 35 个包。
+async-openai = { version = "0.42.0", default-features = false, features = [
+    "chat-completion-types",
+] }
 tokio = { version = "1.53.1", features = ["sync", "time", "macros"] }
 futures-util = "0.3.34"
 directories = "6.0.0"

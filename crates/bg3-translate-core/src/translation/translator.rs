@@ -3,9 +3,20 @@
 //! 抽象成 trait 是为了单测：注入假实现后，事件序列、并发、失败统计、
 //! 取消行为都能在没有网络的情况下断言。生产实现 [`HttpTranslator`] 只负责
 //! 「发请求 → 解析 SSE → 实时推 delta」，重试与调度在 `retry` / `engine` 里。
+//!
+//! 协议边界：**HTTP 客户端、请求发送、SSE 解码、取消都是本仓库自研**；
+//! 只有请求体与流式 chunk 的**协议结构**借自 `async-openai` 的 types-only
+//! 特性（`default-features = false` + `chat-completion-types`），所以并没有
+//! 引入任何第三方 HTTP 客户端。
 
 use std::time::Duration;
 
+use async_openai::types::chat::{
+    ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
+    ChatCompletionRequestSystemMessageContent, ChatCompletionRequestUserMessage,
+    ChatCompletionRequestUserMessageContent, CreateChatCompletionRequest,
+    CreateChatCompletionRequestArgs,
+};
 use futures_util::future::BoxFuture;
 use futures_util::stream::StreamExt;
 
@@ -94,15 +105,7 @@ impl HttpTranslator {
         }
 
         let user_prompt = build_request_prompt(&request, correction);
-        let body = serde_json::json!({
-            "model": self.settings.model,
-            "stream": true,
-            "temperature": self.settings.temperature,
-            "messages": [
-                { "role": "system", "content": SYSTEM_PROMPT },
-                { "role": "user", "content": user_prompt }
-            ]
-        });
+        let body = build_chat_request(&self.settings, &user_prompt)?;
 
         let response = tokio::select! {
             response = self
@@ -173,7 +176,9 @@ impl HttpTranslator {
         if request.cancel.is_cancelled() {
             return Ok(None);
         }
-        Ok(Some(full.trim().to_string()))
+        let text = full.trim().to_string();
+        ensure_stream_produced_text(request.source, &text)?;
+        Ok(Some(text))
     }
 }
 
@@ -192,6 +197,55 @@ impl TextTranslator for HttpTranslator {
     ) -> BoxFuture<'a, Result<Option<String>>> {
         Box::pin(self.translate_once(request, correction))
     }
+}
+
+/// 按 OpenAI 兼容协议构造请求体。
+///
+/// 类型借自 `async-openai` 的 types-only 特性：字段名、角色枚举与序列化规则都
+/// 与协议定义同源，协议加字段时不用我们跟着改。**请求仍由本仓库自己的 reqwest
+/// 客户端发出**，不经过任何第三方 HTTP 客户端。
+///
+/// 顺带修掉手写 `json!` 时的一个隐蔽问题：`json!({"temperature": 0.3f32})` 会先把
+/// f32 转成 f64 再序列化，线上实际发出去的是 `0.30000001192092896`；走类型化
+/// 序列化才是干净的 `0.3`。
+pub(crate) fn build_chat_request(
+    settings: &LlmSettings,
+    user_prompt: &str,
+) -> Result<CreateChatCompletionRequest> {
+    CreateChatCompletionRequestArgs::default()
+        .model(settings.model.as_str())
+        .stream(true)
+        .temperature(settings.temperature)
+        .messages(vec![
+            ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                content: ChatCompletionRequestSystemMessageContent::Text(SYSTEM_PROMPT.to_string()),
+                name: None,
+            }),
+            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                content: ChatCompletionRequestUserMessageContent::Text(user_prompt.to_string()),
+                name: None,
+            }),
+        ])
+        .build()
+        .map_err(|err| AppError::Llm(format!("构造请求失败: {err}")))
+}
+
+/// 流读完了却一个字都没收到 → 报错。
+///
+/// 不报错的话会返回空译文：对「原文没有占位符/标签」的条目，空译文能通过结构校验
+/// 被当成成功（前端显示「已翻译」但译文空白），只有写回时才因为 target 为空退回
+/// 原文。把这种情况变成一次可重试的失败，比让它静默通过更有用 —— 最常见的成因
+/// 就是网关把错误包成了 200，或者服务端压根没按 SSE 返回。
+///
+/// 原文本身为空时不报错：那本来就不该要求模型输出任何东西。
+fn ensure_stream_produced_text(source: &str, text: &str) -> Result<()> {
+    if text.is_empty() && !source.trim().is_empty() {
+        return Err(AppError::Llm(
+            "流式响应结束但没有任何文本（网关可能把错误包成了 200，或服务端未按 SSE 返回）"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// 组装 user prompt；有纠错提示时附在最后。
@@ -297,5 +351,80 @@ mod tests {
         assert_eq!(truncate_chars("夺心魔", 10), "夺心魔");
         assert_eq!(truncate_chars("夺心魔", 2), "夺心");
         assert_eq!(truncate_chars("", 3), "");
+    }
+
+    // ── 协议类型化（方案 A：types-only 依赖）──
+
+    fn test_settings() -> LlmSettings {
+        LlmSettings {
+            base_url: "https://api.deepseek.com".into(),
+            api_key: "k".into(),
+            model: "deepseek-chat".into(),
+            concurrency: 2,
+            temperature: 0.3,
+        }
+    }
+
+    /// 类型化请求序列化出来的线上格式，必须与拆分前手写的 `json!` 逐字段一致
+    /// （字段名、角色名、内容位置都不许漂移）。
+    ///
+    /// 注意比对方式：先 `to_string` 再 `from_str` 回 `Value`，而不是直接
+    /// `to_value` —— `to_value` 会把 f32 拓宽成 f64，报出的是一个
+    /// **永远上不了线**的数字（0.30000001192092896），真实请求走的是
+    /// reqwest 的 `to_vec`，即 ryu 对 f32 的格式化结果。
+    #[test]
+    fn build_chat_request_matches_the_wire_format() {
+        let request = build_chat_request(&test_settings(), "原文：\nFireball").unwrap();
+        let serialized = serde_json::to_string(&request).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "model": "deepseek-chat",
+                "stream": true,
+                "temperature": 0.3,
+                "messages": [
+                    { "role": "system", "content": SYSTEM_PROMPT },
+                    { "role": "user", "content": "原文：\nFireball" }
+                ]
+            })
+        );
+        // 恰恰四个字段：async-openai 的请求结构有几十个字段，
+        // 不能被填成 null 一起发出去（部分网关对多余字段很挑）
+        assert_eq!(value.as_object().unwrap().len(), 4);
+    }
+
+    /// 手写 `json!` 会把 0.3f32 发成 0.30000001192092896，类型化后必须是 0.3。
+    #[test]
+    fn build_chat_request_serializes_temperature_without_f32_noise() {
+        let request = build_chat_request(&test_settings(), "x").unwrap();
+        let serialized = serde_json::to_string(&request).unwrap();
+        assert!(
+            serialized.contains("\"temperature\":0.3"),
+            "实际序列化: {serialized}"
+        );
+        assert!(!serialized.contains("0.30000001192092896"));
+    }
+
+    // ── 空流防线（200 但没有任何 delta）──
+
+    #[test]
+    fn empty_stream_with_non_empty_source_is_an_error() {
+        let err = ensure_stream_produced_text("Fireball", "").unwrap_err();
+        assert_eq!(err.code(), "llm");
+        assert!(err.to_string().contains("没有任何文本"), "实际: {err}");
+    }
+
+    #[test]
+    fn empty_stream_with_empty_source_is_not_an_error() {
+        // 原文本身为空（例如 contentList 里的空 <content/>）不该要求模型输出东西
+        ensure_stream_produced_text("", "").unwrap();
+        ensure_stream_produced_text("   ", "").unwrap();
+    }
+
+    #[test]
+    fn non_empty_stream_is_not_an_error() {
+        ensure_stream_produced_text("Fireball", "火球").unwrap();
     }
 }

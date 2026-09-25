@@ -18,6 +18,8 @@ aho-corasick.workspace = true
 quick-xml.workspace = true
 zip.workspace = true
 bg3rustpaklib.workspace = true
+# 仅类型：OpenAI 兼容协议的请求/流式响应结构（见 workspace 里的注释）
+async-openai.workspace = true
 tokio.workspace = true
 futures-util.workspace = true
 directories.workspace = true

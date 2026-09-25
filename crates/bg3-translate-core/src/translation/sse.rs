@@ -4,6 +4,10 @@
 //! [`SseDecoder`] 之后，跨 chunk 切断、CRLF、多行 data 这些最容易出错的
 //! 分支都能用纯数据驱动测试覆盖。
 //!
+//! 分工：**SSE 帧解析（[`SseDecoder`]）与流式读取都是本仓库自研**，
+//! 只有 chunk 的**协议结构**借自 `async-openai` 的 types-only 特性
+//! （见 [`parse_chat_chunk`]），所以这里不带任何 HTTP 客户端依赖。
+//!
 //! 兼容的现实写法：
 //! - `data: {...}` 与 `data:{...}`（有无空格）
 //! - `\n` / `\r\n` / 单独 `\r` 三种行结束符
@@ -13,6 +17,7 @@
 
 use std::mem;
 
+use async_openai::types::chat::CreateChatCompletionStreamResponse;
 use serde::Deserialize;
 
 /// 一条解析出来的 SSE 事件。
@@ -144,30 +149,51 @@ fn take_line(buffer: &[u8]) -> Option<(String, usize)> {
 
 /// 从 OpenAI 兼容的流式响应里取 `choices[0].delta.content`。
 ///
-/// 解析失败（心跳、非 JSON、空 choices）返回 `None`，由调用方跳过。
+/// 两级解析：
+/// 1. 先按协议标准结构 [`CreateChatCompletionStreamResponse`] 反序列化。类型借自
+///    `async-openai` 的 types-only 特性（只有类型，不含 HTTP 客户端），字段名与
+///    协议定义同源，协议演进时不用我们跟着改。
+/// 2. 标准结构要求 `id` / `index` / `created` / `model` / `object` 齐全，而部分网关
+///    只发最小字段（`{"choices":[{"delta":{"content":"…"}}]}`），所以标准解析失败时
+///    退回 [`LenientChunk`] 再试一次。
+///
+/// 两次都失败（心跳、非 JSON、空 choices、错误体）返回 `None`，由调用方跳过。
 pub fn parse_chat_chunk(data: &str) -> Option<String> {
-    let chunk: ChatChunk = serde_json::from_str(data).ok()?;
-    chunk
-        .choices
-        .into_iter()
-        .next()
-        .and_then(|choice| choice.delta.content)
+    match serde_json::from_str::<CreateChatCompletionStreamResponse>(data) {
+        Ok(chunk) => chunk
+            .choices
+            .into_iter()
+            .next()
+            .and_then(|choice| choice.delta.content),
+        Err(_) => {
+            let chunk: LenientChunk = serde_json::from_str(data).ok()?;
+            chunk
+                .choices
+                .into_iter()
+                .next()
+                .and_then(|choice| choice.delta.content)
+        }
+    }
+}
+
+/// 宽松兜底结构：字段全可选，只为兼容「字段不全」的第三方网关。
+///
+/// 它不再是主解析路径，只是标准结构解析失败后的第二次机会，所以刻意做得最小：
+/// 只关心 `choices[0].delta.content`。
+#[derive(Debug, Deserialize)]
+struct LenientChunk {
+    #[serde(default)]
+    choices: Vec<LenientChoice>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ChatChunk {
+struct LenientChoice {
     #[serde(default)]
-    choices: Vec<ChatChoice>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatChoice {
-    #[serde(default)]
-    delta: ChatDelta,
+    delta: LenientDelta,
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct ChatDelta {
+struct LenientDelta {
     #[serde(default)]
     content: Option<String>,
 }
@@ -338,9 +364,26 @@ mod tests {
 
     #[test]
     fn parse_chat_chunk_extracts_delta_content() {
+        // 字段不全的 chunk：标准协议类型解析不了，靠宽松兜底拿下
         let chunk =
             r#"{"id":"1","choices":[{"index":0,"delta":{"content":"你好"},"finish_reason":null}]}"#;
         assert_eq!(parse_chat_chunk(chunk).as_deref(), Some("你好"));
+    }
+
+    #[test]
+    fn parse_chat_chunk_accepts_a_complete_protocol_chunk() {
+        // 字段齐全：走 async-openai 标准协议类型那条路（类型化解析）
+        let chunk = r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1700000000,"model":"deepseek-chat","choices":[{"index":0,"delta":{"role":"assistant","content":"火球"},"finish_reason":null}]}"#;
+        assert_eq!(parse_chat_chunk(chunk).as_deref(), Some("火球"));
+    }
+
+    #[test]
+    fn parse_chat_chunk_agrees_between_typed_and_lenient_paths() {
+        // 同一条增量，字段齐全 vs 最小写法，两级解析必须给出同一个结果
+        let full = r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"一致"},"finish_reason":null}]}"#;
+        let minimal = r#"{"choices":[{"delta":{"content":"一致"}}]}"#;
+        assert_eq!(parse_chat_chunk(full), parse_chat_chunk(minimal));
+        assert_eq!(parse_chat_chunk(full).as_deref(), Some("一致"));
     }
 
     #[test]

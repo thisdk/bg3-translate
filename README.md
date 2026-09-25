@@ -23,7 +23,9 @@
 ## 使用
 
 1. 打开软件，选择 `.pak` 或 `.zip`（Nexus 上常见的 zip 包会被自动解开取里面的 pak）。
-2. 在设置里填好大模型接口（OpenAI 兼容协议，默认对接 DeepSeek）。
+2. 在设置里填好大模型接口（OpenAI 兼容协议，默认对接 DeepSeek）。base URL 填
+   `https://api.deepseek.com` 或 `https://api.deepseek.com/v1` 都可以，也可以直接
+   粘完整的 `…/v1/chat/completions`，三种写法会落到同一个端点。
 3. 选中要翻译的文件，开始翻译。文本会边生成边显示。
 4. 翻完后检查几条重点文本，可以直接在表格里改。
 5. 保存并重新打包，输出 `<原名>_zh.pak`，丢进 MOD 管理器即可。
@@ -121,7 +123,7 @@ crates/bg3-translate-core/     # 纯逻辑核心，零 GUI 依赖
   src/pak.rs                   #   PAK / ZIP 解包与重打包
   src/formats/                 #   contentList XML / LSX / LOCA 三种格式
   src/glossary/                #   术语表数据、清洗、命中匹配
-  src/translation/             #   LLM 流式翻译引擎（含占位符 / 标签结构保真校验）
+  src/translation/             #   LLM 流式翻译引擎（协议类型借用 types-only 依赖，HTTP/SSE 自研）
   tests/e2e_pak_flow.rs        #   真实 PAK 的端到端闭环测试
 src-tauri/                     # Tauri 薄壳：命令层 + 事件桥 + 插件注册
 src/                           # React 前端

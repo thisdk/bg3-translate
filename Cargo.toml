@@ -1,0 +1,58 @@
+# BG3 MOD 汉化工具 —— Cargo workspace
+#
+# 目录结构：
+#   crates/bg3-translate-core  纯逻辑核心（无 Tauri / 无 GUI 系统依赖，可本地 cargo test）
+#   src-tauri                  Tauri 桌面壳（命令层 + 事件桥）
+#
+# 拆分的意义：PAK/LOCA/XML 解析、术语表匹配、翻译引擎全部可以在没有
+# webkit2gtk / dbus 等 GUI 依赖的机器上编译与测试，CI 也能并行跑。
+
+[workspace]
+members = ["crates/bg3-translate-core", "src-tauri"]
+resolver = "3"
+
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+authors = ["thisdk"]
+repository = "https://github.com/thisdk/bg3-translate"
+
+[workspace.dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.21"
+log = "0.4.34"
+regex = "1.13.1"
+aho-corasick = "1.1.5"
+quick-xml = "0.42.0"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+bg3rustpaklib = "0.1.5"
+tokio = { version = "1.53.1", features = ["sync", "time", "macros"] }
+futures-util = "0.3.34"
+directories = "6.0.0"
+tempfile = "3"
+
+tauri = "2.11.6"
+tauri-build = "2.6.3"
+tauri-plugin-dialog = "2.7.3"
+tauri-plugin-fs = "2.5.2"
+tauri-plugin-log = "2.9.2"
+
+# ── 发布配置 ──
+# 只发布 Windows，产物用 LTO + 体积优化，尽量压小安装包。
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
+
+# 依赖用 O3 编译：核心逻辑（zstd/lz4/rayon）是热点，不值得为体积牺牲速度。
+[profile.release.package."*"]
+opt-level = 3
+
+# 调试构建下也让解包相关依赖跑得快一点
+[profile.dev.package."*"]
+opt-level = 2

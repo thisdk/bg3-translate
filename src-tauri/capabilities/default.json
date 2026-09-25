@@ -1,19 +1,19 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "默认权限：允许前端调用对话框与文件系统插件",
+  "description": "默认权限：仅开放自定义标题栏所需的窗口操作、文件对话框，以及术语表 JSON 的读取能力。",
   "windows": ["main"],
   "permissions": [
     "core:default",
     "core:window:allow-close",
     "core:window:allow-minimize",
-    "core:window:allow-start-dragging",
     "core:window:allow-toggle-maximize",
+    "core:window:allow-start-dragging",
+    "core:window:allow-is-maximized",
     "dialog:default",
     "dialog:allow-open",
     "dialog:allow-save",
     "fs:default",
-    "fs:allow-read-text-file",
-    "fs:allow-write-text-file"
+    "fs:allow-read-text-file"
   ]
 }

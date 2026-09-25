@@ -1,14 +1,14 @@
 # 依赖
 node_modules/
-bun.lockb
 
 # 构建产物
 dist/
 build/
 
-# Tauri / Rust
-src-tauri/target/
+# Rust / Tauri（workspace 根目录下的 target）
+target/
 src-tauri/gen/
+src-tauri/target/
 
 # IDE
 .vscode/
@@ -21,10 +21,15 @@ src-tauri/gen/
 *.tsbuildinfo
 
 # 本地配置（含 API Key，不入库）
-# 注意：settings.json 由应用运行时生成在用户配置目录，本仓库内不应出现
+# 应用运行时的配置写在「exe 同级 config/」或系统配置目录，仓库内不应出现
+config/settings.json
+config/glossary.json
 
 # 日志
 *.log
+npm-debug.log*
+yarn-error.log*
 
 # 临时文件
 *.tmp
+*.bak

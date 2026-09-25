@@ -1,54 +1,30 @@
 [package]
 name = "bg3-translate"
-version = "0.1.0"
-description = "BG3 MOD 汉化工具"
-authors = ["you"]
-edition = "2021"
-rust-version = "1.77"
+description = "BG3 MOD 汉化工具（Tauri 桌面壳）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
 
 [lib]
 name = "bg3_translate_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build.workspace = true
 
 [dependencies]
-tauri = { version = "2", features = [] }
-tauri-plugin-dialog = "2"
-tauri-plugin-fs = "2"
-tauri-plugin-log = "2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+# 纯逻辑核心：PAK/格式/术语表/翻译引擎
+bg3-translate-core = { path = "../crates/bg3-translate-core" }
 
-# PAK 处理（阶段0已验证通过）
-bg3rustpaklib = "0.1"
-
-# LLM 翻译
-reqwest = { version = "0.12", features = ["json", "stream"] }
-futures-util = "0.3"
-tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
-
-# XML 解析
-quick-xml = "0.37"
-
-# 正则（术语表命中检测）
-regex = "1"
-
-# 错误处理
-thiserror = "2"
-anyhow = "1"
-
-# 日志
-log = "0.4"
-
-[dev-dependencies]
-bg3rustpaklib = "0.1"
-
-[profile.release]
-panic = "abort"
-codegen-units = 1
-lto = true
-opt-level = "s"
-strip = true
+tauri.workspace = true
+tauri-plugin-dialog.workspace = true
+tauri-plugin-fs.workspace = true
+tauri-plugin-log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { version = "1.53.1", features = ["sync", "time", "rt", "macros"] }
+log.workspace = true
+thiserror.workspace = true

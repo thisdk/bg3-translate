@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "BG3 MOD 汉化工具",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "com.herrisome.bg3translate",
   "build": {
     "beforeDevCommand": "bun run dev",
@@ -13,28 +13,36 @@
     "windows": [
       {
         "title": "BG3 MOD 汉化工具",
-        "width": 1200,
-        "height": 800,
-        "minWidth": 640,
-        "minHeight": 480,
+        "width": 1280,
+        "height": 840,
+        "minWidth": 720,
+        "minHeight": 520,
+        "center": true,
         "decorations": false,
         "resizable": true,
         "fullscreen": false
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; base-uri 'self'"
     }
   },
   "bundle": {
     "active": true,
     "targets": "all",
+    "category": "Utility",
+    "publisher": "thisdk",
+    "copyright": "Copyright © 2025 thisdk",
+    "shortDescription": "博德之门 3 MOD 汉化工具",
+    "longDescription": "解包 BG3 MOD、调用大模型流式翻译本地化文本、再重新打包为可加载的 .pak。配置与术语表默认放在 exe 同级目录，方便便携使用。",
     "windows": {
       "wix": {
         "language": "zh-CN"
       },
       "nsis": {
-        "languages": ["SimpChinese"]
+        "languages": ["SimpChinese"],
+        "installMode": "both",
+        "displayLanguageSelector": false
       }
     },
     "icon": [

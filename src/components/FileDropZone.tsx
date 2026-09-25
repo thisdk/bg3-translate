@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { DragDropEvent } from "@tauri-apps/api/webview";
-import { Archive, FolderOpen, Loader2 } from "lucide-react";
+import { Archive, CheckCircle2, FolderOpen, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import {
@@ -125,13 +125,21 @@ export function FileDropZone({ className }: { className?: string }) {
     [handleOpen],
   );
 
+  const busy = loading || extracting;
+
   return (
     <Card
+      role="button"
+      tabIndex={busy ? -1 : 0}
+      aria-label="打开 MOD 文件"
+      aria-busy={busy || undefined}
       className={cn(
         "flex min-h-[420px] cursor-pointer flex-col items-center justify-center border-2 border-dashed p-8 text-center transition-colors md:min-h-[520px]",
+        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background",
         dragOver
           ? "border-primary bg-accent/50"
           : "border-border hover:border-primary/50",
+        busy && "cursor-default",
         className,
       )}
       onDragOver={(e) => {
@@ -140,7 +148,14 @@ export function FileDropZone({ className }: { className?: string }) {
       }}
       onDragLeave={() => setDragOver(false)}
       onDrop={onDrop}
-      onClick={loading || extracting ? undefined : onClickPick}
+      onClick={busy ? undefined : onClickPick}
+      onKeyDown={(e) => {
+        if (busy) return;
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          void onClickPick();
+        }
+      }}
     >
       <div className="flex flex-col items-center justify-center gap-5">
         <div
@@ -148,7 +163,7 @@ export function FileDropZone({ className }: { className?: string }) {
             dragOver ? "scale-110" : ""
           }`}
         >
-          {loading || extracting ? (
+          {busy ? (
             <Loader2 className="h-12 w-12 animate-spin text-primary" />
           ) : (
             <FolderOpen className="h-12 w-12 text-primary" />
@@ -170,7 +185,7 @@ export function FileDropZone({ className }: { className?: string }) {
                 : "拖拽 .pak 或 .zip 文件到此区域，或点击选择"}
           </p>
         </div>
-        {!loading && !extracting && (
+        {!busy && (
           <div className="flex flex-wrap items-center justify-center gap-3">
             <Button
               size="lg"
@@ -196,17 +211,25 @@ export function FileDropZone({ className }: { className?: string }) {
           </div>
         )}
         {extractResult && (
-          <div className="max-w-xl rounded-md border bg-muted/30 px-4 py-3 text-left text-xs leading-5">
-            <div className="font-medium text-foreground">
-              已解压 {extractResult.count} 个文件
-            </div>
-            <div className="mt-1 break-all text-muted-foreground">
-              {extractResult.dir}
+          <div className="flex max-w-xl items-start gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-left text-xs leading-5">
+            <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
+            <div className="min-w-0">
+              <div className="font-medium text-foreground">
+                已解压 {extractResult.count} 个文件
+              </div>
+              <div className="mt-1 break-all text-muted-foreground">
+                {extractResult.dir}
+              </div>
             </div>
           </div>
         )}
         <p className="max-w-sm text-xs text-muted-foreground">
           支持 Nexus 标准打包的 .zip 和 BG3 原生 .pak 格式
+          {!busy && (
+            <span className="mt-1 block opacity-80">
+              可直接把文件拖进窗口，或按 Enter 打开文件选择框
+            </span>
+          )}
         </p>
       </div>
       <input

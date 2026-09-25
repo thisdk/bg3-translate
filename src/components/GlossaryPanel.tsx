@@ -14,6 +14,8 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import { EmptyState } from "@/components/ui/empty-state";
+import { ErrorBanner } from "@/components/ui/error-banner";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
@@ -56,6 +58,8 @@ export function GlossaryPanel({
   const [editing, setEditing] = useState<GlossaryEntry | null>(null);
   const [editOriginal, setEditOriginal] = useState<string | null>(null);
   const [limit, setLimit] = useState(200);
+  const [saving, setSaving] = useState(false);
+  const [busySource, setBusySource] = useState<string | null>(null);
 
   useEffect(() => {
     refresh();
@@ -87,12 +91,13 @@ export function GlossaryPanel({
   }, [glossary, search]);
 
   const onSave = async () => {
-    if (!editing) return;
+    if (!editing || saving) return;
     if (!editing.source.trim() || !editing.target.trim()) {
       setError("术语的中英文均不能为空");
       return;
     }
     setError(null);
+    setSaving(true);
     try {
       let g: Glossary;
       if (editOriginal) {
@@ -105,16 +110,21 @@ export function GlossaryPanel({
       setEditOriginal(null);
     } catch (e) {
       setError(String(e));
+    } finally {
+      setSaving(false);
     }
   };
 
   const onDelete = async (source: string) => {
     setError(null);
+    setBusySource(source);
     try {
       const g = await deleteGlossaryEntry(source);
       setGlossary(g);
     } catch (e) {
       setError(String(e));
+    } finally {
+      setBusySource(null);
     }
   };
 
@@ -222,9 +232,7 @@ export function GlossaryPanel({
         </div>
       )}
       {error && (
-        <div className="bg-destructive px-4 py-2 text-sm text-destructive-foreground">
-          ⚠ {error}
-        </div>
+        <ErrorBanner message={error} onClose={() => setError(null)} compact />
       )}
 
       {/* 搜索 */}
@@ -239,6 +247,7 @@ export function GlossaryPanel({
               setLimit(200);
             }}
             className="h-8 pl-8 text-xs"
+            aria-label="搜索术语"
           />
         </div>
       </div>
@@ -246,14 +255,26 @@ export function GlossaryPanel({
       {/* 列表 */}
       <div className="min-h-0 flex-1 overflow-auto">
         {loading ? (
-          <div className="flex h-full items-center justify-center text-muted-foreground">
-            <Loader2 className="mr-2 h-5 w-5 animate-spin" />
-            加载术语表…
-          </div>
+          <EmptyState
+            icon={<Loader2 className="h-6 w-6 animate-spin" />}
+            title="加载术语表…"
+          />
         ) : visible.length === 0 ? (
-          <div className="flex h-full items-center justify-center p-8 text-center text-sm text-muted-foreground">
-            没有匹配的术语
-          </div>
+          <EmptyState
+            title={search ? "没有匹配的术语" : "术语表是空的"}
+            description={
+              search
+                ? "换个关键词试试。"
+                : "可以点右上角「新增」手工添加，或「导入」官方术语表 JSON。"
+            }
+            action={
+              search ? (
+                <Button size="sm" variant="outline" onClick={() => setSearch("")}>
+                  清除搜索
+                </Button>
+              ) : undefined
+            }
+          />
         ) : (
           <table className="w-full text-sm">
             <thead className="sticky top-0 bg-muted/80 backdrop-blur">
@@ -286,6 +307,8 @@ export function GlossaryPanel({
                         variant="ghost"
                         className="h-6 px-1.5"
                         onClick={() => startEdit(t)}
+                        aria-label={`编辑术语 ${t.source}`}
+                        title="编辑"
                       >
                         <Edit3 className="h-3 w-3" />
                       </Button>
@@ -295,6 +318,9 @@ export function GlossaryPanel({
                           variant="ghost"
                           className="h-6 px-1.5 text-destructive hover:text-destructive"
                           onClick={() => onDelete(t.source)}
+                          loading={busySource === t.source}
+                          aria-label={`删除术语 ${t.source}`}
+                          title="删除"
                         >
                           <Trash2 className="h-3 w-3" />
                         </Button>
@@ -331,6 +357,8 @@ export function GlossaryPanel({
                   setEditing(null);
                   setEditOriginal(null);
                 }}
+                aria-label="关闭"
+                title="关闭"
               >
                 <X className="h-4 w-4" />
               </Button>
@@ -389,9 +417,9 @@ export function GlossaryPanel({
               >
                 取消
               </Button>
-              <Button size="sm" onClick={onSave}>
-                <Check className="h-4 w-4" />
-                保存
+              <Button size="sm" onClick={onSave} loading={saving}>
+                {!saving && <Check className="h-4 w-4" />}
+                {saving ? "保存中…" : "保存"}
               </Button>
             </div>
           </Card>

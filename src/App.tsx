@@ -5,19 +5,20 @@ import {
   ChevronRight,
   FileArchive,
   GripVertical,
-  Loader2,
   Package,
   RotateCcw,
   X,
 } from "lucide-react";
 import { AppTopBar } from "@/components/AppTopBar";
 import { Button } from "@/components/ui/button";
+import { ErrorBanner } from "@/components/ui/error-banner";
 import { FileDropZone } from "@/components/FileDropZone";
 import { FileTree, LOCALIZATION_KINDS } from "@/components/FileTree";
 import { GlossaryPanel } from "@/components/GlossaryPanel";
 import { SettingsPanel } from "@/components/SettingsPanel";
 import { TranslationTable } from "@/components/TranslationTable";
 import { useAppStore } from "@/store/app-store";
+import { planLocalizationWrites } from "@/lib/localization";
 import {
   loadLlmSettings,
   pickSavePath,
@@ -25,9 +26,6 @@ import {
   writeFileEntries,
 } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
-import type { PakFile, TranslationEntry } from "@/lib/types";
-
-const TARGET_LANGUAGE = "Chinese";
 
 function HomePage() {
   return (
@@ -49,25 +47,11 @@ function FilesPage() {
   const onGoPack = async () => {
     if (!workDir) return;
     try {
-      const writePlans = new Map<
-        string,
-        { entries: TranslationEntry[]; priority: number }
-      >();
-
-      for (const file of selectedFiles) {
-        const entries = entriesByFile[file.name];
-        if (entries && entries.length > 0) {
-          const targetName = toTargetLocalizationPath(file.name);
-          const priority = localizationWritePriority(file);
-          const existing = writePlans.get(targetName);
-          if (!existing || priority > existing.priority) {
-            writePlans.set(targetName, { entries, priority });
-          }
-        }
-      }
-
-      for (const [fileName, plan] of writePlans) {
-        await writeFileEntries(workDir, fileName, plan.entries);
+      // 多语言文件可能映射到同一个目标路径（Localization/Chinese/xxx），
+      // 只写回优先级最高的那一份（英文 > 中文 > 其它语言）。
+      const plans = planLocalizationWrites(selectedFiles, entriesByFile);
+      for (const plan of plans) {
+        await writeFileEntries(workDir, plan.fileName, plan.entries);
       }
     } catch (e) {
       setError(String(e));
@@ -102,29 +86,6 @@ function FilesPage() {
       </div>
     </div>
   );
-}
-
-function toTargetLocalizationPath(fileName: string): string {
-  const parts = fileName.split("/").filter(Boolean);
-  const locIndex = parts.findIndex(
-    (part) => part.toLowerCase() === "localization",
-  );
-  if (locIndex < 0 || parts.length <= locIndex + 2) {
-    return fileName;
-  }
-  parts[locIndex + 1] = TARGET_LANGUAGE;
-  return parts.join("/");
-}
-
-function localizationWritePriority(file: PakFile): number {
-  if (file.language === "English") return 3;
-  if (
-    file.language === TARGET_LANGUAGE ||
-    file.language === "ChineseSimplified"
-  ) {
-    return 2;
-  }
-  return 1;
 }
 
 function DonePage() {
@@ -230,15 +191,11 @@ function DonePage() {
             <div className="space-y-3">
               <Button
                 onClick={onPack}
-                disabled={packing}
+                loading={packing}
                 className="h-12 w-full"
                 size="lg"
               >
-                {packing ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                ) : (
-                  <Package className="h-4 w-4" />
-                )}
+                <Package className="h-4 w-4" />
                 {packing ? "打包中..." : "选择保存位置并打包"}
               </Button>
               <Button
@@ -310,17 +267,21 @@ function ResizableSidebar({
   return (
     <div className="absolute bottom-0 right-0 top-[54px] z-30 flex">
       <button
-        className="h-full w-screen bg-black/20"
+        type="button"
+        className="h-full w-screen bg-black/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
         onClick={onClose}
         aria-label="关闭侧边栏遮罩"
+        tabIndex={-1}
       />
       <aside
         className="relative flex h-full shrink-0 flex-col border-l bg-background shadow-2xl"
         style={{ width }}
+        role="dialog"
+        aria-label={title}
       >
         <button
           type="button"
-          className="absolute left-0 top-0 z-10 flex h-full w-3 -translate-x-1/2 cursor-ew-resize items-center justify-center text-muted-foreground hover:text-foreground"
+          className="absolute left-0 top-0 z-10 flex h-full w-3 -translate-x-1/2 cursor-ew-resize items-center justify-center rounded text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           onMouseDown={(event) => {
             event.preventDefault();
             setResizing(true);
@@ -366,13 +327,6 @@ function App() {
   const [glossaryWidth, setGlossaryWidth] = useState(720);
 
   useEffect(() => {
-    if (error) {
-      const timer = setTimeout(() => setError(null), 5000);
-      return () => clearTimeout(timer);
-    }
-  }, [error, setError]);
-
-  useEffect(() => {
     if (settingsLoaded) return;
     let cancelled = false;
 
@@ -396,11 +350,7 @@ function App() {
         onOpenGlossary={() => setShowGlossary(true)}
         onOpenSettings={() => setShowSettings(true)}
       />
-      {error && (
-        <div className="bg-destructive px-6 py-2 text-sm text-destructive-foreground">
-          {error}
-        </div>
-      )}
+      <ErrorBanner message={error} onClose={() => setError(null)} />
       <div
         className={
           stage === "files"

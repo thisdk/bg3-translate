@@ -94,12 +94,14 @@ function ThemeSwitcher() {
 
 function WindowControls() {
   const win = getCurrentWindow();
+  const baseClass =
+    "flex h-[54px] w-11 items-center justify-center text-muted-foreground transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring";
 
   return (
     <div className="ml-1 flex items-center">
       <button
         type="button"
-        className="flex h-[54px] w-11 items-center justify-center text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+        className={`${baseClass} hover:bg-accent hover:text-accent-foreground`}
         onClick={() => void win.minimize()}
         title="最小化"
         aria-label="最小化"
@@ -108,7 +110,7 @@ function WindowControls() {
       </button>
       <button
         type="button"
-        className="flex h-[54px] w-11 items-center justify-center text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+        className={`${baseClass} hover:bg-accent hover:text-accent-foreground`}
         onClick={() => void win.toggleMaximize()}
         title="最大化"
         aria-label="最大化"
@@ -117,7 +119,7 @@ function WindowControls() {
       </button>
       <button
         type="button"
-        className="flex h-[54px] w-11 items-center justify-center text-muted-foreground hover:bg-destructive hover:text-destructive-foreground"
+        className={`${baseClass} hover:bg-destructive hover:text-destructive-foreground`}
         onClick={() => void win.close()}
         title="关闭窗口"
         aria-label="关闭窗口"

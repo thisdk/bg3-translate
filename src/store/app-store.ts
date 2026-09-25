@@ -77,15 +77,19 @@ interface AppState {
   reset: () => void;
 }
 
-const DEFAULT_SETTINGS: LlmSettings = {
+/** 默认 LLM 设置（首次启动 / 后端无配置时） */
+export const DEFAULT_SETTINGS: LlmSettings = {
   baseUrl: "https://api.deepseek.com",
   apiKey: "",
   model: "deepseek-chat",
   concurrency: 6,
-  batchSize: 10,
+  temperature: 0.3,
 };
 
-const THEME_KEY = "bg3-translate-theme";
+/** 主题持久化 key */
+export const THEME_STORAGE_KEY = "bg3-translate-theme";
+
+const THEME_KEY = THEME_STORAGE_KEY;
 
 function loadTheme(): Theme {
   try {

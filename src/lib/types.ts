@@ -58,8 +58,8 @@ export interface LlmSettings {
   model: string;
   /** 并发数 */
   concurrency: number;
-  /** 每批条目数 */
-  batchSize: number;
+  /** 采样温度 0–1，越低越稳定，默认 0.3 */
+  temperature: number;
 }
 
 /**

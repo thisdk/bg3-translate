@@ -1,118 +1,174 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+@import "tw-animate-css";
 
-@layer base {
-  /* ═══ 浅色（默认）═══ */
-  :root,
-  .theme-light {
-    --background: 0 0% 100%;
-    --foreground: 222.2 84% 4.9%;
-    --card: 0 0% 100%;
-    --card-foreground: 222.2 84% 4.9%;
-    --popover: 0 0% 100%;
-    --popover-foreground: 222.2 84% 4.9%;
-    --primary: 222.2 47.4% 11.2%;
-    --primary-foreground: 210 40% 98%;
-    --secondary: 210 40% 96.1%;
-    --secondary-foreground: 222.2 47.4% 11.2%;
-    --muted: 210 40% 96.1%;
-    --muted-foreground: 215.4 16.3% 46.9%;
-    --accent: 210 40% 96.1%;
-    --accent-foreground: 222.2 47.4% 11.2%;
-    --destructive: 0 84.2% 60.2%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 214.3 31.8% 91.4%;
-    --input: 214.3 31.8% 91.4%;
-    --ring: 222.2 84% 4.9%;
-    --radius: 0.5rem;
-  }
+/* Tailwind v4 的 dark 变体仍以 <html class="dark"> 为准（app-store.applyTheme 负责切换） */
+@custom-variant dark (&:is(.dark *));
 
-  /* ═══ 深色 ═══ */
-  .theme-dark {
-    --background: 222.2 84% 4.9%;
-    --foreground: 210 40% 98%;
-    --card: 222.2 84% 4.9%;
-    --card-foreground: 210 40% 98%;
-    --popover: 222.2 84% 4.9%;
-    --popover-foreground: 210 40% 98%;
-    --primary: 210 40% 98%;
-    --primary-foreground: 222.2 47.4% 11.2%;
-    --secondary: 217.2 32.6% 17.5%;
-    --secondary-foreground: 210 40% 98%;
-    --muted: 217.2 32.6% 17.5%;
-    --muted-foreground: 215 20.2% 65.1%;
-    --accent: 217.2 32.6% 17.5%;
-    --accent-foreground: 210 40% 98%;
-    --destructive: 0 62.8% 30.6%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 217.2 32.6% 17.5%;
-    --input: 217.2 32.6% 17.5%;
-    --ring: 212.7 26.8% 83.9%;
-  }
+/* ═══════════════════════════════════════════════════════════
+   主题 CSS 变量（4 套：light / dark / cyberpunk / dungeon）
+   变量值保持 "H S% L%" 三元组，由 @theme inline 拼成 hsl() 颜色。
+   ═══════════════════════════════════════════════════════════ */
 
-  /* ═══ 赛博朋克（2077 风格：警示黄/电光青/深黑）═══ */
-  .theme-cyberpunk {
-    --background: 224 52% 4%;
-    --foreground: 52 100% 91%;
-    --card: 224 45% 7%;
-    --card-foreground: 52 100% 91%;
-    --popover: 224 48% 6%;
-    --popover-foreground: 52 100% 91%;
-    --primary: 52 100% 52%;
-    --primary-foreground: 224 58% 6%;
-    --secondary: 218 44% 13%;
-    --secondary-foreground: 52 100% 84%;
-    --muted: 218 38% 12%;
-    --muted-foreground: 185 28% 68%;
-    --accent: 183 100% 48%;
-    --accent-foreground: 224 58% 6%;
-    --destructive: 349 96% 58%;
-    --destructive-foreground: 52 100% 94%;
-    --border: 52 95% 32%;
-    --input: 183 70% 22%;
-    --ring: 52 100% 52%;
-    --radius: 0.125rem;
-  }
+/* ═══ 浅色（默认）═══ */
+:root,
+.theme-light {
+  --background: 0 0% 100%;
+  --foreground: 222.2 84% 4.9%;
+  --card: 0 0% 100%;
+  --card-foreground: 222.2 84% 4.9%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 222.2 84% 4.9%;
+  --primary: 222.2 47.4% 11.2%;
+  --primary-foreground: 210 40% 98%;
+  --secondary: 210 40% 96.1%;
+  --secondary-foreground: 222.2 47.4% 11.2%;
+  --muted: 210 40% 96.1%;
+  --muted-foreground: 215.4 16.3% 46.9%;
+  --accent: 210 40% 96.1%;
+  --accent-foreground: 222.2 47.4% 11.2%;
+  --destructive: 0 84.2% 60.2%;
+  --destructive-foreground: 210 40% 98%;
+  --border: 214.3 31.8% 91.4%;
+  --input: 214.3 31.8% 91.4%;
+  --ring: 222.2 84% 4.9%;
+  --radius: 0.5rem;
+}
 
-  /* ═══ 地下城（羊皮纸/暗金/烛火暖色）═══ */
-  .theme-dungeon {
-    --background: 30 25% 10%;
-    --foreground: 38 40% 88%;
-    --card: 30 22% 13%;
-    --card-foreground: 38 40% 88%;
-    --popover: 30 25% 12%;
-    --popover-foreground: 38 40% 88%;
-    --primary: 38 70% 45%;
-    --primary-foreground: 30 30% 8%;
-    --secondary: 30 18% 20%;
-    --secondary-foreground: 38 40% 85%;
-    --muted: 30 15% 18%;
-    --muted-foreground: 35 20% 55%;
-    --accent: 145 30% 30%;
-    --accent-foreground: 38 40% 90%;
-    --destructive: 0 70% 40%;
-    --destructive-foreground: 38 40% 90%;
-    --border: 35 30% 25%;
-    --input: 35 25% 22%;
-    --ring: 38 70% 45%;
-    --radius: 0.25rem;
-  }
+/* ═══ 深色 ═══ */
+.theme-dark {
+  --background: 222.2 84% 4.9%;
+  --foreground: 210 40% 98%;
+  --card: 222.2 84% 4.9%;
+  --card-foreground: 210 40% 98%;
+  --popover: 222.2 84% 4.9%;
+  --popover-foreground: 210 40% 98%;
+  --primary: 210 40% 98%;
+  --primary-foreground: 222.2 47.4% 11.2%;
+  --secondary: 217.2 32.6% 17.5%;
+  --secondary-foreground: 210 40% 98%;
+  --muted: 217.2 32.6% 17.5%;
+  --muted-foreground: 215 20.2% 65.1%;
+  --accent: 217.2 32.6% 17.5%;
+  --accent-foreground: 210 40% 98%;
+  --destructive: 0 62.8% 30.6%;
+  --destructive-foreground: 210 40% 98%;
+  --border: 217.2 32.6% 17.5%;
+  --input: 217.2 32.6% 17.5%;
+  --ring: 212.7 26.8% 83.9%;
+  --radius: 0.5rem;
+}
+
+/* ═══ 赛博朋克（2077 风格：警示黄/电光青/深黑）═══ */
+.theme-cyberpunk {
+  --background: 224 52% 4%;
+  --foreground: 52 100% 91%;
+  --card: 224 45% 7%;
+  --card-foreground: 52 100% 91%;
+  --popover: 224 48% 6%;
+  --popover-foreground: 52 100% 91%;
+  --primary: 52 100% 52%;
+  --primary-foreground: 224 58% 6%;
+  --secondary: 218 44% 13%;
+  --secondary-foreground: 52 100% 84%;
+  --muted: 218 38% 12%;
+  --muted-foreground: 185 28% 68%;
+  --accent: 183 100% 48%;
+  --accent-foreground: 224 58% 6%;
+  --destructive: 349 96% 58%;
+  --destructive-foreground: 52 100% 94%;
+  --border: 52 95% 32%;
+  --input: 183 70% 22%;
+  --ring: 52 100% 52%;
+  --radius: 0.125rem;
+}
+
+/* ═══ 地下城（羊皮纸/暗金/烛火暖色）═══ */
+.theme-dungeon {
+  --background: 30 25% 10%;
+  --foreground: 38 40% 88%;
+  --card: 30 22% 13%;
+  --card-foreground: 38 40% 88%;
+  --popover: 30 25% 12%;
+  --popover-foreground: 38 40% 88%;
+  --primary: 38 70% 45%;
+  --primary-foreground: 30 30% 8%;
+  --secondary: 30 18% 20%;
+  --secondary-foreground: 38 40% 85%;
+  --muted: 30 15% 18%;
+  --muted-foreground: 35 20% 55%;
+  --accent: 145 30% 30%;
+  --accent-foreground: 38 40% 90%;
+  --destructive: 0 70% 40%;
+  --destructive-foreground: 38 40% 90%;
+  --border: 35 30% 25%;
+  --input: 35 25% 22%;
+  --ring: 38 70% 45%;
+  --radius: 0.25rem;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   把 CSS 变量映射为 Tailwind 语义色 / 圆角（Tailwind v4 CSS-first）
+   inline = 工具类直接内联值，运行时按当前主题变量解析
+   ═══════════════════════════════════════════════════════════ */
+@theme inline {
+  --color-border: hsl(var(--border));
+  --color-input: hsl(var(--input));
+  --color-ring: hsl(var(--ring));
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+  --color-secondary: hsl(var(--secondary));
+  --color-secondary-foreground: hsl(var(--secondary-foreground));
+  --color-destructive: hsl(var(--destructive));
+  --color-destructive-foreground: hsl(var(--destructive-foreground));
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+  --color-accent: hsl(var(--accent));
+  --color-accent-foreground: hsl(var(--accent-foreground));
+  --color-popover: hsl(var(--popover));
+  --color-popover-foreground: hsl(var(--popover-foreground));
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
 }
 
 @layer base {
-  * {
-    @apply border-border;
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: hsl(var(--border));
   }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
   body {
     @apply bg-background text-foreground;
     font-family: "PingFang SC", "Microsoft YaHei", -apple-system,
       BlinkMacSystemFont, "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* 统一焦点环（键盘可达性）：组件内更具体的 focus-visible 工具类会覆盖它 */
+  :focus-visible {
+    outline: 2px solid hsl(var(--ring));
+    outline-offset: 2px;
   }
 
   /* 赛博朋克主题：2077 式硬边霓虹 */
   .theme-cyberpunk body {
-    background:
+    background-image:
       linear-gradient(
         135deg,
         hsl(52 100% 52% / 0.08) 0 12%,
@@ -127,8 +183,8 @@
         circle at 90% 8%,
         hsl(328 100% 55% / 0.1),
         transparent 26%
-      ),
-      hsl(var(--background));
+      );
+    background-color: hsl(var(--background));
   }
 
   .theme-cyberpunk .bg-primary {
@@ -161,6 +217,18 @@
       hsl(38 40% 15% / 0.4),
       transparent 60%
     );
+  }
+
+  /* 减少动效偏好 */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    ::before,
+    ::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
   }
 }
 

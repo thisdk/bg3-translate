@@ -1,14 +1,17 @@
 import { useMemo } from "react";
 import {
+  Check,
   ChevronDown,
   FileText,
   Languages,
+  Minus,
   Package,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Card } from "@/components/ui/card";
 import { Checkbox, type CheckState } from "@/components/ui/checkbox";
 import { Button } from "@/components/ui/button";
+import { EmptyState } from "@/components/ui/empty-state";
 import type { PakFile, PakFileKind } from "@/lib/types";
 
 interface TreeNode {
@@ -117,11 +120,15 @@ function TreeRow({
     return (
       <div>
         <div
-          className="grid w-full grid-cols-[14px_auto_16px_minmax(0,1fr)_42px] items-center gap-1 rounded px-2 py-1 text-sm hover:bg-accent"
+          className="grid w-full grid-cols-[14px_auto_16px_minmax(0,1fr)_42px] items-center gap-1 rounded px-2 py-1 text-sm hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
           style={{ paddingLeft: depth * 16 + 4 }}
         >
           <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
-          <Checkbox state={folderState} onToggle={toggleFolder} />
+          <Checkbox
+            state={folderState}
+            onToggle={toggleFolder}
+            aria-label={`${folderState === "checked" ? "取消全选" : "全选"} ${node.name}`}
+          />
           <Package className="h-4 w-4 text-muted-foreground" />
           <span className="min-w-0 truncate">{node.name}</span>
           <span className="text-right text-[10px] tabular-nums text-muted-foreground">
@@ -147,15 +154,26 @@ function TreeRow({
     <div
       className={cn(
         "flex w-full items-center gap-2 rounded px-2 py-1 text-sm hover:bg-accent",
+        "cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
         checked && "bg-accent",
       )}
       style={{ paddingLeft: depth * 16 + 20 }}
       onClick={() => onToggleFile(file)}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onToggleFile(file);
+        }
+      }}
       role="button"
+      tabIndex={0}
+      aria-pressed={checked}
+      title={file.name}
     >
       <Checkbox
         state={checked ? "checked" : "unchecked"}
         onToggle={() => onToggleFile(file)}
+        aria-label={`选择 ${node.name}`}
       />
       {KIND_ICON[file.kind] ?? (
         <FileText className="h-4 w-4 text-muted-foreground" />
@@ -237,24 +255,37 @@ export function FileTree({
           <Button
             size="sm"
             variant={allSelected ? "default" : "outline"}
-            className="h-8 w-full text-xs"
+            className="h-8 w-full"
             onClick={toggleAll}
           >
-            <Checkbox
-              state={
-                allSelected ? "checked" : noneSelected ? "unchecked" : "indeterminate"
-              }
-              onToggle={toggleAll}
-            />
+            {/* 装饰性三态指示，避免 button 嵌套 button */}
+            <span
+              aria-hidden
+              className={cn(
+                "flex h-4 w-4 shrink-0 items-center justify-center rounded border",
+                allSelected || !noneSelected
+                  ? "border-primary bg-primary text-primary-foreground"
+                  : "border-input bg-background",
+              )}
+            >
+              {allSelected ? (
+                <Check className="h-3 w-3" strokeWidth={3} />
+              ) : noneSelected ? null : (
+                <Minus className="h-3 w-3" strokeWidth={3} />
+              )}
+            </span>
             {allSelected ? "取消全选" : "全选"}
+            <span className="tabular-nums opacity-70">({locFiles.length})</span>
           </Button>
         )}
       </div>
       <div className="flex-1 overflow-auto p-1">
         {locFiles.length === 0 ? (
-          <div className="flex h-full items-center justify-center p-4 text-center text-sm text-muted-foreground">
-            此 MOD 没有本地化文件
-          </div>
+          <EmptyState
+            icon={<Languages className="h-8 w-8" />}
+            title="此 MOD 没有本地化文件"
+            description="只有 Localization 目录下的 XML / LOCA 文件可以翻译。"
+          />
         ) : (
           [...tree.children.values()].map((node) => (
             <TreeRow

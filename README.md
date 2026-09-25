@@ -118,14 +118,31 @@ bun run build
 
 ### 端到端测试
 
-`crates/bg3-translate-core/tests/e2e_pak_flow.rs` 会真的造一个 PAK，跑完整闭环：
+两层，都是真的读写 PAK：
 
-```
-造 MOD 目录树 → 打包成 .pak → 解包 → 识别文件类型 → 读条目 →
-翻译 → 写回 → 重新打包 → 再解包 → 校验 contentuid / 标签 / 占位符 / 未翻译内容
+- `crates/bg3-translate-core/tests/e2e_pak_flow.rs`：**造**一个 PAK 跑闭环
+  ```
+  造 MOD 目录树 → 打包成 .pak → 解包 → 识别文件类型 → 读条目 →
+  翻译 → 写回 → 重新打包 → 再解包 → 校验 contentuid / 标签 / 占位符 / 未翻译内容
+  ```
+- `crates/bg3-translate-core/tests/real_mod_sample.rs`：拿仓库里那个**真实 Nexus MOD**
+  （`samples/Appearance Edit Enhanced-*.zip`）跑同样一遍，并校验未翻译的
+  lua 脚本逐字节没被动过。
+
+合成样本只能验证「我以为格式是这样的」，真实样本才能验证「格式实际就是这样」。
+`meta.lsx` 里 `Name` 是模块内部标识符（`GustavDev`）而类型同样是 `LSString`
+这件事，就是真实样本测出来的——它绝不能进翻译白名单。
+
+### 跨层契约检查
+
+```bash
+python3 scripts/check_ipc_contract.py
 ```
 
-这样「重构没有破坏功能」有可执行的证据，而不是靠人工目视。
+只依赖 Python 标准库，几秒出结果，核对：前端 `invoke` 的命令 ⊆ 后端注册的命令、
+后端注册的命令 == `docs/ARCHITECTURE.md` 命令表，以及 `TranslationEvent` /
+`TranslationStatus` / `PakFileKind` 三组枚举的 serde 名称与前端联合类型一致。
+`src-tauri` 依赖 GUI 系统库、在很多机器上编不了，这个脚本就是补上的那道防线。
 
 ---
 

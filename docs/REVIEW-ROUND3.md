@@ -14,7 +14,7 @@
 | 工作区代码 hash | `ad8d3219…` | `1189d7aa17ba5302e75681ec411918c0` |
 | `bash scripts/verify.sh` | 6/6 通过 | **6/6 通过** |
 | Rust 测试 | 263 + 6 + 6 = 275 | **327 + 7 + 7 = 341** |
-| Tauri 命令层测试 | 0（CI 里从未执行） | **15**，并已接进 CI |
+| Tauri 命令层测试 | 0（CI 里从未执行） | **16**，并已接进 CI 且在 Windows 上跑通 |
 | 前端测试 | 13 文件 / 155 用例 | **20 文件 / 190 用例** |
 | 已修缺陷 | — | **37 条**（高 7 / 中 14 / 低与信息 16） |
 | 已确认未修（含理由） | — | 11 条 + 红队 4 条（均低/信息级） |
@@ -167,7 +167,47 @@ R-10（属性名漏报）逐条独立复现，`BEFORE=红 / AFTER=绿`。
 已在 `tauri-shell`（Windows）job 里加一步 `cargo test -p bg3-translate --lib`。
 它**故意不进 `verify.sh`**：`cargo test -p bg3-translate` 要先编译整个 Tauri 壳，
 ubuntu runner 上没有 webkit2gtk 连编译都过不去（`docs/ARCHITECTURE.md` 已写明这条边界）。
-本机 Linux 实测 15/15 通过；**Windows runner 上能否通过属于「无法验证项」**（见 §5）。
+本机 Linux 实测 15/15 通过。**首次 Windows CI 运行就红了** —— 见 §3.5。
+
+### 3.5 首次 Windows CI 运行暴露的平台相关断言（v1.1.0 修）
+
+`dev` 上第一次跑 `tauri-shell` 时，新增的这一步失败了：14 个用例里
+`commands::tests::same_dir_falls_back_to_lexical_for_missing_paths` 红了。
+
+```
+assertion failed: !is_same_dir(&ghost,
+    Path::new(ghost.to_string_lossy().trim_start_matches('/')))
+```
+
+**根因是测试自己写错了，不是产品缺陷。** 那条断言想验证「相对路径不能冒充绝对路径」，
+于是用 `trim_start_matches('/')` 把临时目录的绝对路径「去掉根」造出一个相对路径 ——
+这个写法默认了绝对路径以 `/` 开头。Windows 的绝对路径是 `C:\Users\...`，
+**`trim_start_matches('/')` 在那里是空操作**，两边退化成同一个字符串，
+`is_same_dir` 当然返回 `true`，断言 `!true` 恒假。它在 Linux 上一直是绿的，因为
+Linux 的绝对路径确实以 `/` 开头。
+
+也就是说：**这条断言在 Windows 上是「恒假」而不是「恒真」** —— 它没有掩盖产品缺陷，
+只是把一个平台假设写死进了测试。产品代码 `is_same_dir` / `lexical_parts` 没有问题：
+盘符分量 `C:` 会保留在比较里，绝对路径与相对路径本来就不会撞车（13 个用例在
+Windows 上全绿，包括 `same_dir_case_sensitivity_matches_platform` 与
+`frontend_echoed_work_dir_passes_validation`）。
+
+修法两层：
+
+1. 用 `components()` 去根（`strip_root`），在 Unix（`/tmp/x` → `tmp/x`）与
+   Windows（`C:\a\x` → `a\x`）上都得到**真正的相对路径**，并先断言 `is_relative()`
+   把「前提不成立」变成一条明确的失败信息，而不是让后面的断言悄悄失去意义；
+2. 新增 `lexical_parts_keep_absolute_and_relative_apart`，用**与宿主无关的字面量**
+   （`/tmp/x` vs `tmp/x`、`C:\a\x` vs `a\x`）直接钉住这条不变量。这样无论
+   `std::env::temp_dir()` 长什么样，这条防线都不会再退化成空断言 ——
+   **Windows 相关的行为现在可以在 Linux 上被钉住**。
+
+两条用例都做了变异实验：把 `lexical_parts` 里的根标记去掉，两条都会立刻变红。
+修后 `cargo test -p bg3-translate --lib` = **16 个用例**，Windows CI 转绿。
+
+这里暴露的真正教训不是「写错了三行」，而是：**这批壳层测试此前从没在任何 CI 上跑过**，
+所以「只在 Linux 上验证过」这件事一直没人发现。§3.4 补上 CI 步骤之后，
+这类问题会在第一次推送时就暴露（这次确实如此），而不是等到用户装包。
 
 ---
 
@@ -217,7 +257,7 @@ ubuntu runner 上没有 webkit2gtk 连编译都过不去（`docs/ARCHITECTURE.md
 | --- | --- |
 | repack 后的 PAK 在**真机 BG3** 里能否加载 | 无法运行游戏；只能用产物的 XML/LOCA 语义与真实样本往返推断 |
 | 真实 LLM API 的端到端行为 | 没有 key；所有网络行为用注入的假实现 + 直接喂字节给 SSE 解码器验证 |
-| Windows 专有行为：保留设备名、`\\?\` 前缀、大小写不敏感、CI 新增步骤能否通过 | 本机是 Linux；测试里用 `cfg!(windows)` / `#[cfg(unix)]` 做了分支，但只能静态判断 |
+| Windows 专有行为：保留设备名、`\\?\` 前缀、大小写不敏感 | 本机是 Linux；测试里用 `cfg!(windows)` / `#[cfg(unix)]` 做了分支，但只能静态判断。**新增的 CI 步骤已经真在 Windows 上跑过一轮并暴露了 1 条平台相关断言**（§3.5），修后由 CI 持续覆盖 |
 | `release.yml` 的 4 段 PowerShell | 本机没有 `pwsh` |
 | 真实 Tauri Channel 与命令 Promise 的**先后顺序** | 不跑真后端；若两者不保序，只会少一条「上次任务 N 条」的摘要，无数据损坏。**建议真机抽查一次** |
 
@@ -227,7 +267,7 @@ ubuntu runner 上没有 webkit2gtk 连编译都过不去（`docs/ARCHITECTURE.md
 
 ```bash
 bash scripts/verify.sh            # 6 道门禁，约 8 秒
-cargo test -p bg3-translate --lib # 命令层 15 条（Linux 需要 GUI 系统库；CI 在 Windows 跑）
+cargo test -p bg3-translate --lib # 命令层 16 条（Linux 需要 GUI 系统库；CI 在 Windows 跑）
 ```
 
 | 文件 | 内容 |

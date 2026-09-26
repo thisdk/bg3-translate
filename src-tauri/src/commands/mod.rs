@@ -208,11 +208,60 @@ mod tests {
         ));
         // `..` 越过根 → 保守判否
         assert!(!is_same_dir(&ghost, Path::new("/..")));
-        // 相对路径与绝对路径不能撞车
-        assert!(!is_same_dir(
-            &ghost,
-            Path::new(ghost.to_string_lossy().trim_start_matches('/'))
-        ));
+        // 相对路径与绝对路径不能撞车：把绝对路径的**根**去掉之后必须判否。
+        //
+        // 不要用 `trim_start_matches('/')` 来构造这个相对路径：Windows 的绝对路径以
+        // 盘符开头（`C:\Users\...`），那个调用是**空操作**，两边会退化成同一个字符串，
+        // 断言在 Windows 上恒假 —— 2026-09-26 的 Windows CI 就是这么红的（v1.1.0 修）。
+        // 用 `components()` 去根，在 Unix（`/tmp/x` → `tmp/x`）与 Windows
+        // （`C:\a\x` → `a\x`）上都得到真正的相对路径。
+        let without_root = strip_root(&ghost);
+        assert!(
+            without_root.is_relative(),
+            "用例前提：去掉根之后必须是相对路径，实际 {}",
+            without_root.display()
+        );
+        assert!(
+            !is_same_dir(&ghost, &without_root),
+            "相对路径与绝对路径不能撞车: {} vs {}",
+            ghost.display(),
+            without_root.display()
+        );
+    }
+
+    /// 去掉路径的根（Unix 的 `/`、Windows 的 `C:\`），返回相对路径。
+    fn strip_root(path: &Path) -> PathBuf {
+        let mut out = PathBuf::new();
+        for component in path.components() {
+            match component {
+                std::path::Component::Prefix(_) | std::path::Component::RootDir => continue,
+                other => out.push(other),
+            }
+        }
+        out
+    }
+
+    /// 「绝对路径 vs 相对路径不能撞车」这条不变量，用**字面量**直接钉住。
+    ///
+    /// 为什么单独写一条：上面那个用例靠 `std::env::temp_dir()` 造路径，构造出的
+    /// 「相对版本」是否真的相对**取决于平台**（Windows 的绝对路径以盘符开头，
+    /// 早先那版用 `trim_start_matches('/')` 去根在 Windows 上是空操作，断言恒假）。
+    /// 这里改用与宿主无关的输入：`/tmp/x` 在两平台都是绝对路径，`tmp/x` 都是相对路径；
+    /// `C:\a\x` 与 `a\x` 的差异靠保留下来的 `C:` 分量区分，同样与宿主无关。
+    #[test]
+    fn lexical_parts_keep_absolute_and_relative_apart() {
+        let cases = [
+            ("/tmp/x", "tmp/x", "Unix 式根 `/`"),
+            (r"C:\a\x", r"a\x", "Windows 式根 `C:`"),
+        ];
+        for (absolute, relative, label) in cases {
+            let absolute_parts = lexical_parts(Path::new(absolute)).expect("词法解析");
+            let relative_parts = lexical_parts(Path::new(relative)).expect("词法解析");
+            assert_ne!(
+                absolute_parts, relative_parts,
+                "{label}：根必须参与比较，否则相对路径能冒充绝对路径"
+            );
+        }
     }
 
     /// 非 UTF-8：词法回退必须保守判否，不能把两个不同的非法路径 lossy 成同一个。

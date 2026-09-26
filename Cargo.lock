@@ -155,7 +155,7 @@ checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "bg3-translate"
-version = "1.0.8"
+version = "1.1.0"
 dependencies = [
  "bg3-translate-core",
  "log",
@@ -172,7 +172,7 @@ dependencies = [
 
 [[package]]
 name = "bg3-translate-core"
-version = "1.0.8"
+version = "1.1.0"
 dependencies = [
  "aho-corasick",
  "async-openai",

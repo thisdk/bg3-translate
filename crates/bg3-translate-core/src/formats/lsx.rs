@@ -14,6 +14,7 @@
 use std::ops::Range;
 use std::path::Path;
 
+use super::content_list::{decode_entities, decode_reference_body};
 use crate::config::write_atomic;
 use crate::error::{AppError, Result};
 use crate::types::TranslationEntry;
@@ -148,6 +149,11 @@ pub fn plan_replacements(
 ///
 /// 区间必须互不重叠且从后往前（[`plan_replacements`] 的排序保证）；一旦发现
 /// 重叠就跳过——用失效偏移替换会把文件写坏，宁可少写一条也不能产出坏文件。
+///
+/// 替换值在转义**之前**先做一次实体还原（[`decode_entities`]）：模型照抄文件里的
+/// 转义形态（`&amp;` / `&lt;LSTag&gt;`）时只转义一层，不会落盘成 `&amp;amp;`。
+/// 顺序与 `content_list` 一致：**还原 → 丢非法字符（在 `escape_attribute` 里）
+/// → 转义**；反过来 `&#1;` 会整段躲过过滤、以裸控制字符落盘。
 pub fn apply_replacements(xml: &str, replacements: &[(Range<usize>, String)]) -> String {
     let mut out = xml.to_string();
     // 已应用的替换里最靠左的起点：后面的替换必须整体落在它左边
@@ -161,7 +167,10 @@ pub fn apply_replacements(xml: &str, replacements: &[(Range<usize>, String)]) ->
             log::warn!("LSX 替换区间重叠，已跳过: {span:?}");
             continue;
         }
-        out.replace_range(span.clone(), &escape_attribute(value));
+        // 还原不能塞进 `escape_attribute`：它必须是纯转义器
+        // （`escapes_and_unescapes_roundtrip` 钉住了 `unescape(escape(x)) == x`）。
+        let decoded = decode_entities(value);
+        out.replace_range(span.clone(), &escape_attribute(&decoded));
         applied_start = span.start;
     }
     out
@@ -372,6 +381,12 @@ pub fn parse_attributes(xml: &str, tag: &TagSpan) -> std::collections::HashMap<S
 // ─────────────────────────────────────────────────────────────
 
 /// 反转义 XML 属性值（含数字字符引用）。
+///
+/// 解码规则**只有一份**：[`decode_reference_body`]（与 `content_list` 共用）。
+/// 这里只负责「扫描出 `&…;` 引用体」这件事 —— 之前 lsx 自己那份 `decode_entity`
+/// 更宽松（还接受大写 `#X`、带符号的数字、码位 0），与写回侧用的规则不一致，
+/// T8 把它删掉改为委托；差异只出现在**非法 XML 引用**上：
+/// `&#X41;` / `&#+65;` / `&#0;` 以前会被解出字符，现在按 XML 文法原样保留。
 pub fn unescape_attribute(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut rest = value;
@@ -383,8 +398,7 @@ pub fn unescape_attribute(value: &str) -> String {
             return out;
         };
         let entity = &tail[1..semi];
-        let decoded = decode_entity(entity);
-        match decoded {
+        match decode_reference_body(entity) {
             Some(text) => out.push_str(&text),
             None => out.push_str(&tail[..=semi]),
         }
@@ -392,27 +406,6 @@ pub fn unescape_attribute(value: &str) -> String {
     }
     out.push_str(rest);
     out
-}
-
-fn decode_entity(entity: &str) -> Option<String> {
-    match entity {
-        "amp" => return Some("&".into()),
-        "lt" => return Some("<".into()),
-        "gt" => return Some(">".into()),
-        "quot" => return Some("\"".into()),
-        "apos" => return Some("'".into()),
-        _ => {}
-    }
-    let digits = entity
-        .strip_prefix("#x")
-        .or_else(|| entity.strip_prefix("#X"));
-    if let Some(hex) = digits {
-        let code = u32::from_str_radix(hex, 16).ok()?;
-        return char::from_u32(code).map(String::from);
-    }
-    let dec = entity.strip_prefix('#')?;
-    let code = dec.parse::<u32>().ok()?;
-    char::from_u32(code).map(String::from)
 }
 
 /// 转义成可安全放进双引号属性值的形式。
@@ -794,5 +787,187 @@ mod tests {
         // 合法的换行/制表符仍按字符引用写出（不能变成裸控制字符）
         assert_eq!(escape_attribute("a\nb"), "a&#10;b");
         assert_eq!(escape_attribute("a\tb"), "a&#9;b");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // T8：写回前先还原实体（与 content_list 共用同一份规则）
+    // ─────────────────────────────────────────────────────────────
+
+    const ONE_FIELD: &str =
+        r#"<save><node><attribute id="Description" type="LSString" value="原文" /></node></save>"#;
+
+    /// 走真实 `write` 路径把一条译文写进单字段 `.lsx`，返回落盘内容。
+    fn write_description(target: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Meta.lsx");
+        std::fs::write(&path, ONE_FIELD).unwrap();
+        let mut entry = TranslationEntry::new("Meta.lsx", "Description#0", "1", "原文");
+        entry.mark_translated(target);
+        write(&path, &[entry]).unwrap();
+        std::fs::read_to_string(&path).unwrap()
+    }
+
+    /// 读侧（`unescape_attribute`）与写回侧共用同一份实体规则。
+    ///
+    /// 这张表同时跑两条路，钉住「跨格式只有一份规则」：任意一行的两边必须给出
+    /// 相同结果（包括非法 / 未知引用一律原样保留）。
+    #[test]
+    fn entity_rule_agrees_with_content_list() {
+        for (raw, expected) in [
+            ("&amp;", "&"),
+            ("&lt;", "<"),
+            ("&gt;", ">"),
+            ("&quot;", "\""),
+            ("&apos;", "'"),
+            ("&#65;", "A"),
+            ("&#x41;", "A"),
+            ("&#x4e2d;", "中"),
+            ("&#x1f600;", "\u{1f600}"),
+            ("&amp;amp;", "&amp;"),
+            ("a & b", "a & b"),
+            ("&nbsp;", "&nbsp;"),
+            ("&lt", "&lt"),
+            ("&#;", "&#;"),
+            ("&#xZZ;", "&#xZZ;"),
+            ("&#0;", "&#0;"),
+            ("&#X41;", "&#X41;"),
+            ("&#-1;", "&#-1;"),
+        ] {
+            assert_eq!(unescape_attribute(raw), expected, "LSX 读侧 {raw:?}");
+            assert_eq!(decode_entities(raw).as_ref(), expected, "共享规则 {raw:?}");
+        }
+    }
+
+    /// 写回前先还原实体：模型照抄文件里的转义形态时只转义**一层**。
+    ///
+    /// 复现（修复前）：`escape_attribute(value)` 直接转义 → 模型输出 `&amp;`
+    /// 落盘成 `&amp;amp;`（游戏读到 `&amp;`）、`&lt;LSTag&gt;` 落盘成
+    /// `&amp;lt;LSTag&amp;gt;`（富文本标签失效）。与 T6 修掉的 D1 同类。
+    #[test]
+    fn entity_in_target_is_decoded_before_escaping() {
+        // (译文, 落盘必须出现, 读回来必须等于, 说明)
+        let cases = [
+            (
+                "a &amp; b",
+                r#"value="a &amp; b""#,
+                "a & b",
+                "`&amp;` 只转义一层",
+            ),
+            (
+                r#"&lt;LSTag&gt;x&lt;/LSTag&gt;"#,
+                r#"value="&lt;LSTag&gt;x&lt;/LSTag&gt;""#,
+                "<LSTag>x</LSTag>",
+                "标签只转义一层",
+            ),
+            ("a & b", r#"value="a &amp; b""#, "a & b", "裸 `&` 照常转义"),
+            (
+                "没有实体",
+                r#"value="没有实体""#,
+                "没有实体",
+                "无实体不回归",
+            ),
+        ];
+        for (target, written, read_back, label) in cases {
+            let out = write_description(target);
+            assert!(out.contains(written), "[{label}] 落盘不对: {out}");
+            assert!(!out.contains("&amp;amp;"), "[{label}] 二次转义: {out}");
+            assert!(!out.contains("&amp;lt;"), "[{label}] 标签二次转义: {out}");
+            assert_eq!(
+                scan_translatable(&out)[0].value,
+                read_back,
+                "[{label}] 读回来不对: {out}"
+            );
+        }
+    }
+
+    /// `escape(decode(T))` 是**不动点**：把落盘值再当译文写一遍，字节不变。
+    #[test]
+    fn rewriting_the_written_value_is_byte_stable() {
+        for target in [
+            r#"&lt;LSTag&gt;x&lt;/LSTag&gt;"#,
+            "a &amp; b",
+            "a & b",
+            "&nbsp;",
+            "&#xZZ;",
+            "没有实体",
+        ] {
+            let first = write_description(target);
+            let written_back = scan_translatable(&first)[0].value.clone();
+            let second = write_description(&written_back);
+            assert_eq!(first, second, "{target:?} 两轮写回不稳定");
+        }
+    }
+
+    /// 非法 / 残缺 / 未知引用一律原样保留（一个字符都不吞）。
+    #[test]
+    fn malformed_entities_in_target_are_kept_verbatim() {
+        for raw in [
+            "&lt",       // 没有分号
+            "&#;",       // 数值引用缺数字
+            "&#xZZ;",    // 非法十六进制
+            "&unknown;", // 未定义实体
+            "&",         // 裸 &
+            "&#X41;",    // 大写 X 不是 XML 的字符引用文法
+            "&#0;",      // 码位 0 非法
+            "a & b",     // 正文里的裸 &
+            "&lt &amp;", // 残缺引用后面跟一个合法引用
+        ] {
+            let out = write_description(raw);
+            let field = scan_translatable(&out)[0].value.clone();
+            let expected = if raw == "&lt &amp;" { "&lt &" } else { raw };
+            assert_eq!(field, expected, "{raw:?} 被改写了: {out}");
+        }
+    }
+
+    /// 顺序必须是**还原 → 丢非法字符 → 转义**：`&#1;` 解出的控制字符要被丢掉，
+    /// 不能整段躲过过滤、以裸控制字符落盘（那会让整个 `.lsx` 变成非法文件）。
+    #[test]
+    fn char_ref_to_illegal_control_char_is_dropped_after_decoding() {
+        let out = write_description("a&#1;b&#x0C;c");
+
+        assert!(!out.contains('\u{1}') && !out.contains('\u{c}'), "{out:?}");
+        assert!(out.contains(r#"value="abc""#), "{out}");
+        assert_eq!(scan_translatable(&out)[0].value, "abc");
+    }
+
+    /// 回归基线：真实 MOD 的 `.lsx` 零译文写回必须**逐字节不变**。
+    ///
+    /// `write` 只替换「有可写回译文」的区间，所以未翻译条目提交上来时文件应当
+    /// 一字不动 —— T8 的改动不许让这条回退（`meta.lsx` / `Rulebook.lsx` 都覆盖）。
+    #[test]
+    fn real_mod_lsx_files_round_trip_byte_identical() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let zip = repo_root.join("samples/Appearance Edit Enhanced-899-3-1-3-1769898497.zip");
+        assert!(zip.is_file(), "真实样本缺失: {}", zip.display());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (work_dir, files) =
+            crate::pak::open_and_extract_in(zip.to_str().unwrap(), tmp.path()).unwrap();
+        let lsx_files: Vec<_> = files
+            .iter()
+            .filter(|file| file.kind == crate::types::PakFileKind::MetadataLsx)
+            .collect();
+        assert!(!lsx_files.is_empty(), "真实样本里应该有 .lsx 文件");
+
+        for file in &lsx_files {
+            let path = work_dir.join("unpacked").join(&file.name);
+            let before = std::fs::read(&path).unwrap();
+            let entries = read(&path, &file.name).unwrap();
+            write(&path, &entries).unwrap();
+            let after = std::fs::read(&path).unwrap();
+            println!(
+                "{}: {} 字节 / {} 个条目 / `&` 出现 {} 次 → {}",
+                file.name,
+                before.len(),
+                entries.len(),
+                before.iter().filter(|byte| **byte == b'&').count(),
+                if after == before {
+                    "往返逐字节相同".to_string()
+                } else {
+                    format!("**不同**（写回后 {} 字节）", after.len())
+                }
+            );
+            assert_eq!(after, before, "{} 零译文写回必须逐字节不变", file.name);
+        }
     }
 }

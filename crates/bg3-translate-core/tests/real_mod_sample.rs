@@ -146,11 +146,15 @@ fn real_localization_files_read_without_errors() {
 /// 结构保真校验在**真实文本 + 真实富文本形态**上不许误报。
 ///
 /// 语料 = 真实样本里 41 条原文，各自套上几种真实 MOD 里常见的标记形态
-/// （`<LSTag Type=... Tooltip=...>`、`<i>`、`<b>`、`<br/>`、`{1}`、比较用的 `<`）。
+/// （`<LSTag Type=... Tooltip=...>`、`<i>`、`<b>`、`<br/>`、`{1}`、`[1]`、
+/// `[IE_PanelSelect]`、相邻的 `[1] [2]`、比较用的 `<`）。
 /// 对每条语料做三种**合法翻译**，三种都必须判为保真：
 /// 1. 只翻正文，标记逐字照抄；
 /// 2. 把译文里的 `<` 重新转义成 `&lt;`（解析层本来也还原过一次，不算结构变化）；
-/// 3. 连标签属性值一起翻译（系统 prompt 不允许，但属性值本来就不参与结构比较）。
+/// 3. 把标签里**自然语言形态**的属性值一起翻译（`Tooltip="Deals {1} damage"` 这类
+///    含空格的值；系统 prompt 不允许，但这类值不参与结构比较）。**标识符形态**的
+///    key 型属性值（`Type="Spell"`、`Tooltip="HitPoints"`）不在此列 —— 它们是查表
+///    key，翻了必须报，见反向用例 [`key_attribute_values_are_not_faithful_when_translated`]。
 ///
 /// 这是"接进主流程前先证明不会误报"的证据；断言失败会直接打印原文与问题。
 #[test]
@@ -167,7 +171,10 @@ fn realistic_translations_are_never_flagged_by_structure_check() {
             let candidates = [
                 ("保留标记", translated.clone()),
                 ("转义尖括号", escape_angle_brackets(&translated)),
-                ("改写属性值", rewrite_attribute_values(&translated)),
+                (
+                    "改写自然语言属性值",
+                    rewrite_natural_language_attribute_values(&translated),
+                ),
             ];
             for (label, candidate) in candidates {
                 translations_checked += 1;
@@ -188,6 +195,62 @@ fn realistic_translations_are_never_flagged_by_structure_check() {
     );
 }
 
+/// 反向用例：**key 型属性值**被翻译，结构校验必须报出来。
+///
+/// 这里订正一条旧结论：这个文件以前断言「只改属性值 → 保真」。但 `Tooltip` / `Type`
+/// 的值不是显示文本，而是**查表 key** —— 语料里 `Tooltip="VENOMOUS_BARBS_CONDITION"`
+/// 包着的正文是 "Deadly Toxin"、`Type` 只有 Spell / Status / Passive 三个取值。
+/// 翻了 KEY，游戏按 key 查表就查不到，而产物仍是合法 XML、写盘一路静默通过。
+///
+/// 收口范围刻意窄：只有**属性名是 `Tooltip` / `Type`、且原文的值是标识符形态**
+/// （非空、只含 ASCII 字母数字下划线）才要求逐字一致。自然语言形态的值仍然自由，
+/// 由 [`realistic_translations_are_never_flagged_by_structure_check`] 那条盯着。
+#[test]
+fn key_attribute_values_are_not_faithful_when_translated() {
+    for (source, translated) in [
+        // `Type` 的闭集取值（游戏据此决定链接样式）
+        (
+            r#"<LSTag Type="Spell">Fireball</LSTag>"#,
+            r#"<LSTag Type="法术">火球术</LSTag>"#,
+        ),
+        // `Tooltip` 的驼峰 key：`HitPoints` 是 key，包着的 "hit points" 才是显示文本
+        (
+            r#"<LSTag Tooltip="HitPoints">hit points</LSTag>"#,
+            r#"<LSTag Tooltip="生命值">生命值</LSTag>"#,
+        ),
+        // 内部 ID 形态 + 两个属性一起被翻
+        (
+            r#"<LSTag Type="Status" Tooltip="VENOMOUS_BARBS_CONDITION">Deadly Toxin</LSTag>"#,
+            r#"<LSTag Type="Status" Tooltip="致命毒素">致命毒素</LSTag>"#,
+        ),
+    ] {
+        assert!(
+            !is_faithful(source, translated),
+            "key 型属性值被翻译必须判为不保真: {source:?} → {translated:?}（问题: {:?}）",
+            check_fidelity(source, translated)
+        );
+    }
+
+    // 只翻 KEY、正文照抄也一样报（正文是不是中文与这条判据无关）
+    assert_eq!(
+        check_fidelity(
+            r#"<LSTag Tooltip="Projectile_MagicStoneThrow">Throw Magic Stone</LSTag>"#,
+            r#"<LSTag Tooltip="投掷魔法石">Throw Magic Stone</LSTag>"#
+        )
+        .len(),
+        1
+    );
+
+    // 正确的做法：KEY 逐字保留、只翻正文与语序 → 保真
+    assert!(
+        is_faithful(
+            r#"Inflicts <LSTag Type="Status" Tooltip="VENOMOUS_BARBS_CONDITION">Deadly Toxin</LSTag> for 2 turns."#,
+            r#"使其陷入<LSTag Type="Status" Tooltip="VENOMOUS_BARBS_CONDITION">致命毒素</LSTag>状态，持续 2 回合。"#
+        ),
+        "KEY 逐字保留的正确译文不该被误报"
+    );
+}
+
 /// 反向用例：**属性名**被改坏、或属性被整个删掉，结构校验必须报出来。
 ///
 /// 为什么必须有这条：构造「属性值改写」的辅助函数以前把属性名也压成了 `字`，
@@ -198,13 +261,28 @@ fn realistic_translations_are_never_flagged_by_structure_check() {
 fn mangled_tag_attribute_names_are_not_faithful() {
     let source = r#"<LSTag Type="Spell" Tooltip="Deals {1} damage">Fireball</LSTag>"#;
 
-    // 对照组：只改写属性值（属性名逐字保留）→ 必须仍然判为保真。
-    // 如果这条红了，说明校验被改成了「连属性值都要一样」，那是过度收紧。
-    let values_rewritten = rewrite_quoted_values(source);
+    // 对照组：只改写**自然语言形态**的属性值（`Tooltip="Deals {1} damage"`），
+    // 属性名与标识符形态的 key 值（`Type="Spell"`）逐字保留 → 必须仍然判为保真。
+    // 如果这条红了，说明校验被改成了「连自然语言属性值都要一样」，那是过度收紧
+    // （见 `fidelity.rs` 里 `natural_language_attribute_values_are_still_free`）。
+    let values_rewritten = rewrite_natural_language_attribute_values(source);
     assert_ne!(values_rewritten, source, "属性值应确实被改写");
     assert!(
+        values_rewritten.contains(r#"Type="Spell""#),
+        "标识符形态的 key 值必须原样保留: {values_rewritten:?}"
+    );
+    assert!(
         is_faithful(source, &values_rewritten),
-        "只改属性值不该被判失败: {values_rewritten:?}"
+        "只改自然语言属性值不该被判失败: {values_rewritten:?}"
+    );
+
+    // 对照组反面：同一个辅助函数**不能**把标识符形态的 key 值洗白 ——
+    // `Type="Spell"` → `Type="字"` 必须报（旧结论在这里是放行的）
+    let key_rewritten = source.replace(r#"Type="Spell""#, r#"Type="字""#);
+    assert!(
+        !is_faithful(source, &key_rewritten),
+        "key 型属性值被改写必须判为不保真: {key_rewritten:?}（问题: {:?}）",
+        check_fidelity(source, &key_rewritten)
     );
 
     // 属性名被改：`Type` → `类型`（模型把标记也翻译了）
@@ -250,6 +328,11 @@ fn real_sample_sources() -> Vec<String> {
 }
 
 /// 真实 MOD 里常见的富文本 / 占位符形态（拿真实原文当正文）。
+///
+/// `[N]` 这一类是后补的：官方术语表里 163 条含 `[数字]` 的条目，**官方简中
+/// 163/163 全部原样保留**，但仓库里这个真实样本恰好一条方括号都没有（41 条
+/// 全是纯 UI 文案），所以只能在这里合成形态覆盖 —— 不补的话，`[N]` 这条回归
+/// 在任何真实/端到端测试里都不会被触发。
 fn markup_variants(source: &str) -> Vec<String> {
     vec![
         source.to_string(),
@@ -258,6 +341,14 @@ fn markup_variants(source: &str) -> Vec<String> {
         format!("<b>{source}</b><br/>{{2}}"),
         format!("{source} (HP < 5%)"),
         format!("{source} (HP &lt; 5%)"),
+        // ── 方括号占位符 `[N]` ──
+        format!("[1] {source}"),
+        format!("{source} (deal [2] otherwise deal [1])"),
+        format!(r#"<LSTag Tooltip="Deals [2] damage">{source}</LSTag>"#),
+        format!("[IE_PanelSelect] {source}"),
+        // 两个占位符相邻：中间的分隔是**载重**的（丢了会被渲染成一个数），
+        // 所以翻译时必须原样保留 —— 这条也顺带盯住「粘连校验不误报」
+        format!("{source} [1] [2]"),
     ]
 }
 
@@ -270,8 +361,13 @@ fn keep_markup_translate_text(source: &str) -> String {
     let mut index = 0usize;
     while index < chars.len() {
         match chars[index] {
-            '<' | '{' => {
-                let closer = if chars[index] == '<' { '>' } else { '}' };
+            // `{}` 与 `[]` 是两套独立的占位符写法，都要原样保留
+            '<' | '{' | '[' => {
+                let closer = match chars[index] {
+                    '<' => '>',
+                    '{' => '}',
+                    _ => ']',
+                };
                 match chars[index..].iter().position(|c| *c == closer) {
                     Some(offset) => {
                         out.extend(&chars[index..=index + offset]);
@@ -300,7 +396,12 @@ fn escape_angle_brackets(text: &str) -> String {
     text.replace('<', "&lt;").replace('>', "&gt;")
 }
 
-/// 改写每个标签的属性**值** —— 属性值不参与结构比较，不该因此判失败。
+/// 改写标签里**自然语言形态**的属性值 —— 模拟「模型顺手把非 key 的属性值也翻了」。
+///
+/// **标识符形态的值一律原样保留**：`Type="Spell"`、`Tooltip="HitPoints"` 这类值是
+/// 查表 key，不是显示文本，改了会把 MOD 弄坏，`fidelity` 也会（应该）报出来 ——
+/// 见反向用例 [`key_attribute_values_are_not_faithful_when_translated`]。
+/// 这个辅助函数只负责构造「合法的那一半」：含空格的自然语言值被翻译。
 ///
 /// **属性名必须原样保留**：这个用例的意图是「属性值被翻译」而不是「属性可以随便改」。
 /// 如果连属性名一起压成 `字`，就会掩盖真实漏报——`Type=` 被改坏成 `类型=`、或者整个
@@ -309,7 +410,19 @@ fn escape_angle_brackets(text: &str) -> String {
 ///
 /// 注意占位符必须原样保留：`Tooltip="Deals {1} damage"` 里的 `{1}` 是给游戏填参数的，
 /// 属性值可以重写，但把它丢了就是真的结构损坏（`fidelity` 会、也应该报出来）。
-fn rewrite_attribute_values(text: &str) -> String {
+fn rewrite_natural_language_attribute_values(text: &str) -> String {
+    rewrite_attribute_values_matching(text, |value| !is_identifier_shaped(value))
+}
+
+/// 属性值是否是「标识符形态」：非空、只含 ASCII 字母数字下划线。
+///
+/// 刻意**不复用** `fidelity` 内部的判断（它在模块私有）：两边独立，才能互相验证。
+fn is_identifier_shaped(value: &str) -> bool {
+    !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// 把每个标签里**满足 `rewrite` 条件**的属性值改写掉，其余属性值逐字保留。
+fn rewrite_attribute_values_matching(text: &str, rewrite: impl Fn(&str) -> bool) -> String {
     let mut out = String::new();
     let mut rest = text;
     while let Some(start) = rest.find('<') {
@@ -335,7 +448,7 @@ fn rewrite_attribute_values(text: &str) -> String {
             out.push_str(name);
             if !attrs.trim().is_empty() {
                 // attrs 自带前导空白，不能额外补空格，否则属性间空白会翻倍
-                out.push_str(&rewrite_quoted_values(attrs));
+                out.push_str(&rewrite_quoted_values(attrs, &rewrite));
             }
             if self_closing {
                 out.push('/');
@@ -348,8 +461,9 @@ fn rewrite_attribute_values(text: &str) -> String {
     out
 }
 
-/// 只重写双引号/单引号里的内容，引号外的一切（属性名、`=`、空白、`/`）逐字保留。
-fn rewrite_quoted_values(attrs: &str) -> String {
+/// 只重写引号里**满足 `rewrite` 条件**的内容，引号外的一切（属性名、`=`、空白、`/`）
+/// 逐字保留。
+fn rewrite_quoted_values(attrs: &str, rewrite: &impl Fn(&str) -> bool) -> String {
     let mut out = String::new();
     let mut i = 0usize;
     while i < attrs.len() {
@@ -363,7 +477,12 @@ fn rewrite_quoted_values(attrs: &str) -> String {
                 .map(|offset| value_start + offset)
                 .unwrap_or(attrs.len());
             out.push(c); // 开引号
-            out.push_str(&keep_placeholders(&attrs[value_start..value_end]));
+            let value = &attrs[value_start..value_end];
+            if rewrite(value) {
+                out.push_str(&keep_placeholders(value));
+            } else {
+                out.push_str(value);
+            }
             out.push(c); // 闭引号
             i = if value_end < attrs.len() {
                 value_end + c.len_utf8()
@@ -378,14 +497,19 @@ fn rewrite_quoted_values(attrs: &str) -> String {
     out
 }
 
-/// 把除 `{...}` 占位符之外的内容整体压成一个 `字`。
+/// 把除 `{...}` / `[...]` 占位符之外的内容整体压成一个 `字`。
 fn keep_placeholders(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::new();
     let mut index = 0usize;
     while index < chars.len() {
-        if chars[index] == '{' {
-            if let Some(offset) = chars[index..].iter().position(|c| *c == '}') {
+        let closer = match chars[index] {
+            '{' => Some('}'),
+            '[' => Some(']'),
+            _ => None,
+        };
+        if let Some(closer) = closer {
+            if let Some(offset) = chars[index..].iter().position(|c| *c == closer) {
                 out.extend(&chars[index..=index + offset]);
                 index += offset + 1;
                 continue;

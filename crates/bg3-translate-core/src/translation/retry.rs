@@ -21,7 +21,9 @@ use std::time::Duration;
 use crate::error::{AppError, Result};
 
 use super::events::{CancelToken, EventSink, emit_progress, wait_until_cancelled};
-use super::fidelity::{FidelityIssue, check_fidelity, correction_hint, summarize};
+use super::fidelity::{
+    FidelityIssue, check_fidelity, correction_hint, repair_placeholders, summarize,
+};
 use super::planner::{TranslationJob, TranslationOutput};
 use super::series::compose_variant_translation;
 use super::translator::{API_STATUS_PREFIX, TextTranslator, TranslateRequest};
@@ -66,6 +68,13 @@ pub(crate) async fn translate_with_retry(
         return Ok(None);
     };
 
+    // 把译文里可确定的占位符写法差异修回原文形态（全角括号、括号类型被改写）。
+    //
+    // **必须早于校验**：只在签名层归一化的话，`【1】` / `{1}` 会被判成保真，
+    // 然后原样写进 PAK —— 游戏替换不了它们，「报错可见」就变成了「静默损坏」。
+    // 放在这里还有个好处：`done` 事件与最终落盘的文本看到的是同一个版本。
+    let translated = repair_placeholders(&job.source, &translated);
+
     let issues = job_fidelity_issues(job, &translated);
     if issues.is_empty() {
         return Ok(Some(translated));
@@ -89,6 +98,7 @@ pub(crate) async fn translate_with_retry(
         .await
     {
         Ok(Some(corrected)) => {
+            let corrected = repair_placeholders(&job.source, &corrected);
             let remaining = job_fidelity_issues(job, &corrected);
             if remaining.is_empty() {
                 Ok(Some(corrected))
@@ -282,8 +292,8 @@ mod tests {
 
     use crate::translation::engine::{CancelToken, CollectingSink, TranslationEngine};
     use crate::translation::test_support::{
-        FakeTranslator, done_events, engine_with, engine_with_fast_retry, entry, matcher,
-        run_options,
+        FakeTranslator, done_events, engine_with, engine_with_fast_retry, entry, error_messages,
+        matcher, run_options,
     };
 
     #[test]
@@ -405,6 +415,124 @@ mod tests {
                 count: 1
             }
         );
+    }
+
+    /// 全角方括号的修复必须**真的接在生产路径上**：模型输出 `【2】`，
+    /// `done` 事件里必须是 `[2]`。
+    ///
+    /// 这条盯的是「修了但没接线」：`repair_full_width_brackets` 自己测过是不够的，
+    /// 它必须在 `translate_with_retry` 里、且**早于结构校验**被调用 —— 否则
+    /// `【2】` 会被判成保真、原样写进 PAK，游戏替换不了全角占位符，
+    /// 「报错可见」就变成了「静默损坏」。
+    #[tokio::test]
+    async fn full_width_placeholders_are_repaired_before_they_reach_done() {
+        let fake = Arc::new(FakeTranslator {
+            output: Some("则造成【2】点伤害，否则造成【1】点伤害。".into()),
+            ..FakeTranslator::default()
+        });
+        let engine = engine_with(fake.clone(), 1);
+        let sink = CollectingSink::new();
+        let cancel = CancelToken::new();
+
+        let summary = engine
+            .run(
+                &[entry("deal [2], otherwise deal [1].", "u1")],
+                &matcher(&[]),
+                run_options(&sink, &cancel, ""),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(summary.translated, 1);
+        assert_eq!(summary.failed, 0, "修好之后不该记失败");
+        assert_eq!(
+            done_events(&sink.events()),
+            vec![(
+                "test.loca#u1".to_string(),
+                "则造成[2]点伤害，否则造成[1]点伤害。".to_string()
+            )]
+        );
+        // 修复发生在校验之前，所以连纠错重试都不该触发
+        assert_eq!(fake.corrections(), vec![None], "不该走纠错重试");
+    }
+
+    /// 占位符粘连要**真的能触发纠错重试**，并在重试仍不合格时记失败。
+    ///
+    /// 粘连是内容缺陷（游戏会把两个值渲染成一个数），所以它必须走和丢占位符
+    /// 一样的处置链路：带具体原因重试一次 → 仍不合格就标 error（打包时退回原文）。
+    #[tokio::test]
+    async fn glued_placeholders_go_through_the_correction_path() {
+        let fake = Arc::new(FakeTranslator {
+            // 首次和纠错重试都返回粘在一起的译文
+            bad_structure_calls_left: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            bad_output: Some("与[1][2]不兼容".into()),
+            ..FakeTranslator::default()
+        });
+        let engine = engine_with(fake.clone(), 1);
+        let sink = CollectingSink::new();
+        let cancel = CancelToken::new();
+
+        let summary = engine
+            .run(
+                &[entry("Incompatible with [1] [2]", "u1")],
+                &matcher(&[]),
+                run_options(&sink, &cancel, ""),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(summary.failed, 1);
+        let messages = error_messages(&sink.events());
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0].1.contains("相邻占位符粘连"),
+            "失败原因要写清是粘连: {}",
+            messages[0].1
+        );
+        // 纠错提示里必须点名「保留空格」，否则模型不知道往哪改
+        let corrections = fake.corrections();
+        assert_eq!(corrections.len(), 2, "首次 + 一次纠错重试");
+        let hint = corrections[1].as_deref().expect("第二次调用应带纠错提示");
+        assert!(hint.contains("相邻占位符"), "纠错提示: {hint}");
+        assert!(hint.contains("保留空格"), "纠错提示: {hint}");
+    }
+
+    /// 括号类型被改写（`[1]` → `{1}`）同样要在生产路径上被修回来。
+    ///
+    /// 这条盯的是真实报障：模型把少见的 `[1]`「归一化」成 `{1}`，旧行为是直接判
+    /// 「占位符多出」失败，然后**退回英文原文**。修回来之后应该一次成功、不走纠错重试。
+    #[tokio::test]
+    async fn swapped_bracket_style_is_repaired_on_the_production_path() {
+        let fake = Arc::new(FakeTranslator {
+            output: Some("消散于风中并打击 {1} 个不同的目标。".into()),
+            ..FakeTranslator::default()
+        });
+        let engine = engine_with(fake.clone(), 1);
+        let sink = CollectingSink::new();
+        let cancel = CancelToken::new();
+
+        let summary = engine
+            .run(
+                &[entry(
+                    "Vanish into the wind and strike [1] different targets.",
+                    "u1",
+                )],
+                &matcher(&[]),
+                run_options(&sink, &cancel, ""),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(summary.translated, 1);
+        assert_eq!(summary.failed, 0, "修好之后不该记失败");
+        assert_eq!(
+            done_events(&sink.events()),
+            vec![(
+                "test.loca#u1".to_string(),
+                "消散于风中并打击 [1] 个不同的目标。".to_string()
+            )]
+        );
+        assert_eq!(fake.corrections(), vec![None], "不该走纠错重试");
     }
 
     fn single_job(source: &str) -> TranslationJob {

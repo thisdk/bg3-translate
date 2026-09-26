@@ -354,7 +354,28 @@ fn writing_to_a_not_yet_existing_target_file_creates_it() {
     assert!(new_file.is_file(), "后端应能创建目标语言目录与文件");
     let content = fs::read_to_string(&new_file).unwrap();
     assert!(content.contains("中文：Hello, adventurer."));
-    assert!(content.contains("<LSTag Tag=\"Fire\">"));
+    // 新建的译文文件磁盘上没有源文件可参考 → 按默认风格（真实 BG3 contentList 的
+    // **转义**形态）写：真标签在真实语料里是 0 处。见 `content_list::MarkupStyle`。
+    assert!(
+        content.contains(r#"&lt;LSTag Tag="Fire"&gt;Fireball&lt;/LSTag&gt;"#),
+        "新建文件必须用转义风格写标记: {content}"
+    );
+    assert!(
+        !content.contains("<LSTag"),
+        "新建文件不能凭空长出真 XML 元素: {content}"
+    );
+    // 解析回来文本必须一字不差（风格只是编码，语义不变）
+    let created_entries = formats::read_entries(
+        work_dir.to_str().unwrap(),
+        "Localization/Chinese/test.xml",
+        PakFileKind::LocalizationXml,
+    )
+    .unwrap();
+    assert_eq!(created_entries.len(), 2);
+    assert_eq!(
+        created_entries[1].source,
+        r#"中文：Cast <LSTag Tag="Fire">Fireball</LSTag> for {1} damage"#
+    );
 
     // 重新打包后应该同时包含英文原文与新建的中文文件
     let output_pak = tmp.path().join("M_zh.pak");
@@ -457,12 +478,12 @@ fn error_entries_never_reach_the_packed_pak() {
         "① 半截流式文本不许落盘"
     );
     assert!(
-        written.contains(r#"Cast <LSTag Tag="Fire">Fireball</LSTag> for {1} damage"#),
+        written.contains(r#"Cast &lt;LSTag Tag="Fire"&gt;Fireball&lt;/LSTag&gt; for {1} damage"#),
         "② error 条目必须原样退回原文（标签与占位符都在）: {written}"
     );
     assert!(!written.contains("造成火焰伤害"), "② 被拒译文不许落盘");
     assert!(
-        written.contains(r#"施放 <LSTag Tag="Ice">冰风暴</LSTag>，造成 {2} 点伤害"#),
+        written.contains(r#"施放 &lt;LSTag Tag="Ice"&gt;冰风暴&lt;/LSTag&gt;，造成 {2} 点伤害"#),
         "③ 合法译文必须照常写回: {written}"
     );
     assert!(written.contains("末日之剑"), "④ 人工抢救的译文必须写回");
@@ -513,6 +534,123 @@ fn error_entries_never_reach_the_packed_pak() {
     assert!(reparsed[1].source.contains("{1}"));
     assert!(reparsed[2].source.contains("冰风暴"));
     assert_eq!(reparsed[3].source, "末日之剑");
+}
+
+/// 端到端：真实世界形态（标记**整体转义**在文本里）的 contentList 全程不被翻转。
+///
+/// 真实 BG3 contentList 里 `&lt;LSTag …&gt;` 是正文、真标签 0 处（见
+/// `samples/english.xml`）。这个测试跑完整闭环：解包 → 读条目 → 零译文写回
+/// （必须逐字节不变）→ 翻译后写进新建的中文文件（仍是转义形态）→ 重打包 →
+/// 再解包，全程不许出现真 XML 元素，也不许把 `'` 写成 `&apos;`。
+#[test]
+fn real_world_escaped_content_list_survives_the_pak_roundtrip() {
+    const ESCAPED_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<contentList>
+  <content contentuid="h11111111g2222u3333i4444" version="1">Extract the target's life force and regain half as many &lt;LSTag Tooltip="HitPoints"&gt;hit points&lt;/LSTag&gt;.</content>
+  <content contentuid="h55555555g6666u7777i8888" version="2">line1&lt;br&gt;line2</content>
+</contentList>"#;
+    // 转义风格 + 无根属性时，写回结果就该是这个单行文档（`'` 不转义、`<br>` 不规范化）
+    const ESCAPED_REWRITTEN: &str = r#"<?xml version="1.0" encoding="utf-8"?><contentList><content contentuid="h11111111g2222u3333i4444" version="1">Extract the target's life force and regain half as many &lt;LSTag Tooltip="HitPoints"&gt;hit points&lt;/LSTag&gt;.</content><content contentuid="h55555555g6666u7777i8888" version="2">line1&lt;br&gt;line2</content></contentList>"#;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("src");
+    fs::create_dir_all(source.join("Localization/English")).unwrap();
+    fs::write(source.join("Localization/English/rw.xml"), ESCAPED_XML).unwrap();
+
+    let input_pak = tmp.path().join("M.pak");
+    pack(&source, &input_pak, 0);
+    let work_root = tmp.path().join("work");
+    fs::create_dir_all(&work_root).unwrap();
+    let (work_dir, _) = pak::open_and_extract_in(input_pak.to_str().unwrap(), &work_root).unwrap();
+
+    // ── 1. 零译文写回原文件：逐字节不变 ──
+    let entries = formats::read_entries(
+        work_dir.to_str().unwrap(),
+        "Localization/English/rw.xml",
+        PakFileKind::LocalizationXml,
+    )
+    .unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(
+        entries[0].source,
+        r#"Extract the target's life force and regain half as many <LSTag Tooltip="HitPoints">hit points</LSTag>."#
+    );
+    formats::write_entries(
+        work_dir.to_str().unwrap(),
+        "Localization/English/rw.xml",
+        PakFileKind::LocalizationXml,
+        &entries,
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read_to_string(work_dir.join("unpacked/Localization/English/rw.xml")).unwrap(),
+        ESCAPED_REWRITTEN,
+        "零译文写回必须保持源文件的转义风格与字节"
+    );
+
+    // ── 2. 翻译后写进新建的中文文件：仍是转义形态，解析回来文本不变 ──
+    let translated: Vec<TranslationEntry> = entries
+        .into_iter()
+        .map(|mut entry| {
+            entry.mark_translated(format!("【译】{}", entry.source));
+            entry
+        })
+        .collect();
+    formats::write_entries(
+        work_dir.to_str().unwrap(),
+        "Localization/Chinese/rw.xml",
+        PakFileKind::LocalizationXml,
+        &translated,
+    )
+    .unwrap();
+
+    let chinese =
+        fs::read_to_string(work_dir.join("unpacked/Localization/Chinese/rw.xml")).unwrap();
+    assert_eq!(chinese.matches("&lt;LSTag").count(), 1, "{chinese}");
+    assert_eq!(
+        chinese.matches("<LSTag").count(),
+        0,
+        "真标签出现了: {chinese}"
+    );
+    assert_eq!(chinese.matches("&lt;br&gt;").count(), 1, "{chinese}");
+    assert_eq!(
+        chinese.matches("<br").count(),
+        0,
+        "真 `<br>` 出现了: {chinese}"
+    );
+    assert_eq!(
+        chinese.matches("&apos;").count(),
+        0,
+        "`'` 被多余转义: {chinese}"
+    );
+    assert!(chinese.contains("【译】Extract the target's"), "{chinese}");
+
+    // ── 3. 重打包 → 再解包：中文文件的形态与文本都不变 ──
+    let output_pak = tmp.path().join("M_zh.pak");
+    pak::repack(work_dir.to_str().unwrap(), output_pak.to_str().unwrap()).unwrap();
+    let verify_root = tmp.path().join("verify");
+    fs::create_dir_all(&verify_root).unwrap();
+    let (verify_dir, _) =
+        pak::open_and_extract_in(output_pak.to_str().unwrap(), &verify_root).unwrap();
+
+    let packed =
+        fs::read_to_string(verify_dir.join("unpacked/Localization/Chinese/rw.xml")).unwrap();
+    assert_eq!(packed, chinese, "重打包不能改变文件字节");
+    let reparsed = formats::read_entries(
+        verify_dir.to_str().unwrap(),
+        "Localization/Chinese/rw.xml",
+        PakFileKind::LocalizationXml,
+    )
+    .unwrap();
+    assert_eq!(reparsed.len(), 2);
+    // 解出来的「原文」就是文件里的文本 = 译文
+    assert_eq!(reparsed[0].source, translated[0].target);
+    assert_eq!(reparsed[1].source, translated[1].target);
+    assert!(
+        reparsed[0]
+            .source
+            .contains(r#"<LSTag Tooltip="HitPoints">"#)
+    );
 }
 
 /// 端到端：MOD 自带的中文文件里「英文原文没有」的条目，绝不能因为写回而消失。

@@ -18,15 +18,21 @@ import { GlossaryPanel } from "@/components/GlossaryPanel";
 import { SettingsPanel } from "@/components/SettingsPanel";
 import { TranslationTable } from "@/components/TranslationTable";
 import { useAppStore } from "@/store/app-store";
-import { planLocalizationWrites } from "@/lib/localization";
+import {
+  mergeWithExistingTarget,
+  planLocalizationWrites,
+  type LocalizationWritePlan,
+} from "@/lib/localization";
 import {
   closeMod,
   loadLlmSettings,
   pickSavePath,
+  readFileEntries,
   repackMod,
   writeFileEntries,
 } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
+import type { TranslationEntry } from "@/lib/types";
 
 function HomePage() {
   return (
@@ -42,23 +48,57 @@ function FilesPage() {
   const setSelectedFiles = useAppStore((s) => s.setSelectedFiles);
   const workDir = useAppStore((s) => s.workDir);
   const entriesByFile = useAppStore((s) => s.entriesByFile);
+  const runActive = useAppStore((s) => s.runToken !== null);
   const setStage = useAppStore((s) => s.setStage);
   const setError = useAppStore((s) => s.setError);
 
   const onGoPack = async () => {
     if (!workDir) return;
+    // 写回闸门：`translating` 条目的半截流式文本会被后端当成真译文写进 PAK
+    // （后端只在 status === "error" 时退回原文）。翻译收尾回滚之后才允许写回。
+    if (useAppStore.getState().runToken !== null) {
+      setError(
+        "翻译仍在进行中：请等待翻译结束，或点「取消翻译」等译文本轮收尾后再打包——" +
+          "否则半截译文会被写进 PAK。",
+      );
+      return;
+    }
     try {
       // 多语言文件可能映射到同一个目标路径（Localization/Chinese/xxx），
       // 只写回优先级最高的那一份（英文 > 中文 > 其它语言）。
       const plans = planLocalizationWrites(selectedFiles, entriesByFile);
+      // MOD 自带的目标文件（例如 Localization/Chinese/x.xml）要当底稿：英文
+      // 文件里未翻译的条目否则会退回英文原文，把文件里已有的中文覆盖掉（R-05）。
+      const shippedFiles = new Set(files.map((f) => f.name));
       for (const plan of plans) {
-        await writeFileEntries(workDir, plan.fileName, plan.entries);
+        const entries = shippedFiles.has(plan.fileName)
+          ? await mergeWithShippedTarget(workDir, plan)
+          : plan.entries;
+        await writeFileEntries(workDir, plan.fileName, entries);
       }
     } catch (e) {
       setError(String(e));
       return;
     }
     setStage("done");
+  };
+
+  /**
+   * 取 MOD 自带目标文件的现有内容作为写回底稿。
+   * 读不到底稿时**不阻断写回**（退回「直接用计划条目」的既有行为），
+   * 只在控制台留痕，避免把一次可恢复的读取失败变成打包失败。
+   */
+  const mergeWithShippedTarget = async (
+    dir: string,
+    plan: LocalizationWritePlan,
+  ): Promise<TranslationEntry[]> => {
+    try {
+      const existing = await readFileEntries(dir, plan.fileName);
+      return mergeWithExistingTarget(plan.entries, existing);
+    } catch (e) {
+      console.warn(`[写回] 读取底稿失败，按原样写回 ${plan.fileName}:`, e);
+      return plan.entries;
+    }
   };
 
   return (
@@ -79,7 +119,15 @@ function FilesPage() {
             <ChevronRight className="h-4 w-4 rotate-180" />
             <span className="hidden sm:inline">返回</span>
           </Button>
-          <Button onClick={onGoPack} disabled={!workDir || selectedFiles.length === 0}>
+          <Button
+            onClick={onGoPack}
+            disabled={!workDir || selectedFiles.length === 0}
+            title={
+              runActive
+                ? "翻译仍在进行中：请等待翻译结束或取消后再打包"
+                : undefined
+            }
+          >
             <CheckCircle2 className="h-4 w-4" />
             完成翻译，去打包
           </Button>

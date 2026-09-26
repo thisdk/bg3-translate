@@ -61,7 +61,9 @@ pub fn resolve_data_dir(
     exe_dir_writable: bool,
 ) -> DataDir {
     if let Some(dir) = env_home {
-        if !dir.as_os_str().is_empty() {
+        // 只写了空格的环境变量按「没设置」处理：否则会在当前工作目录下
+        // 建一个名字是空格的目录，配置写进去后用户根本找不到。
+        if !dir.as_os_str().is_empty() && !dir.to_string_lossy().trim().is_empty() {
             return DataDir {
                 path: dir.to_path_buf(),
                 source: DataDirSource::EnvOverride,
@@ -127,23 +129,31 @@ pub fn data_dir() -> Result<DataDir> {
         &system,
         exe_dir_writable,
     );
+    ensure_dir(resolved)
+}
 
-    // 系统目录也失败时退回临时目录，保证应用还能启动
-    if std::fs::create_dir_all(&resolved.path).is_err() {
-        let fallback = std::env::temp_dir().join(APP_NAME);
-        std::fs::create_dir_all(&fallback)?;
-        log::warn!(
-            "无法创建数据目录 {}，回退到 {}",
-            resolved.path.display(),
-            fallback.display()
-        );
-        return Ok(DataDir {
-            path: fallback,
-            source: DataDirSource::System,
-        });
+/// 确保数据目录真的可用；创建不了就退回系统临时目录。
+///
+/// 会走到这里的真实场景：`BG3_TRANSLATE_HOME` 指向的是一个**文件**而不是目录
+/// （`create_dir_all` 返回 `AlreadyExists`）、目标目录只读、路径不存在且父目录
+/// 不可写。此时宁可把配置放到临时目录，也不能让应用起不来。
+fn ensure_dir(resolved: DataDir) -> Result<DataDir> {
+    match std::fs::create_dir_all(&resolved.path) {
+        Ok(()) => Ok(resolved),
+        Err(err) => {
+            let fallback = std::env::temp_dir().join(APP_NAME);
+            std::fs::create_dir_all(&fallback)?;
+            log::warn!(
+                "无法创建数据目录 {}（{err}），回退到 {}",
+                resolved.path.display(),
+                fallback.display()
+            );
+            Ok(DataDir {
+                path: fallback,
+                source: DataDirSource::System,
+            })
+        }
     }
-
-    Ok(resolved)
 }
 
 /// 设置文件绝对路径（不创建目录）。
@@ -236,6 +246,23 @@ mod tests {
         assert_eq!(resolved.source, DataDirSource::Portable);
     }
 
+    /// 纯空白的环境变量不是「用户指定了目录」，而是手滑多打了空格。
+    ///
+    /// 旧行为会把它当合法路径：在当前工作目录下建一个名字是空格的目录，
+    /// 配置与术语表写到那里，用户完全找不到。空串被忽略、空白串不被忽略，
+    /// 这种不一致本身就是缺陷。
+    #[test]
+    fn whitespace_only_env_override_is_ignored() {
+        let resolved = resolve_data_dir(
+            Some(Path::new("   ")),
+            Some(Path::new("/exe/dir")),
+            Path::new("/system/dir"),
+            true,
+        );
+        assert_eq!(resolved.source, DataDirSource::Portable);
+        assert_eq!(resolved.path, PathBuf::from("/exe/dir/config"));
+    }
+
     #[test]
     fn writable_exe_dir_means_portable_mode() {
         let resolved = resolve_data_dir(
@@ -275,6 +302,41 @@ mod tests {
         // /proc 下不可写
         #[cfg(target_os = "linux")]
         assert!(!dir_writable(Path::new("/proc/self/nope")));
+    }
+
+    /// `BG3_TRANSLATE_HOME` 指向**文件**而不是目录时：不回退就等于应用起不来，
+    /// 必须落回临时目录，并且明确告诉 UI 来源已经变成「系统配置目录」。
+    #[test]
+    fn data_dir_that_is_actually_a_file_falls_back_to_temp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("home-is-a-file");
+        fs::write(&file, b"not a directory").unwrap();
+
+        let resolved = DataDir {
+            path: file.clone(),
+            source: DataDirSource::EnvOverride,
+        };
+        let out = ensure_dir(resolved).expect("必须能回退，而不是把错误抛给调用方");
+
+        assert_ne!(out.path, file, "不能把文件当成数据目录");
+        assert_eq!(out.source, DataDirSource::System);
+        assert!(out.path.is_dir(), "回退目录必须真实存在");
+        assert!(out.path.to_string_lossy().contains(APP_NAME));
+    }
+
+    /// 正常目录原样返回，来源保持不变。
+    #[test]
+    fn ensure_dir_keeps_a_usable_directory_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wanted = tmp.path().join("portable/config");
+        let resolved = DataDir {
+            path: wanted.clone(),
+            source: DataDirSource::Portable,
+        };
+        let out = ensure_dir(resolved).expect("可创建目录不应回退");
+        assert_eq!(out.path, wanted);
+        assert_eq!(out.source, DataDirSource::Portable);
+        assert!(wanted.is_dir());
     }
 
     #[test]

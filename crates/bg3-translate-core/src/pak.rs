@@ -134,6 +134,10 @@ fn is_reserved_windows_component(part: &str) -> bool {
 /// - `..`（目录穿越）与绝对路径 / 盘符
 /// - Windows 保留设备名（`CON`、`NUL`、`COM1`……）
 /// - 含 `:` 的片段（Windows 上 `a:b` 是 NTFS 数据流写法，会写到文件之外）
+/// - **尾随的点或空格**：Windows 路径规整会去掉片段结尾的 `.` 与空格，
+///   于是 `".. "` 变成 `".."`（经典 zip-slip 绕过）。这类名字在 Windows 上
+///   本来就创建不出来，合法 PAK 里不可能有。
+/// - 含 NUL 的片段：文件系统层必然失败，早点给出明确错误
 pub fn safe_output_path(root: &Path, file_name: &str) -> Result<PathBuf> {
     let mut output = root.to_path_buf();
     for component in Path::new(&normalize_entry_name(file_name)).components() {
@@ -145,9 +149,19 @@ pub fn safe_output_path(root: &Path, file_name: &str) -> Result<PathBuf> {
                         "非法归档路径（含冒号）: {file_name}"
                     )));
                 }
+                if part.contains('\0') {
+                    return Err(AppError::pak(format!(
+                        "非法归档路径（含 NUL 字节）: {file_name}"
+                    )));
+                }
                 if is_reserved_windows_component(&part) {
                     return Err(AppError::pak(format!(
                         "非法归档路径（Windows 保留设备名）: {file_name}"
+                    )));
+                }
+                if part.ends_with(['.', ' ']) {
+                    return Err(AppError::pak(format!(
+                        "非法归档路径（片段以点或空格结尾，Windows 上会被规整掉）: {file_name}"
                     )));
                 }
                 output.push(part.as_ref());
@@ -162,6 +176,11 @@ pub fn safe_output_path(root: &Path, file_name: &str) -> Result<PathBuf> {
 }
 
 /// 递归遍历目录下所有文件。
+///
+/// **不跟随符号链接**：跟随的话，链接指向的外部文件会被当成目录树里的文件
+/// （`pick_largest_pak` 就可能选中解压目录之外的 `.pak`），指向祖先目录的
+/// 链接更会让遍历永不结束。用 [`std::fs::DirEntry::file_type`]（不 follow）
+/// 判断类型即可。
 pub fn walk_files(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -170,8 +189,15 @@ pub fn walk_files(dir: &Path) -> Vec<PathBuf> {
             continue;
         };
         for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                log::debug!("跳过符号链接: {}", entry.path().display());
+                continue;
+            }
             let path = entry.path();
-            if path.is_dir() {
+            if file_type.is_dir() {
                 stack.push(path);
             } else {
                 out.push(path);
@@ -180,6 +206,29 @@ pub fn walk_files(dir: &Path) -> Vec<PathBuf> {
     }
     out.sort();
     out
+}
+
+/// 深度优先找目录树里第一个符号链接（不跟随链接本身）。
+fn find_symlink(dir: &Path) -> Option<PathBuf> {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if file_type.is_symlink() {
+                return Some(path);
+            }
+            if file_type.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    None
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -276,6 +325,43 @@ fn extract_pak_from(file_path: &Path, work_dir: &Path) -> Result<PathBuf> {
 
 /// 解压 zip 并返回其中体积最大的 `.pak`（Nexus 包里通常还有 README 等杂物）。
 fn extract_zip_to_find_pak(zip_path: &Path, work_dir: &Path) -> Result<PathBuf> {
+    extract_zip_to_find_pak_limited(zip_path, work_dir, ZipLimits::default())
+}
+
+/// zip 解压的防护上限。
+///
+/// 取值理由：BG3 的 4K 材质 MOD 解包后可能有好几 GB（合法），所以上限必须宽松；
+/// 但「65 KB → 64 MiB」（≈1000× 膨胀）这种压缩比炸弹必须在**解压过程中**就被
+/// 拦住——`open_and_extract` 的清理跑在解压之后，磁盘已经写满了就来不及了。
+#[derive(Debug, Clone, Copy)]
+struct ZipLimits {
+    /// 单个条目声明的解压后大小上限
+    max_entry_bytes: u64,
+    /// 所有条目解压后的总字节上限
+    max_total_bytes: u64,
+    /// 条目数上限（防海量小文件耗尽 inode 与时间）
+    max_entries: usize,
+}
+
+impl Default for ZipLimits {
+    fn default() -> Self {
+        Self {
+            // 6 GiB：再大的单个文件不可能是 MOD 内容，但留足真实 MOD 的余量
+            max_entry_bytes: 6 * 1024 * 1024 * 1024,
+            // 16 GiB：几 GB 的 4K 材质 MOD 合法
+            max_total_bytes: 16 * 1024 * 1024 * 1024,
+            // 20 万条目：真实 MOD 通常几百到几千个文件
+            max_entries: 200_000,
+        }
+    }
+}
+
+/// [`extract_zip_to_find_pak`] 的实现（上限可注入，便于用小样本测炸弹防线）。
+fn extract_zip_to_find_pak_limited(
+    zip_path: &Path,
+    work_dir: &Path,
+    limits: ZipLimits,
+) -> Result<PathBuf> {
     let zip_extract = work_dir.join("zip_contents");
     std::fs::create_dir_all(&zip_extract)?;
 
@@ -283,10 +369,36 @@ fn extract_zip_to_find_pak(zip_path: &Path, work_dir: &Path) -> Result<PathBuf> 
     let mut archive =
         zip::ZipArchive::new(file).map_err(|e| AppError::pak(format!("读取 zip 失败: {e}")))?;
 
+    if archive.len() > limits.max_entries {
+        return Err(AppError::pak(format!(
+            "zip 条目数 {} 超过上限 {}，已中止解压（疑似恶意压缩包，真实 MOD 不会有这么多文件）",
+            archive.len(),
+            limits.max_entries
+        )));
+    }
+
+    let mut written_total: u64 = 0;
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
             .map_err(|e| AppError::pak(format!("读取 zip 条目失败: {e}")))?;
+
+        // ① 先看声明大小：压缩炸弹的声明通常就是几 GB，连文件都不用创建
+        let declared = entry.size();
+        if declared > limits.max_entry_bytes {
+            return Err(AppError::pak(format!(
+                "zip 条目 {} 声明解压后 {} 字节，超过单文件上限 {}，已中止解压",
+                entry.name(),
+                declared,
+                limits.max_entry_bytes
+            )));
+        }
+        if written_total.saturating_add(declared) > limits.max_total_bytes {
+            return Err(AppError::pak(format!(
+                "zip 解压总量将超过上限 {} 字节（已解压 {} 字节），已中止解压",
+                limits.max_total_bytes, written_total
+            )));
+        }
 
         // enclosed_name() 已经过滤了 `..` 与绝对路径
         let Some(relative) = entry.enclosed_name() else {
@@ -303,7 +415,22 @@ fn extract_zip_to_find_pak(zip_path: &Path, work_dir: &Path) -> Result<PathBuf> 
             std::fs::create_dir_all(parent)?;
         }
         let mut output = std::fs::File::create(&output_path)?;
-        std::io::copy(&mut entry, &mut output)?;
+
+        // ② 再按**实际写入**字节数兜底：声明大小是可以撒谎的
+        let budget = limits.max_total_bytes - written_total;
+        let mut limited = std::io::Read::take(&mut entry, budget.saturating_add(1));
+        let copied = std::io::copy(&mut limited, &mut output)?;
+        drop(output);
+        if copied > budget {
+            // 及时收尾：失败时不要在工作目录里留下一个已经写了几个 GB 的文件
+            let _ = std::fs::remove_file(&output_path);
+            return Err(AppError::pak(format!(
+                "zip 条目 {} 解压超过总量上限 {} 字节，已中止解压（疑似压缩炸弹）",
+                entry.name(),
+                limits.max_total_bytes
+            )));
+        }
+        written_total += copied;
     }
 
     pick_largest_pak(&zip_extract)
@@ -410,6 +537,16 @@ pub fn repack(work_dir: &str, output_path: &str) -> Result<()> {
         )));
     }
 
+    // 底层打包库的 `add_directory` 会跟随符号链接，把链接指向的**工作目录之外**
+    // 的文件打进 PAK。解包本身不会产生符号链接，所以这里出现链接只可能来自
+    // 本机其它程序——宁可报错也不要把工作目录外的文件写进产物。
+    if let Some(link) = find_symlink(&unpacked) {
+        return Err(AppError::pak(format!(
+            "工作目录里存在符号链接，拒绝打包（它会把工作目录外的文件打进 PAK）: {}",
+            link.display()
+        )));
+    }
+
     let output = Path::new(output_path);
     if let Some(parent) = output.parent() {
         if !parent.as_os_str().is_empty() {
@@ -495,6 +632,78 @@ mod tests {
         assert_eq!(
             safe_output_path(root, "./a/./b.txt").unwrap(),
             root.join("a").join("b.txt")
+        );
+    }
+
+    /// Windows 会去掉每个路径片段**结尾**的点与空格，`".. "` 于是变成 `".."`——
+    /// 这是经典 zip-slip 绕过（Linux 上 `".. "` 只是个普通文件名，本地测不出来，
+    /// 但产物是要在 Windows 上跑的）。这类名字也不可能由合法的 PAK 产生。
+    #[test]
+    fn safe_output_path_rejects_trailing_dots_and_spaces() {
+        let root = Path::new("root");
+        for name in [
+            ".. ",
+            ".. /evil.txt",
+            "a. ",
+            "COM1 ",
+            "NUL. ",
+            "...",
+            "a/.. . /b.txt",
+        ] {
+            assert!(
+                safe_output_path(root, name).is_err(),
+                "{name:?} 在 Windows 上会被规整掉尾随点/空格，必须拒绝"
+            );
+        }
+        // 名字中间的点与空格不受影响
+        assert!(safe_output_path(root, "a.b c.txt").is_ok());
+        assert!(safe_output_path(root, "Mods/Meta.lsx").is_ok());
+    }
+
+    /// 含 NUL 的片段不可能落盘（`fs::write` 会报 `unexpected NUL byte`），
+    /// 应该在路径校验阶段就给出明确的 pak 错误，而不是半路抛一个 IO 错误。
+    #[test]
+    fn safe_output_path_rejects_nul_bytes() {
+        let root = Path::new("root");
+        assert!(safe_output_path(root, "evil\u{0}.txt").is_err());
+        assert!(safe_output_path(root, "a/\u{0}.lsx").is_err());
+    }
+
+    /// `walk_files` 不能跟着符号链接走出被遍历的目录树。
+    ///
+    /// 复现（修复前）：`walk_files` 用 `path.is_dir()`（会跟随链接）判断目录，
+    /// 于是链接指向的外部目录里的文件会被当成自己的文件列出来；如果链接指向
+    /// 自己的祖先目录，遍历会**永不结束**。`pick_largest_pak` 依赖这个函数，
+    /// 也就可能选中解压目录之外的 `.pak`。
+    #[cfg(unix)]
+    #[test]
+    fn walk_files_does_not_follow_symlinked_directories() {
+        let base = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("outside.txt"), b"outside").unwrap();
+        std::fs::write(base.path().join("inside.txt"), b"inside").unwrap();
+        std::os::unix::fs::symlink(outside.path(), base.path().join("link_dir")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("outside.txt"),
+            base.path().join("link_file.txt"),
+        )
+        .unwrap();
+
+        let files = walk_files(base.path());
+
+        assert!(
+            files.iter().any(|p| p.ends_with("inside.txt")),
+            "本目录里的真实文件必须被列出: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|p| p.ends_with("outside.txt")),
+            "符号链接指向的外部文件不该被列出: {files:?}"
+        );
+        assert!(
+            !files
+                .iter()
+                .any(|p| p.components().any(|c| c.as_os_str() == "link_dir")),
+            "符号链接目录不该被递归进去: {files:?}"
         );
     }
 
@@ -596,9 +805,314 @@ mod tests {
         assert_eq!(err.code(), "config");
     }
 
+    /// `repack` 必须拒绝 `unpacked/` 里的符号链接。
+    ///
+    /// 复现（修复前）：`PackageBuilder::add_directory` 跟随符号链接，
+    /// `/tmp/outside/evil.txt`（工作目录之外）被原样打进了 PAK。
+    #[cfg(unix)]
+    #[test]
+    fn repack_refuses_symlinks_inside_unpacked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        let unpacked = work.join(UNPACKED_DIR);
+        std::fs::create_dir_all(unpacked.join("Localization/English")).unwrap();
+        std::fs::write(
+            unpacked.join("Localization/English/a.xml"),
+            b"<contentList/>",
+        )
+        .unwrap();
+
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("evil.txt"), b"OUTSIDE SECRET").unwrap();
+        std::os::unix::fs::symlink(outside.path(), unpacked.join("link_dir")).unwrap();
+
+        let output = tmp.path().join("out.pak");
+        let err = repack(work.to_str().unwrap(), output.to_str().unwrap()).unwrap_err();
+
+        assert_eq!(err.code(), "pak", "必须报 pak 错误: {err}");
+        assert!(
+            err.to_string().contains("符号链接"),
+            "错误信息要说明原因: {err}"
+        );
+        assert!(!output.exists(), "拒绝打包时不该产出文件");
+    }
+
     #[test]
     fn open_and_extract_rejects_missing_file() {
         let err = open_and_extract("/nope/missing.pak").unwrap_err();
         assert_eq!(err.code(), "config");
+    }
+
+    /// 压缩炸弹防线：65 KB 的 zip 能解出 64 MiB（≈1000×），必须在解压过程中
+    /// 就被拦住，而且**不能**在工作目录里留下已经写出去的大文件。
+    ///
+    /// 复现（修复前）：`extract_zip_to_find_pak` 对声明大小与实际写入都没有任何
+    /// 上限，19 KiB 的 zip 24 ms 就写出 64 MiB（见报告 §2 F-09 的探针输出）。
+    #[test]
+    fn zip_bomb_is_refused_before_it_fills_the_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = tmp.path().join("bomb.zip");
+        {
+            let file = std::fs::File::create(&zip_path).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            writer.start_file("bomb.bin", options).unwrap();
+            let chunk = vec![0u8; 1 << 20];
+            for _ in 0..4 {
+                std::io::Write::write_all(&mut writer, &chunk).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        let zip_size = std::fs::metadata(&zip_path).unwrap().len();
+        assert!(zip_size < 64 * 1024, "炸弹样本应远小于解压结果: {zip_size}");
+
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        // 只有「单条目声明上限」会触发（总量给了 64 MiB），
+        // 这样把单条目检查去掉后炸弹会被真的解压出来，体积断言立刻变红。
+        let limits = ZipLimits {
+            max_entry_bytes: 1 << 20,  // 1 MiB：4 MiB 的条目必然超
+            max_total_bytes: 64 << 20, // 64 MiB：总量检查不会先触发
+            max_entries: 16,
+        };
+
+        let err = extract_zip_to_find_pak_limited(&zip_path, &work, limits).unwrap_err();
+        assert_eq!(err.code(), "pak", "超限必须报 pak 错误: {err}");
+        assert!(
+            err.to_string().contains("上限") || err.to_string().contains("中止"),
+            "错误信息要说清是超限: {err}"
+        );
+
+        // 工作目录里不能留下超过单条目上限的文件
+        for path in walk_files(&work) {
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            assert!(
+                size <= (1 << 20),
+                "{} 留下了 {size} 字节（超过上限）",
+                path.display()
+            );
+        }
+    }
+
+    /// 压缩炸弹防线②：**总量**超限（多个中等条目累加）同样要中止。
+    #[test]
+    fn zip_total_size_limit_is_enforced_across_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = tmp.path().join("two.zip");
+        {
+            let file = std::fs::File::create(&zip_path).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            let chunk = vec![0u8; 600 * 1024];
+            for name in ["a.bin", "b.bin"] {
+                writer.start_file(name, options).unwrap();
+                std::io::Write::write_all(&mut writer, &chunk).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        // 把两条的「声明大小」都改成 900 KiB（实际各 600 KiB），
+        // 于是声明总量 1.8 MiB > 上限 1 MiB，而实际写入总量 1.2 MiB 也不会先触发
+        // 单条目上限 —— 只有「声明总量」这一层能拦住它。
+        let mut bytes = std::fs::read(&zip_path).unwrap();
+        for (signature, offset) in [
+            (b"PK\x03\x04".as_slice(), 22usize),
+            (b"PK\x01\x02".as_slice(), 24usize),
+        ] {
+            let mut i = 0usize;
+            while let Some(pos) = bytes[i..]
+                .windows(4)
+                .position(|window| window == signature)
+                .map(|p| i + p)
+            {
+                bytes[pos + offset..pos + offset + 4]
+                    .copy_from_slice(&(900u32 * 1024).to_le_bytes());
+                i = pos + 4;
+            }
+        }
+        std::fs::write(&zip_path, &bytes).unwrap();
+
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let limits = ZipLimits {
+            max_entry_bytes: 1 << 20, // 单条目声明 900 KiB 不超
+            max_total_bytes: 1 << 20, // 两条声明累加 1.8 MiB 必超
+            max_entries: 16,
+        };
+
+        let err = extract_zip_to_find_pak_limited(&zip_path, &work, limits).unwrap_err();
+        assert_eq!(err.code(), "pak", "总量超限必须报错: {err}");
+        assert!(
+            err.to_string().contains("将超过上限"),
+            "必须是「声明总量」这一层拦下来的（实际写入层是另一条消息，不能算数）: {err}"
+        );
+    }
+
+    /// 压缩炸弹防线③：声明大小是**可以撒谎的**，实际写入字节数也要兜底。
+    ///
+    /// 做法：正常写一个 4 MiB 的 deflate 条目，再把本地头（`PK\x03\x04` +22）
+    /// 与中央目录（`PK\x01\x02` +24）里的「解压后大小」字段篡改成 1 字节——
+    /// 两个声明检查全部放行，只有实际写入计数能拦住它。
+    #[test]
+    fn zip_with_a_lying_size_header_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = tmp.path().join("liar.zip");
+        {
+            let file = std::fs::File::create(&zip_path).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            writer.start_file("liar.bin", options).unwrap();
+            std::io::Write::write_all(&mut writer, &vec![0u8; 4 << 20]).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let mut bytes = std::fs::read(&zip_path).unwrap();
+        let mut patched = 0usize;
+        for (signature, offset) in [
+            (b"PK\x03\x04".as_slice(), 22usize),
+            (b"PK\x01\x02".as_slice(), 24usize),
+        ] {
+            let mut i = 0usize;
+            while let Some(pos) = bytes[i..]
+                .windows(4)
+                .position(|window| window == signature)
+                .map(|p| i + p)
+            {
+                bytes[pos + offset..pos + offset + 4].copy_from_slice(&1u32.to_le_bytes());
+                patched += 1;
+                i = pos + 4;
+            }
+        }
+        assert!(patched >= 2, "应至少篡改本地头与中央目录各一处: {patched}");
+        std::fs::write(&zip_path, &bytes).unwrap();
+
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let limits = ZipLimits {
+            max_entry_bytes: 1 << 20,
+            max_total_bytes: 2 << 20,
+            max_entries: 16,
+        };
+
+        let err = extract_zip_to_find_pak_limited(&zip_path, &work, limits).unwrap_err();
+        assert_eq!(err.code(), "pak", "实际写入超限必须报错: {err}");
+        for path in walk_files(&work) {
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            assert!(size <= (2 << 20), "{} 留下了 {size} 字节", path.display());
+        }
+    }
+
+    /// 条目数上限：海量小文件同样要拦（这里用 3 个条目 + 上限 2 来验证）。
+    #[test]
+    fn zip_entry_count_limit_is_enforced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = tmp.path().join("many.zip");
+        {
+            let file = std::fs::File::create(&zip_path).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            for i in 0..3 {
+                writer.start_file(format!("f{i}.txt"), options).unwrap();
+                std::io::Write::write_all(&mut writer, b"x").unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let limits = ZipLimits {
+            max_entry_bytes: 1 << 20,
+            max_total_bytes: 1 << 20,
+            max_entries: 2,
+        };
+
+        let err = extract_zip_to_find_pak_limited(&zip_path, &work, limits).unwrap_err();
+        assert_eq!(err.code(), "pak", "必须报 pak 错误: {err}");
+        assert!(
+            err.to_string().contains("条目数"),
+            "必须是「条目数」这一层拦下来的: {err}"
+        );
+        assert!(
+            walk_files(&work).is_empty(),
+            "超限时不该解压出任何文件: {:?}",
+            walk_files(&work)
+        );
+    }
+
+    /// 真实体量的 zip 照常解压（上限不能误伤正常 MOD）。
+    #[test]
+    fn normal_zip_still_extracts_under_the_limits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("src");
+        std::fs::create_dir_all(source.join("Localization/English")).unwrap();
+        std::fs::write(source.join("Localization/English/a.xml"), b"<contentList/>").unwrap();
+        let inner = tmp.path().join("Inner.pak");
+        PackageBuilder::new()
+            .priority(1)
+            .add_directory(&source)
+            .unwrap()
+            .build(&inner)
+            .unwrap();
+
+        let zip_path = tmp.path().join("Normal.zip");
+        {
+            let file = std::fs::File::create(&zip_path).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            writer.start_file("README.txt", options).unwrap();
+            std::io::Write::write_all(&mut writer, b"install me").unwrap();
+            writer.start_file("Mods/Inner.pak", options).unwrap();
+            std::io::Write::write_all(&mut writer, &std::fs::read(&inner).unwrap()).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let pak = extract_zip_to_find_pak(&zip_path, &work).unwrap();
+        assert!(pak.is_file());
+        assert!(pak.ends_with("Inner.pak"));
+    }
+
+    /// `ZipLimits::default()` 必须被钉住。
+    ///
+    /// 上面几条炸弹用例全部**注入**小上限（否则测试要造几 GiB 的归档），所以
+    /// 它们拦得住「解压逻辑坏了」，却拦不住「默认值被改成 `u64::MAX`」——
+    /// 那等于把整条防线关掉而 `cargo test` 依然全绿。这里直接给默认值设界，
+    /// 让任何「关掉防线」的改动立刻变红（独立验证者用变异实验发现过这个缺口）。
+    #[test]
+    fn zip_limits_default_stays_bounded() {
+        let limits = ZipLimits::default();
+
+        // 上界：默认值不能大到等于没有限制
+        assert!(
+            limits.max_entry_bytes <= 16 * 1024 * 1024 * 1024,
+            "单条目默认上限过大，压缩炸弹防线等于失效: {}",
+            limits.max_entry_bytes
+        );
+        assert!(
+            limits.max_total_bytes <= 64 * 1024 * 1024 * 1024,
+            "总量默认上限过大，压缩炸弹防线等于失效: {}",
+            limits.max_total_bytes
+        );
+        assert!(
+            limits.max_entries <= 1_000_000,
+            "条目数默认上限过大，海量小文件防线等于失效: {}",
+            limits.max_entries
+        );
+
+        // 下界：也不能小到误伤真实 MOD（几 GB 的 4K 材质包必须放行）
+        assert!(
+            limits.max_entry_bytes >= 1024 * 1024 * 1024,
+            "单条目默认上限过小，会误伤真实的大 MOD: {}",
+            limits.max_entry_bytes
+        );
+        assert!(
+            limits.max_total_bytes >= limits.max_entry_bytes,
+            "总量上限不该小于单条目上限: {} < {}",
+            limits.max_total_bytes,
+            limits.max_entry_bytes
+        );
     }
 }

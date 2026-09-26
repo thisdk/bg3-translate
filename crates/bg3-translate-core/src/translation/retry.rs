@@ -24,7 +24,7 @@ use super::events::{CancelToken, EventSink, emit_progress, wait_until_cancelled}
 use super::fidelity::{FidelityIssue, check_fidelity, correction_hint, summarize};
 use super::planner::{TranslationJob, TranslationOutput};
 use super::series::compose_variant_translation;
-use super::translator::{TextTranslator, TranslateRequest};
+use super::translator::{API_STATUS_PREFIX, TextTranslator, TranslateRequest};
 
 /// 最多重试 3 次（加上首次尝试共 4 次请求）。
 pub(crate) const MAX_RETRIES: usize = 3;
@@ -107,13 +107,17 @@ pub(crate) async fn translate_with_retry(
         // 取消：不记失败
         Ok(None) => Ok(None),
         Err(err) => Err(AppError::Llm(format!(
-            "结构校验未通过：{}（已重试 1 次）；纠错重试失败：{err}",
-            summarize(&issues)
+            "结构校验未通过：{}（已重试 1 次）；纠错重试失败：{}",
+            summarize(&issues),
+            error_message(&err)
         ))),
     }
 }
 
 /// 网络层面的重试循环（最多 3 次重试：500ms / 1000ms / 2000ms）。
+///
+/// **确定性失败不重试**：`401` 密钥错、`403` 无权限、`404` 路径错这类错误重试
+/// 4 次只是让用户白等 3.5 秒再看到同一个错误（见 [`is_retryable_failure`]）。
 async fn translate_attempts(
     translator: &dyn TextTranslator,
     style_hint: Option<&str>,
@@ -123,7 +127,7 @@ async fn translate_attempts(
     job: &TranslationJob,
     stream_entry_ids: &[String],
 ) -> Result<Option<String>> {
-    let mut last_err = String::new();
+    let mut last_err: Option<AppError> = None;
     for attempt in 0..MAX_ATTEMPTS {
         if cancel.is_cancelled() {
             return Ok(None);
@@ -137,8 +141,12 @@ async fn translate_attempts(
             Ok(Some(text)) => return Ok(Some(text)),
             Ok(None) => return Ok(None),
             Err(err) => {
-                last_err = err.to_string();
-                log::warn!("[{}] 第 {} 次尝试失败: {last_err}", job.source, attempt + 1);
+                log::warn!("[{}] 第 {} 次尝试失败: {err}", job.source, attempt + 1);
+                if !is_retryable_failure(&err) {
+                    log::warn!("[{}] 该错误重试也不会成功，不再重试", job.source);
+                    return Err(err);
+                }
+                last_err = Some(err);
                 if let Some(backoff) = retry_backoff.get(attempt) {
                     tokio::select! {
                         () = tokio::time::sleep(*backoff) => {}
@@ -148,7 +156,56 @@ async fn translate_attempts(
             }
         }
     }
-    Err(AppError::Llm(last_err))
+    // 原样抛出最后一次的错误：再包一层 `AppError::Llm` 会让用户看到
+    // 「大模型调用错误: 大模型调用错误: …」，也会把非 LLM 的错误类别吞掉。
+    match last_err {
+        Some(err) => Err(err),
+        None => Err(AppError::Llm(
+            "翻译失败：没有任何一次尝试真正发起".to_string(),
+        )),
+    }
+}
+
+/// 取错误里不带类别前缀的原始消息，供拼接用。
+fn error_message(err: &AppError) -> String {
+    match err {
+        AppError::Llm(message) => message.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// 这个失败值不值得重试。
+///
+/// 只有**能确定重试没有意义**的错误才返回 `false`：HTTP `API 返回 {status}` 形态里
+/// 的确定性 4xx。认不出来的一律当作可重试 —— 把「本来能靠重试恢复」的网络抖动
+/// 变成不可重试，代价比多等几次大得多。
+pub(crate) fn is_retryable_failure(err: &AppError) -> bool {
+    match http_status_of(err) {
+        Some(status) => is_retryable_status(status),
+        None => true,
+    }
+}
+
+/// 从 `API 返回 {status}: …` 形态的消息里取状态码。
+fn http_status_of(err: &AppError) -> Option<u16> {
+    let AppError::Llm(message) = err else {
+        return None;
+    };
+    let rest = message.strip_prefix(API_STATUS_PREFIX)?;
+    let digits: String = rest
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .take(3)
+        .collect();
+    digits.parse().ok()
+}
+
+/// `408`（请求超时）、`425`（太早，RFC 8470 要求稍后重试）、`429`（限流）
+/// 与全部 5xx 值得重试；其余 4xx 是确定性失败。
+///
+/// `429` 目前不读 `Retry-After`（已知取舍，见 ARCHITECTURE 的已知限制）。
+fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 408 | 425 | 429) || (500..600).contains(&status)
 }
 
 fn build_request<'a>(
@@ -404,5 +461,225 @@ mod tests {
             })
             .unwrap();
         assert_eq!(engine.settings().concurrency, 2);
+    }
+
+    // ── 重试分类（确定性失败不重试）──
+
+    fn status_err(status: u16, reason: &str) -> AppError {
+        AppError::Llm(format!("{API_STATUS_PREFIX}{status} {reason}: body"))
+    }
+
+    /// 4xx 里只有 408 / 429 值得重试；其余确定性失败一重试就白等 3.5 秒。
+    #[test]
+    fn http_status_codes_are_classified_for_retry() {
+        for status in [400, 401, 403, 404, 405, 413, 422] {
+            assert!(
+                !is_retryable_failure(&status_err(status, "Deterministic")),
+                "{status} 是确定性失败，不该重试"
+            );
+        }
+        for status in [408, 425, 429, 500, 502, 503, 504] {
+            assert!(
+                is_retryable_failure(&status_err(status, "Transient")),
+                "{status} 应该重试"
+            );
+        }
+        // 302 之类既不是成功也不是 4xx：保守起见不重试
+        assert!(!is_retryable_failure(&status_err(302, "Found")));
+    }
+
+    /// 认不出来的错误一律当可重试 —— 别把网络抖动变成不可重试。
+    #[test]
+    fn unrecognized_errors_stay_retryable() {
+        assert!(is_retryable_failure(&AppError::Llm(
+            "请求失败: connection reset".into()
+        )));
+        assert!(is_retryable_failure(&AppError::Llm(
+            "流读取失败: unexpected EOF".into()
+        )));
+        assert!(is_retryable_failure(&AppError::Io(std::io::Error::other(
+            "boom"
+        ))));
+        assert!(is_retryable_failure(&AppError::Cancelled));
+        // 消息里出现状态码但不是我们的格式：不能误判
+        assert!(is_retryable_failure(&AppError::Llm(
+            "网关说：API 返回 401 是密钥问题".into()
+        )));
+    }
+
+    #[test]
+    fn http_status_is_parsed_from_our_own_message_shape() {
+        assert_eq!(http_status_of(&status_err(404, "Not Found")), Some(404));
+        assert_eq!(http_status_of(&status_err(503, "Unavailable")), Some(503));
+        assert_eq!(http_status_of(&AppError::Llm("API 返回 ".into())), None);
+        assert_eq!(
+            http_status_of(&AppError::Llm("API 返回 abc: x".into())),
+            None
+        );
+        assert_eq!(
+            http_status_of(&AppError::Other("API 返回 500".into())),
+            None
+        );
+    }
+
+    /// 401 不该重试：一次调用、一条 Error、失败计数 1（端到端接线）。
+    #[tokio::test]
+    async fn unauthorized_fails_after_a_single_attempt_without_double_prefix() {
+        struct Unauthorized;
+
+        impl crate::translation::engine::TextTranslator for Unauthorized {
+            fn translate<'a>(
+                &'a self,
+                _request: TranslateRequest<'a>,
+            ) -> futures_util::future::BoxFuture<'a, Result<Option<String>>> {
+                Box::pin(async { Err(status_err(401, "Unauthorized")) })
+            }
+        }
+
+        let engine = TranslationEngine::with_translator(
+            std::sync::Arc::new(Unauthorized),
+            crate::types::LlmSettings {
+                concurrency: 1,
+                ..Default::default()
+            },
+        )
+        .with_retry_backoff([Duration::from_millis(1); MAX_RETRIES]);
+        let sink = CollectingSink::new();
+        let cancel = CancelToken::new();
+
+        let summary = engine
+            .run(
+                &[entry("Fireball", "u1")],
+                &matcher(&[]),
+                run_options(&sink, &cancel, ""),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.translated, 0);
+        let messages = crate::translation::test_support::error_messages(&sink.events());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].1.matches("大模型调用错误").count(), 1);
+        assert!(messages[0].1.contains("401"), "实际: {}", messages[0].1);
+        assert!(
+            !sink
+                .events()
+                .iter()
+                .any(|event| matches!(event, crate::types::TranslationEvent::Done { .. })),
+            "失败不该有 Done"
+        );
+    }
+
+    /// 429 仍然重试到上限（限流是暂时性的）。
+    #[tokio::test]
+    async fn rate_limited_requests_are_still_retried() {
+        struct RateLimited;
+
+        impl crate::translation::engine::TextTranslator for RateLimited {
+            fn translate<'a>(
+                &'a self,
+                _request: TranslateRequest<'a>,
+            ) -> futures_util::future::BoxFuture<'a, Result<Option<String>>> {
+                Box::pin(async { Err(status_err(429, "Too Many Requests")) })
+            }
+        }
+
+        let engine = TranslationEngine::with_translator(
+            std::sync::Arc::new(RateLimited),
+            crate::types::LlmSettings {
+                concurrency: 1,
+                ..Default::default()
+            },
+        )
+        .with_retry_backoff([Duration::from_millis(1); MAX_RETRIES]);
+        let sink = CollectingSink::new();
+        let cancel = CancelToken::new();
+
+        let summary = engine
+            .run(
+                &[entry("Fireball", "u1")],
+                &matcher(&[]),
+                run_options(&sink, &cancel, ""),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(summary.failed, 1);
+        // progress 每次尝试都发一次 → MAX_ATTEMPTS 次尝试
+        let progress = sink
+            .events()
+            .iter()
+            .filter(|event| matches!(event, crate::types::TranslationEvent::Progress { .. }))
+            .count();
+        assert_eq!(progress, MAX_ATTEMPTS, "429 应重试到上限");
+    }
+
+    /// 截断类失败必须是**可重试**的，且最终态是 `Error`、`failed` 计数、绝不 `Done`。
+    ///
+    /// 这是红队 R-01 的验收口径：截断的风险在于「半句译文被当成成品」，
+    /// 所以失败必须一路走到 Error，让条目写回时退回原文。
+    #[tokio::test]
+    async fn truncation_failures_are_retryable_and_end_as_error_not_done() {
+        struct Truncated;
+
+        impl crate::translation::engine::TextTranslator for Truncated {
+            fn translate<'a>(
+                &'a self,
+                _request: TranslateRequest<'a>,
+            ) -> futures_util::future::BoxFuture<'a, Result<Option<String>>> {
+                Box::pin(async {
+                    Err(AppError::Llm(
+                        "模型输出不完整（finish_reason=length），已丢弃这次半截译文".to_string(),
+                    ))
+                })
+            }
+        }
+
+        let engine = TranslationEngine::with_translator(
+            std::sync::Arc::new(Truncated),
+            crate::types::LlmSettings {
+                concurrency: 1,
+                ..Default::default()
+            },
+        )
+        .with_retry_backoff([Duration::from_millis(1); MAX_RETRIES]);
+        let sink = CollectingSink::new();
+        let cancel = CancelToken::new();
+
+        let summary = engine
+            .run(
+                &[entry("Deals {1} damage", "u1")],
+                &matcher(&[]),
+                run_options(&sink, &cancel, ""),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.translated, 0);
+        assert!(!summary.cancelled);
+        let events = sink.events();
+        assert_eq!(
+            crate::translation::test_support::error_events(&events).len(),
+            1
+        );
+        assert!(
+            crate::translation::test_support::done_events(&events).is_empty(),
+            "截断绝不能产生 Done（半截译文会被写回）"
+        );
+        assert_eq!(
+            events.last().unwrap(),
+            &crate::types::TranslationEvent::AllDone {
+                total: 1,
+                failed: 1
+            }
+        );
+        // 可重试：progress 每次尝试都发一次
+        let progress = events
+            .iter()
+            .filter(|event| matches!(event, crate::types::TranslationEvent::Progress { .. }))
+            .count();
+        assert_eq!(progress, MAX_ATTEMPTS, "截断应走完既有重试额度");
     }
 }

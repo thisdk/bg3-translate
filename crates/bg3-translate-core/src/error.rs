@@ -40,7 +40,12 @@ pub enum AppError {
 }
 
 impl AppError {
-    /// 机器可读的错误类别，便于前端做差异化处理（如「取消」不弹错误）。
+    /// 机器可读的错误类别，**只在本进程内使用**（命令层 / 引擎分支）。
+    ///
+    /// 注意跨 IPC 的形状：`Serialize` 把整个错误序列化成一条面向用户的
+    /// 中文字符串（前端 `String(e)` 直接展示），所以前端**拿不到** `code`。
+    /// 想按类别差异化的地方（例如「取消不弹错误」）必须在 Rust 侧判断，
+    /// 或者先把 `Serialize` 改成 `{code, message}` 结构（= 改 IPC 契约）。
     pub const fn code(&self) -> &'static str {
         match self {
             AppError::Io(_) => "io",
@@ -136,6 +141,27 @@ mod tests {
     fn serializes_to_plain_string_for_frontend() {
         let json = serde_json::to_string(&AppError::Config("没配 key".into())).unwrap();
         assert_eq!(json, "\"配置错误: 没配 key\"");
+    }
+
+    /// 锁死 IPC 错误形状：**纯字符串**，不带 `code`/`message` 字段。
+    ///
+    /// 前端全部按 `String(e)` 处理（`src/lib/tauri.ts` 的调用方），一旦有人把
+    /// `Serialize` 改成结构体，前端拿到的是 `[object Object]`，错误信息全丢。
+    #[test]
+    fn serialized_form_carries_no_machine_readable_code() {
+        for error in [
+            AppError::Cancelled,
+            AppError::Llm("boom".into()),
+            AppError::config("x"),
+        ] {
+            let json = serde_json::to_string(&error).unwrap();
+            assert!(
+                json.starts_with('"') && json.ends_with('"'),
+                "必须是纯字符串: {json}"
+            );
+            assert!(!json.contains("code"), "不应带 code 字段: {json}");
+            assert_eq!(json, format!("\"{error}\""));
+        }
     }
 
     #[test]

@@ -103,7 +103,11 @@ export function TranslationToolbar({
 
       {/* 整体进度 */}
       <div className="px-3 pb-2.5">
-        <Progress value={stats.done} max={Math.max(stats.total, 1)} />
+        <Progress
+          value={stats.done}
+          max={Math.max(stats.total, 1)}
+          aria-label="翻译进度"
+        />
         <div className="mt-1 flex flex-wrap items-center justify-between gap-2 text-[11px] tabular-nums text-muted-foreground">
           <span>
             已翻译 {stats.done}/{stats.total}（{stats.percent}%）

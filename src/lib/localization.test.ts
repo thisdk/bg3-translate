@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   TARGET_LANGUAGE,
   localizationWritePriority,
+  mergeWithExistingTarget,
   planLocalizationWrites,
   toTargetLocalizationPath,
 } from "./localization";
@@ -192,5 +193,158 @@ describe("planLocalizationWrites", () => {
     expect(plans).toHaveLength(1);
     expect(plans[0].fileName).toBe("Mods/Foo/meta.lsx");
     expect(plans[0].priority).toBe(1);
+  });
+});
+
+describe("mergeWithExistingTarget（写回已有文件的底稿合并）", () => {
+  const en = "Localization/English/x.xml";
+  const zh = "Localization/Chinese/x.xml";
+
+  function incoming(contentuid: string, text: string, patch: Partial<TranslationEntry> = {}) {
+    return {
+      id: `${en}#${contentuid}`,
+      sourceFile: en,
+      source: text,
+      target: "",
+      contentuid,
+      version: "1",
+      status: "pending" as const,
+      error: null,
+      ...patch,
+    };
+  }
+
+  function base(contentuid: string, text: string) {
+    return {
+      id: `${zh}#${contentuid}`,
+      sourceFile: zh,
+      source: text,
+      target: "",
+      contentuid,
+      version: "1",
+      status: "pending" as const,
+      error: null,
+    };
+  }
+
+  it("未翻译条目保留底稿文本，已翻译条目用新译文", () => {
+    const merged = mergeWithExistingTarget(
+      [
+        incoming("uid-1", "Fireball", { target: "火球术", status: "translated" }),
+        incoming("uid-2", "Ice"),
+      ],
+      [base("uid-1", "火球"), base("uid-2", "寒冰")],
+    );
+
+    expect(merged.map((e) => [e.contentuid, e.target || e.source])).toEqual([
+      ["uid-1", "火球术"],
+      ["uid-2", "寒冰"],
+    ]);
+  });
+
+  it("error 条目不得覆盖底稿（被拒译文也不进 payload）", () => {
+    const merged = mergeWithExistingTarget(
+      [
+        incoming("uid-1", "Fireball", {
+          target: "被拒译文",
+          status: "error",
+          error: "结构校验未通过",
+        }),
+      ],
+      [base("uid-1", "火球")],
+    );
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0].target).toBe("");
+    expect(merged[0].source).toBe("火球");
+    expect(merged[0].status).toBe("pending");
+  });
+
+  it("translating 条目（半截译文）同样保留底稿", () => {
+    const merged = mergeWithExistingTarget(
+      [incoming("uid-1", "Fireball", { target: "半截", status: "translating" })],
+      [base("uid-1", "火球")],
+    );
+    expect(merged[0].source).toBe("火球");
+    expect(merged[0].target).toBe("");
+  });
+
+  it("底稿有、incoming 没有的 contentuid 保留，顺序为 incoming 在前", () => {
+    const merged = mergeWithExistingTarget(
+      [incoming("uid-2", "Ice")],
+      [base("uid-1", "火球"), base("uid-9", "只有底稿有")],
+    );
+    // uid-2 底稿里没有 → 保持 incoming 原文；uid-1 / uid-9 只有底稿有 → 原样保留
+    expect(merged.map((e) => e.contentuid)).toEqual(["uid-2", "uid-1", "uid-9"]);
+    expect(merged.map((e) => e.source)).toEqual(["Ice", "火球", "只有底稿有"]);
+  });
+
+  it("底稿里有同 contentuid 且 incoming 未翻译时保留底稿文本", () => {
+    const merged = mergeWithExistingTarget(
+      [incoming("uid-2", "Ice")],
+      [base("uid-2", "寒冰")],
+    );
+    expect(merged.map((e) => [e.contentuid, e.source])).toEqual([["uid-2", "寒冰"]]);
+  });
+
+  it("底稿文本为空时退回 incoming（不写出空条目）", () => {
+    const merged = mergeWithExistingTarget(
+      [incoming("uid-1", "Fireball")],
+      [base("uid-1", "")],
+    );
+    expect(merged).toHaveLength(1);
+    expect(merged[0].source).toBe("Fireball");
+  });
+
+  it("底稿为空数组时原样返回 incoming", () => {
+    const list = [incoming("uid-1", "Fireball")];
+    expect(mergeWithExistingTarget(list, [])).toEqual(list);
+  });
+});
+
+describe("planLocalizationWrites 写回闸门（半截译文不得进 PAK）", () => {
+  it("translating 条目退回原文，target 不进入写回请求", () => {
+    // 后端只在 status === "error" 时退回原文；translating 的非空 target
+    // 会被当成真译文写进 PAK，所以写回计划必须自己把它降级。
+    const file = pakFile({ name: "Localization/English/half.xml", language: "English" });
+    const plans = planLocalizationWrites([file], {
+      [file.name]: [
+        entry("done-1", "已经翻好的译文"),
+        {
+          ...entry("half-1", "半截流式文本"),
+          status: "translating",
+        },
+      ],
+    });
+
+    expect(plans).toHaveLength(1);
+    expect(plans[0].entries.map((e) => [e.contentuid, e.target, e.status])).toEqual([
+      ["done-1", "已经翻好的译文", "pending"],
+      ["half-1", "", "pending"],
+    ]);
+  });
+
+  it("不改动已翻译 / 已编辑 / error 条目的语义", () => {
+    const file = pakFile({ name: "Localization/English/keep.xml", language: "English" });
+    const translated = { ...entry("t-1", "译文"), status: "translated" as const };
+    const edited = { ...entry("e-1", "手工译文"), status: "edited" as const };
+    const failed = {
+      ...entry("f-1", "被拒的半截文本"),
+      status: "error" as const,
+      error: "结构校验未通过",
+    };
+
+    const plans = planLocalizationWrites([file], {
+      [file.name]: [translated, edited, failed],
+    });
+
+    // translated / edited 的 target 必须原样带走（后端据此写回译文）
+    expect(plans[0].entries.map((e) => [e.contentuid, e.target, e.status])).toEqual([
+      ["t-1", "译文", "translated"],
+      ["e-1", "手工译文", "edited"],
+      // error 条目必须保留 status === "error"：后端据此退回原文。
+      // 若这里被改成 pending，被拒译文就会被写进 PAK。
+      ["f-1", "被拒的半截文本", "error"],
+    ]);
   });
 });

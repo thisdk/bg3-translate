@@ -60,6 +60,17 @@ interface AppState {
   // ── 加载态 ──
   loading: boolean;
   error: string | null;
+  /**
+   * 当前活跃的翻译轮次 token（`null` = 没有翻译在跑）。
+   *
+   * 写回（打包）必须看它：后端只在 `status === "error"` 时退回原文，处于
+   * `translating` 的半截流式文本会被当成真译文写进 PAK。
+   *
+   * 之所以用 token 而不是 boolean：只有**登记它的那一轮**才能注销它。否则
+   * 「旧工作台的收尾」会把「新一轮刚打开的闸门」误关掉 —— 那正好又是半截
+   * 译文被写回 PAK 的入口（旧一轮与新一纶的条目 id 可以完全相同）。
+   */
+  runToken: number | null;
 
   // ── Actions ──
   setStage: (stage: AppStage) => void;
@@ -83,10 +94,21 @@ interface AppState {
   getAllEntries: () => TranslationEntry[];
   /** 获取某个文件的条目，用于写回 */
   getFileEntries: (fileName: string) => TranslationEntry[];
+  /**
+   * 按 id 取当前条目（不存在返回 undefined）。
+   *
+   * 写回收尾用它判断条目是否已经被用户手工改过（`edited`）：人工成果优先于
+   * 本轮的流式文本，既不能被迟到的 delta/done 覆盖，也不能被收尾回滚清掉。
+   */
+  getEntryById: (id: string) => TranslationEntry | undefined;
   setSettings: (settings: LlmSettings) => void;
   setTheme: (theme: Theme) => void;
   setLoading: (loading: boolean) => void;
   setError: (error: string | null) => void;
+  /** 登记一轮翻译，返回该轮的 token（写回闸门据此判断是否还在翻译） */
+  beginRun: () => number;
+  /** 注销某一轮翻译；只有当前登记的 token 匹配时才真正关闭闸门 */
+  endRun: (token: number) => void;
   reset: () => void;
 }
 
@@ -101,6 +123,9 @@ export const DEFAULT_SETTINGS: LlmSettings = {
 
 /** 主题持久化 key */
 export const THEME_STORAGE_KEY = "bg3-translate-theme";
+
+/** 翻译轮次 token 的全局序号（跨组件实例唯一，见 AppState.runToken） */
+let runTokenSeq = 0;
 
 const THEME_KEY = THEME_STORAGE_KEY;
 
@@ -175,6 +200,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   theme: loadTheme(),
   loading: false,
   error: null,
+  runToken: null,
 
   setStage: (stage) => set({ stage }),
   setModOpened: (filePath, workDir, files) =>
@@ -189,6 +215,9 @@ export const useAppStore = create<AppState>((set, get) => ({
       entryIdToFile: {},
       entryIdToIndex: {},
       error: null,
+      // 换了 MOD：上一轮翻译的运行态与本次无关（旧一轮的回调也会因为
+      // runId / 卸载而停止写 store）
+      runToken: null,
     }),
   setSelectedFiles: (files) => set({ selectedFiles: files }),
   setFileEntries: (fileName, entries) =>
@@ -233,6 +262,10 @@ export const useAppStore = create<AppState>((set, get) => ({
         if (text === "") continue;
         const hit = locateEntry(s, id);
         if (!hit) continue;
+        // 用户已经手工保存过译文（status === "edited"）：模型后续的流式文本
+        // 不得再追加到人工成果上（否则会拼出「人工译文 + 模型尾巴」的混合文本，
+        // 而且状态会被改回 translating —— 那是会被写进 PAK 的）
+        if (hit.list[hit.index].status === "edited") continue;
         const byIndex = updates.get(hit.fileName) ?? new Map<number, string>();
         byIndex.set(hit.index, (byIndex.get(hit.index) ?? "") + text);
         updates.set(hit.fileName, byIndex);
@@ -265,6 +298,10 @@ export const useAppStore = create<AppState>((set, get) => ({
     return all;
   },
   getFileEntries: (fileName) => get().entriesByFile[fileName] ?? [],
+  getEntryById: (id) => {
+    const hit = locateEntry(get(), id);
+    return hit ? hit.list[hit.index] : undefined;
+  },
   setSettings: (settings) => set({ settings, settingsLoaded: true }),
   setTheme: (theme) => {
     saveTheme(theme);
@@ -273,6 +310,13 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
   setLoading: (loading) => set({ loading }),
   setError: (error) => set({ error }),
+  beginRun: () => {
+    runTokenSeq += 1;
+    set({ runToken: runTokenSeq });
+    return runTokenSeq;
+  },
+  endRun: (token) =>
+    set((s) => (s.runToken === token ? { runToken: null } : {})),
   reset: () =>
     set({
       stage: "home",
@@ -285,5 +329,6 @@ export const useAppStore = create<AppState>((set, get) => ({
       entryIdToFile: {},
       entryIdToIndex: {},
       error: null,
+      runToken: null,
     }),
 }));

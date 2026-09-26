@@ -188,6 +188,50 @@ fn realistic_translations_are_never_flagged_by_structure_check() {
     );
 }
 
+/// 反向用例：**属性名**被改坏、或属性被整个删掉，结构校验必须报出来。
+///
+/// 为什么必须有这条：构造「属性值改写」的辅助函数以前把属性名也压成了 `字`，
+/// 于是 `<LSTag Type="Spell">` → `<LSTag 字="字字">` 也能过校验。但真实链路里
+/// 模型输出会被**原样写进 PAK**：`Type="Spell"` 变成 `类型="法术"`、或者整个属性
+/// 消失，游戏就读不到这个标签的属性了 —— 属于「会把 MOD 弄坏」的漏报。
+#[test]
+fn mangled_tag_attribute_names_are_not_faithful() {
+    let source = r#"<LSTag Type="Spell" Tooltip="Deals {1} damage">Fireball</LSTag>"#;
+
+    // 对照组：只改写属性值（属性名逐字保留）→ 必须仍然判为保真。
+    // 如果这条红了，说明校验被改成了「连属性值都要一样」，那是过度收紧。
+    let values_rewritten = rewrite_quoted_values(source);
+    assert_ne!(values_rewritten, source, "属性值应确实被改写");
+    assert!(
+        is_faithful(source, &values_rewritten),
+        "只改属性值不该被判失败: {values_rewritten:?}"
+    );
+
+    // 属性名被改：`Type` → `类型`（模型把标记也翻译了）
+    let renamed = source.replace("Type=", "类型=");
+    assert!(
+        !is_faithful(source, &renamed),
+        "属性名被改坏必须判为不保真: {renamed:?}（问题: {:?}）",
+        check_fidelity(source, &renamed)
+    );
+
+    // 整个属性被删掉：`Type="Spell" ` 消失
+    let dropped = source.replace(r#"Type="Spell" "#, "");
+    assert!(
+        !is_faithful(source, &dropped),
+        "属性被删掉必须判为不保真: {dropped:?}（问题: {:?}）",
+        check_fidelity(source, &dropped)
+    );
+
+    // 属性名大小写被改（`Type` → `type`）同样是结构变化
+    let lowercased = source.replace("Type=", "type=");
+    assert!(
+        !is_faithful(source, &lowercased),
+        "属性名大小写被改必须判为不保真: {lowercased:?}（问题: {:?}）",
+        check_fidelity(source, &lowercased)
+    );
+}
+
 /// 真实样本里所有可翻译条目的原文。
 fn real_sample_sources() -> Vec<String> {
     let zip = sample_zip();
@@ -256,7 +300,12 @@ fn escape_angle_brackets(text: &str) -> String {
     text.replace('<', "&lt;").replace('>', "&gt;")
 }
 
-/// 改写每个标签的属性值 —— 属性值不参与结构比较，不该因此判失败。
+/// 改写每个标签的属性**值** —— 属性值不参与结构比较，不该因此判失败。
+///
+/// **属性名必须原样保留**：这个用例的意图是「属性值被翻译」而不是「属性可以随便改」。
+/// 如果连属性名一起压成 `字`，就会掩盖真实漏报——`Type=` 被改坏成 `类型=`、或者整个
+/// 属性被删掉，都在结构上真的弄坏了标签，写回时模型输出会被原样写进 PAK。
+/// 见反向用例 [`mangled_tag_attribute_names_are_not_faithful`]。
 ///
 /// 注意占位符必须原样保留：`Tooltip="Deals {1} damage"` 里的 `{1}` 是给游戏填参数的，
 /// 属性值可以重写，但把它丢了就是真的结构损坏（`fidelity` 会、也应该报出来）。
@@ -285,8 +334,8 @@ fn rewrite_attribute_values(text: &str) -> String {
             };
             out.push_str(name);
             if !attrs.trim().is_empty() {
-                out.push(' ');
-                out.push_str(&keep_placeholders(attrs));
+                // attrs 自带前导空白，不能额外补空格，否则属性间空白会翻倍
+                out.push_str(&rewrite_quoted_values(attrs));
             }
             if self_closing {
                 out.push('/');
@@ -296,6 +345,36 @@ fn rewrite_attribute_values(text: &str) -> String {
         rest = &after[end + 1..];
     }
     out.push_str(rest);
+    out
+}
+
+/// 只重写双引号/单引号里的内容，引号外的一切（属性名、`=`、空白、`/`）逐字保留。
+fn rewrite_quoted_values(attrs: &str) -> String {
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < attrs.len() {
+        let Some(c) = attrs[i..].chars().next() else {
+            break;
+        };
+        if c == '"' || c == '\'' {
+            let value_start = i + c.len_utf8();
+            let value_end = attrs[value_start..]
+                .find(c)
+                .map(|offset| value_start + offset)
+                .unwrap_or(attrs.len());
+            out.push(c); // 开引号
+            out.push_str(&keep_placeholders(&attrs[value_start..value_end]));
+            out.push(c); // 闭引号
+            i = if value_end < attrs.len() {
+                value_end + c.len_utf8()
+            } else {
+                value_end
+            };
+        } else {
+            out.push(c);
+            i += c.len_utf8();
+        }
+    }
     out
 }
 

@@ -7,7 +7,7 @@ use bg3_translate_core::pak;
 use bg3_translate_core::types::{ExtractResult, PakFile};
 use tauri::State;
 
-use crate::commands::blocking;
+use crate::commands::{blocking, checked_work_root};
 use crate::state::AppState;
 
 /// 打开 MOD（`.pak` / `.zip`）并解包到临时工作目录。
@@ -43,9 +43,23 @@ pub async fn extract_mod(file_path: String, output_dir: String) -> Result<Vec<Pa
 }
 
 /// 重新打包工作目录为 `.pak`。
+///
+/// `output_path` 是用户通过系统对话框选的保存位置，**合法地可以指向任意目录**
+/// （导出到桌面是正常用法），所以不限制它；要校验的是 `work_dir`：它由前端
+/// 提供，必须等于 `open_mod` 记录的那个工作目录，否则前端能把任意目录打成
+/// pak 写到任意位置。
 #[tauri::command]
-pub async fn repack_mod(work_dir: String, output_path: String) -> Result<()> {
-    blocking("打包", move || pak::repack(&work_dir, &output_path)).await
+pub async fn repack_mod(
+    state: State<'_, AppState>,
+    work_dir: String,
+    output_path: String,
+) -> Result<()> {
+    let recorded = state.current_work_dir();
+    blocking("打包", move || {
+        let root = checked_work_root(recorded.as_deref(), &work_dir)?;
+        pak::repack(&root.to_string_lossy(), &output_path)
+    })
+    .await
 }
 
 /// 清理当前 MOD 的工作目录（前端「开始新的 MOD」时调用；未调用也会在打开下一个 MOD 时自动清理）。

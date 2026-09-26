@@ -46,4 +46,9 @@ impl AppState {
     pub fn take_work_dir(&self) -> Option<PathBuf> {
         self.work_dir.lock().ok()?.take()
     }
+
+    /// 读取当前工作目录的快照（不清空），供命令层校验前端传来的 `work_dir`。
+    pub fn current_work_dir(&self) -> Option<PathBuf> {
+        self.work_dir.lock().ok()?.clone()
+    }
 }

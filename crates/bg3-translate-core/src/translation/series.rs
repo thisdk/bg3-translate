@@ -262,7 +262,11 @@ pub fn contains_latin(text: &str) -> bool {
     text.chars().any(|c| c.is_ascii_alphabetic())
 }
 
-/// 是否含 CJK 统一表意文字（含扩展区）。
+/// 是否含 CJK 统一表意文字（含全部扩展区）。
+///
+/// 区间按 Unicode 15.1 的 CJK Unified Ideographs 各扩展区补齐：扩展 F/G/H/I
+/// 也要认，否则用生僻字写的系列名不会被归到中文那一侧，同一系列会被拆成两组
+/// 分别翻译（译名不一致）。
 pub fn contains_cjk(text: &str) -> bool {
     text.chars().any(|c| {
         matches!(
@@ -274,6 +278,10 @@ pub fn contains_cjk(text: &str) -> bool {
                 | 0x2a700..=0x2b73f
                 | 0x2b740..=0x2b81f
                 | 0x2b820..=0x2ceaf
+                | 0x2ceb0..=0x2ebef
+                | 0x2ebf0..=0x2ee5f
+                | 0x30000..=0x3134f
+                | 0x31350..=0x323af
         )
     })
 }
@@ -628,6 +636,24 @@ mod tests {
         assert!(contains_cjk("银发9b"));
         assert!(!contains_cjk("Silver's Hair"));
         assert!(contains_cjk("㐀"), "CJK 扩展 A 区也应识别");
+    }
+
+    /// 扩展 F/G/H/I 也要认：漏了它们，生僻字系列名不会被归到中文一侧。
+    #[test]
+    fn contains_cjk_covers_the_extended_planes() {
+        for (label, ch) in [
+            ("扩展F首字", '\u{2ceb0}'),
+            ("扩展I首字", '\u{2ebf0}'),
+            ("扩展G首字", '\u{30000}'),
+            ("扩展H首字", '\u{31350}'),
+        ] {
+            assert!(contains_cjk(&ch.to_string()), "{label} 应识别为 CJK");
+        }
+        // 边界：扩展 I 的末字仍是 CJK，紧邻的下一码位不是
+        assert!(contains_cjk("\u{2ee5f}"));
+        assert!(!contains_cjk("\u{2ee60}"));
+        // 扩展 E 的末字（修复前就认得的区间）不受影响
+        assert!(contains_cjk("\u{2ceaf}"));
     }
 
     #[test]

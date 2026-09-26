@@ -5,7 +5,7 @@
 原来的工程是一个单体的 Tauri 应用：所有业务逻辑都写在 `src-tauri/src/`，
 编译它需要 webkit2gtk / dbus / gtk 等一堆 GUI 系统库。结果是：
 
-- 在 Linux 开发者机器上 `cargo test` 直接失败（缺系统库）
+- 在**没装**这些系统库的 Linux 开发机上 `cargo test` 直接失败
 - CI 上想跑单测就必须装一整套 GUI 依赖
 - 核心逻辑（PAK 解析、术语表匹配、翻译引擎）无法独立复用
 
@@ -199,15 +199,32 @@ OpenAI 兼容协议的「结构」与「传输」是分开的，改代码前先�
 - **流式 chunk 是两级解析**（`sse::parse_chat_chunk`）：先按标准协议类型反序列化，失败再
   退回只认 `choices[0].delta.content` 的宽松结构。标准结构要求 `id`/`index`/`created`/
   `model`/`object` 齐全，而部分网关只发最小字段 —— 只留类型化一条路会把这类响应全丢掉。
-- **两处协议级修复**（v1.0.0）：
+- **三处协议级修复**（v1.0.0）：
   1. `LlmSettings::chat_completions_url()` 收口 baseUrl 的四种写法（`types.rs` 里有对照表）。
      过去填 `https://api.deepseek.com/v1` 会拼成 `/v1/v1/chat/completions` → 404。
   2. 流读完却没有任何文本 → 报错，而不是返回空译文。空译文对「原文没有占位符/标签」的条目
      能通过结构校验、被记成「已翻译」（界面一片空白），只在写回时因 target 为空退回原文；
      现在它变成一次可重试的失败（原文本身为空时不报错）。最常见成因是网关把错误包成了 200，
      或服务端没按 SSE 返回。
-- **已知限制（有意保留，不在本次范围）**：4xx（除 408/429）目前仍跟网络错误一样退避重试
-  3 次才失败；服务端忽略 `stream: true`、直接返回完整 JSON 时没有非流式兜底。
+  3. **被截断的流不再当成功**（`translator::ensure_stream_complete`）。两种情况都算失败：
+     `finish_reason ∈ {length, content_filter}`（服务端自报不完整），或者
+     **既没有 `[DONE]` 也没有任何 `finish_reason`**（连接被中途掐断，拿不到「输出完整」的证据）。
+     报的是 `llm` 错误 → 走既有网络重试（1 次 + 最多 3 次退避）→ 仍失败则条目落 `error`、
+     写回退回原文。半截译文（`模型输出不完整（finish_reason=length），已丢弃这次半截译文…`）
+     过去能一路通过结构校验被打进 PAK，现在不会。
+- **已知限制（有意保留，不在本次范围）**：
+  1. `429` 不读 `Retry-After` 头，仍按固定退避（500ms → 1000ms → 2000ms）重试。
+  2. 服务端忽略 `stream: true`、直接返回完整 JSON 时没有非流式兜底。
+  3. **完全不用 `[DONE]`、也不发 `finish_reason` 的第三方网关现在会被判失败**
+     （重试 3 次后条目落 `error`、退回原文）。这是与上一条修复配套的**刻意取舍**：
+     这类响应与「连接被中途掐断」在客户端不可区分，而「宁可失败也不要静默丢内容」——
+     以前它们能用，是因为半截/未知完整性的译文被当成成功写进了 PAK。
+     报错文案会明说原因与下一步（`流式响应结束，但既没有收到 [DONE] 也没有 finish_reason，无法确认输出完整（连接可能被中途掐断）；若在自定义网关上出现，请确认它按 OpenAI 协议发送 [DONE] 或 finish_reason，否则换用标准端点后重试`），
+     用户可据此换用遵守 OpenAI 流式协议的端点，或点「重试」。
+
+**重试分类**（`retry::is_retryable_failure`，纯函数，可单测）：
+`408` / `425` / `429` / 全部 `5xx` → 可重试；**其余 4xx 直接失败**，不再退避重试 3 次；
+消息里认不出状态码时**按可重试处理**（宁多重试一次，也不要把可恢复的错误当致命错误）。
 
 ### 译文结构保真校验（`translation::fidelity`）
 
@@ -218,7 +235,7 @@ OpenAI 兼容协议的「结构」与「传输」是分开的，改代码前先�
 | 检查项 | 抓什么 | 明确不抓什么（防误报） |
 | --- | --- | --- |
 | 占位符 | `{1}` / `{10}` / `{name}` / `{user_name}` 的多重集必须一致（缺失 / 多余 / 重复都报）；顺序不计（`{1} {2}` ↔ `{2} {1}` 保真） | `{}`、`{ }`、`{a b}`、`{"k": 1}`、`{#FFAA00}`、`{-1}` 都不算占位符 |
-| 标签 | 写回白名单标签（`LSTag`/`font`/`i`/`b`/`u`/`br`/`span`/`em`/`strong`）的开 / 闭 / 空元素序列必须一致；属性值与标签内文本不参与比较 | `< 5`、`a < b`、`a < b > c`、`<5>`、`x <y` 这类比较文本；白名单外的 `<name>`/`<color>`（写回时会转义成普通文本，没有配对义务）；属性值被改写 |
+| 标签 | 写回白名单标签（`LSTag`/`font`/`i`/`b`/`u`/`br`/`span`/`em`/`strong`）的开 / 闭 / 空元素序列必须一致；**开始标签的属性名多重集也必须一致**（大小写敏感、顺序不计）；标签内文本与属性**值**不参与比较 | `< 5`、`a < b`、`a < b > c`、`<5>`、`x <y` 这类比较文本；白名单外的 `<name>`/`<color>`（写回时会转义成普通文本，没有配对义务）；属性值被改写/被翻译；属性名的顺序 |
 | 空元素 | `<br/>`、`<br>`、`<br />` 等价，都不要求闭合；非空元素的 `<x/>` 与 `<x></x>` 也等价（XML 语义相同） | 空元素整个丢失仍然会报；代价是非空元素「空标签」与「包住文本的标签对」也分不出来（正文位置本来就不参与比对） |
 | 实体 | `&lt;` / `&gt;` 先还原成字面尖括号再比较 | 模型把译文里的 `<` 重新转义成 `&lt;` 不算结构变化（解析层本来也还原过一次） |
 
@@ -332,10 +349,31 @@ pub struct MatchedTerm { pub source: String, pub target: String }
   命令注册 / 前端 `invoke` / 本文件命令表三处集合相等，并核对
   `TranslationEvent`、`TranslationStatus`、`PakFileKind` 三组枚举的 serde 名称
   与 `src/lib/types.ts` 的联合类型一致。它在 CI 的 `meta` job 里跑。
-- `src-tauri` 本身**没有**集成测试：它依赖 webkit2gtk/gtk/dbus，本机与
-  ubuntu CI 都编译不了。壳层刻意做得很薄（只做参数转发与事件桥接），
-  验证手段是 CI 里 Windows runner 上的 `cargo check` + `cargo clippy -D warnings`，
-  以及上面那个契约脚本。这是有意的取舍，不是遗漏。
+- `src-tauri` 没有独立目录的集成测试，但**命令层有单元测试**：
+  `cargo test -p bg3-translate --lib` 覆盖 `work_dir` / `file_name` 的越权校验
+  （见下节）与纯逻辑；壳层刻意做得很薄（只做参数转发与事件桥接）。
+  **能不能在本机编译，取决于 GUI 系统库是否就位**：装好 webkit2gtk / gtk / dbus 的
+  Linux 与 Windows 都可以直接跑
+  `cargo check -p bg3-translate --all-targets` 与
+  `cargo clippy -p bg3-translate --all-targets -- -D warnings`；ubuntu-latest 的
+  CI runner 历史上没有这些库，所以 CI 里这两条固定在 Windows `tauri-shell` job 上跑。
+  **同一 job 还会真正执行这些单元测试**（`cargo test -p bg3-translate --lib`）：
+  `--all-targets` 只**编译**测试不执行，少了这一步，越权校验的回归防线就只是静默失效。
+  这三条命令**故意不进** `scripts/verify.sh`：门禁要在所有开发机与 ubuntu CI 上都能过，
+  把「本机装了 GUI 库」当成必要条件会误伤没装的机器。
+
+## 前端可控参数的信任边界（`src-tauri` 命令层）
+
+`read_file_entries` / `write_file_entries` / `repack_mod` 的 `work_dir` 与 `file_name`
+都是**前端可控字符串**，core 里的 `pak::resolve_disk_path` 只做纯 `join`。因此命令层
+必须先校验再交给 core：
+
+- `file_name` 过 `pak::safe_output_path`（拒绝 `..`、绝对路径、盘符、`:`、Windows 保留名）；
+- `work_dir` 必须等于 `open_mod` 记在 `AppState` 里的那个目录（`is_same_dir`：
+  先 `canonicalize`，失败退回词法比较），并且**用记录值而不是前端传的值**当读写根目录。
+
+用户通过系统对话框选出来的路径（`extract_mod` 的 `outputDir`、`repack_mod` 的
+`outputPath`）合法地可以指向任意位置，**不**做限制。
 
 ## 运行
 

@@ -46,8 +46,8 @@
 现在拿到译文后还会**真的校验一遍结构**，不合格不会被当成成功译文：
 
 - **比什么**：比的是原文与译文的**结构签名**——占位符（`{1}` / `{10}` / `{name}`）
-  的多重集，加上白名单富文本标签（`<LSTag>` / `</LSTag>` / `<br/>`）的标签名序列。
-  属性值改了、标签之间的正文被翻译了都不算问题：只比结构，不比内容。
+  的多重集，加上白名单富文本标签（`<LSTag>` / `</LSTag>` / `<br/>`）的标签名序列
+  与开始标签的**属性名**。属性值改了、标签之间的正文被翻译了都不算问题：只比结构，不比内容。
   占位符顺序不算问题（`{1} {2}` ↔ `{2} {1}` 保真）；缺一处 / 多一处 / 重复，
   以及标签的顺序或嵌套与原文不同，都算问题。
 - **怎么处理**：第一次拿到结构不合格的译文，会带上具体原因（例如「上一轮译文缺少占位符
@@ -61,10 +61,18 @@
   所以不修也不会把坏译文写进文件；手工改好并保存后状态变成「已编辑」，
   才按你改的内容写回。（取消翻译时残留的半截流式文本，前端会回滚成「待翻译」
   并清空译文，同样退回原文。）
+- **被截断的流不算成功**：服务端自报 `finish_reason` 是 `length` / `content_filter`，
+  或者**流结束了却既没有 `[DONE]` 也没有 `finish_reason`**，都会被判为失败
+  （重试 3 次后条目标成「出错」、打包时退回原文），不会把半句话当成品写进 PAK。
+  代价：**完全不用 `[DONE]` 也不发 `finish_reason` 的第三方网关会开始报错** ——
+  这类响应与「连接被掐断」在客户端无法区分，宁可失败也不静默丢内容；
+  遇到这种报错请换用遵守 OpenAI 流式协议的端点（或点「重试」）。
 - **防误报**：`HP < 5`、`a < b`、`<5>` 这类不良好的尖括号按普通文本处理；白名单之外的
   标签名（`<name>`、`<color>`）不算标签；`&lt;` 会先还原成字面 `<` 再比较，
   模型把 `<` 转义回去也不会误判——代价是这种转义写法会被原样写回，
   游戏里显示成字面 `&lt;`（这条防线拦的是结构丢失，不是转义风格）。
+  标签的**属性值**是玩家可见文本（`Tooltip` 之类），允许翻译；**属性名**是结构，
+  必须逐字保留（写回时模型输出的标签会被原样写进 PAK，原文标签不会被恢复）。
 - 系列变体（只差后缀的一组文本，例如 `Silver's Hair` / `Silver's Hair 9b`，
   基础部分只翻一次再拼后缀）是在**合成后的完整译文**上逐成员校验的，
   所以拆到后缀里的占位符同样不会漏。
@@ -128,7 +136,11 @@ crates/bg3-translate-core/     # 纯逻辑核心，零 GUI 依赖
 src-tauri/                     # Tauri 薄壳：命令层 + 事件桥 + 插件注册
 src/                           # React 前端
 docs/ARCHITECTURE.md           # 架构说明与冻结的 IPC 契约
-docs/VERIFICATION.md           # 一次独立验证的完整记录（含已知限制与无法验证项）
+docs/VERIFICATION.md           # 第一轮独立验证的完整记录（含已知限制与无法验证项）
+docs/VERIFICATION-ROUND2.md    # 第二轮独立验证：对第一轮修复的证伪记录
+docs/REVIEW-ROUND3.md          # 第三轮全面审查：结论摘要、修复清单、已知取舍
+docs/VERIFICATION-ROUND3.md    # 第三轮独立验证：逐条复核 + 变异测试
+docs/review-r3/                # 第三轮四位审计者的原始报告 + 独立红队基线发现
 scripts/check_ipc_contract.py  # 跨层契约检查（CI meta job 调用）
 scripts/verify.sh              # 一键跑完全部门禁（CI 的 core / web job 也走它）
 ```
@@ -172,9 +184,16 @@ bun run test
 bun run build
 ```
 
-Tauri 壳（`src-tauri`）依赖 webkit2gtk / gtk / dbus，多数开发机上编不了，
-所以 **不在** `verify.sh` 里：它的 `cargo check` / `clippy` 固定由 CI 的
-Windows `tauri-shell` job 负责。
+Tauri 壳（`src-tauri`）依赖 webkit2gtk / gtk / dbus：装好这些库的 Linux 与 Windows
+可以直接编译，没装的机器（含 ubuntu-latest 的 CI runner）编不了，所以 **不在**
+`verify.sh` 里——门禁得在所有开发机上都能过。它的 `cargo check` / `clippy` 固定由
+CI 的 Windows `tauri-shell` job 负责；本机装了 GUI 系统库时可以自己跑：
+
+```bash
+cargo check -p bg3-translate --all-targets
+cargo clippy -p bg3-translate --all-targets -- -D warnings
+cargo test -p bg3-translate --lib   # 命令层的路径校验等单元测试
+```
 
 ### 端到端测试
 
@@ -200,18 +219,23 @@ python3 scripts/check_ipc_contract.py
 ```
 
 只依赖 Python 标准库，几秒出结果，核对：前端 `invoke` 的命令 ⊆ 后端注册的命令、
-后端注册的命令 == `docs/ARCHITECTURE.md` 命令表，以及 `TranslationEvent` /
-`TranslationStatus` / `PakFileKind` 三组枚举的 serde 名称与前端联合类型一致。
-`src-tauri` 依赖 GUI 系统库、在很多机器上编不了，这个脚本就是补上的那道防线。
+后端注册的命令 == `docs/ARCHITECTURE.md` 命令表、**每条命令的参数名**在
+「后端形参 / 前端 `invoke` 字段 / 文档命令表」三处一致（命令名对了但参数名写错，
+运行期一样报错），`TranslationEvent` / `TranslationStatus` / `PakFileKind` 三组枚举的
+serde 名称与前端联合类型一致，以及版本号在 `package.json` / `tauri.conf.json` /
+`Cargo.toml` / `Cargo.lock` 四处一致（版本改了却忘了更新 lock，`--locked` 构建会失败）。
+装了 GUI 系统库时能真编 `src-tauri`，没装的机器上编不了——这个脚本就是补上的那道防线。
 
 ---
 
 ## CI / 发布
 
 - `.github/workflows/ci.yml`：4 个并行 job。
-  - `meta`：版本号三处一致（`package.json` / `Cargo.toml` / `tauri.conf.json`，
-    并断言两个 crate 都用 `version.workspace = true` 继承，不留第四处版本号）、
-    跨层 IPC 契约检查，以及「`scripts/verify.sh` 的六道门禁没被删改」的一致性断言
+  - `meta`：版本号一致（`package.json` / `Cargo.toml` / `tauri.conf.json`，
+    并断言两个 crate 都用 `version.workspace = true` 继承，不留第四处版本号；
+    `Cargo.lock` 由契约脚本一并核对）、
+    跨层 IPC 契约检查（命令名 + 参数名 + 枚举 + 版本号），以及
+    「`scripts/verify.sh` 的六道门禁没被删改」的一致性断言
     （`--list` 毫秒级、不需要工具链）。几秒出结果，不需要 cargo / bun。
   - `core` / `web`：直接调用 `scripts/verify.sh --core-only --no-ipc` /
     `--web-only --no-ipc`，所以 CI 和本地跑的是同一串命令，不会各写一份慢慢漂移。

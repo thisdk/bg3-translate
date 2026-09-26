@@ -35,6 +35,15 @@ export function useEntryLoading(): { loading: boolean } {
     toLoad.forEach((f) => loadedRef.current.add(f.name));
 
     let cancelled = false;
+    /**
+     * 本次 effect 里已经拿到结果的请求。
+     *
+     * cleanup 只能把「还没加载完」的文件放回待加载集合：已经加载完成的文件
+     * 若被放回去，之后每次新增勾选都会重读一遍全部文件 —— 既重复 IPC，
+     * 又会用磁盘内容整体替换 store 里的条目，把用户手工编辑过的译文和本轮
+     * 已翻译的结果悄悄丢掉。
+     */
+    const settled = new Set<string>();
     setLoading(true);
     setError(null);
     Promise.all(
@@ -48,6 +57,9 @@ export function useEntryLoading(): { loading: boolean } {
               setError(`${f.name}: ${String(e)}`);
               setFileEntries(f.name, []);
             }
+          })
+          .finally(() => {
+            settled.add(f.name);
           }),
       ),
     ).finally(() => {
@@ -57,7 +69,9 @@ export function useEntryLoading(): { loading: boolean } {
       cancelled = true;
       // 未完成的加载要把文件名从已加载集合里移除，
       // 否则 StrictMode 双调用 / 快速切换选中时会漏加载条目
-      toLoad.forEach((f) => loadedRef.current.delete(f.name));
+      toLoad.forEach((f) => {
+        if (!settled.has(f.name)) loadedRef.current.delete(f.name);
+      });
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workDir, selectedKey]);

@@ -105,11 +105,15 @@ pub fn entries_from_fields(fields: &[LsxField], file_name: &str) -> Vec<Translat
 /// 只处理「能解析出 contentuid 且有**可写回**译文」的条目（`error` 状态的条目
 /// 即使 target 非空也要退回原文，见 [`TranslationEntry::has_writable_target`]）；
 /// 找不到对应字段的条目会被记 warning 并跳过（而不是静默写错位置）。
+///
+/// 同一个区间只会被替换一次：`entries` 里出现重复 contentuid（前端重读/合并出
+/// 错时会发生）会产生两个完全相同的区间，逐个从后往前替换会让第二次用到**已经
+/// 失效**的偏移，把刚落盘的译文又切一刀。
 pub fn plan_replacements(
     fields: &[LsxField],
     entries: &[TranslationEntry],
 ) -> Vec<(Range<usize>, String)> {
-    let mut plan = Vec::new();
+    let mut plan: Vec<(Range<usize>, String)> = Vec::new();
     for entry in entries {
         if !entry.has_writable_target() {
             continue;
@@ -129,6 +133,10 @@ pub fn plan_replacements(
             );
             continue;
         };
+        if plan.iter().any(|(span, _)| *span == field.value_span) {
+            log::warn!("LSX 字段 {}#{} 被重复提交，只应用第一条", id, occurrence);
+            continue;
+        }
         plan.push((field.value_span.clone(), entry.target.clone()));
     }
     // 从后往前替换，避免前面的替换影响后面的区间
@@ -137,14 +145,24 @@ pub fn plan_replacements(
 }
 
 /// 按区间替换生成新字符串。
+///
+/// 区间必须互不重叠且从后往前（[`plan_replacements`] 的排序保证）；一旦发现
+/// 重叠就跳过——用失效偏移替换会把文件写坏，宁可少写一条也不能产出坏文件。
 pub fn apply_replacements(xml: &str, replacements: &[(Range<usize>, String)]) -> String {
     let mut out = xml.to_string();
+    // 已应用的替换里最靠左的起点：后面的替换必须整体落在它左边
+    let mut applied_start = out.len();
     for (span, value) in replacements {
         if span.start > span.end || span.end > out.len() {
             log::warn!("LSX 替换区间越界，已跳过: {span:?}");
             continue;
         }
+        if span.end > applied_start {
+            log::warn!("LSX 替换区间重叠，已跳过: {span:?}");
+            continue;
+        }
         out.replace_range(span.clone(), &escape_attribute(value));
+        applied_start = span.start;
     }
     out
 }
@@ -398,8 +416,13 @@ fn decode_entity(entity: &str) -> Option<String> {
 }
 
 /// 转义成可安全放进双引号属性值的形式。
+///
+/// XML 1.0 的 `Char` 产生式不接受控制字符（除 `\t`/`\n`/`\r`），而且**连字符
+/// 引用都不允许**（`&#1;` 同样非法），所以只能丢弃：留着它们会让整个 `.lsx`
+/// 变成非法文件，游戏侧解析直接失败，丢的是整份元数据。
 pub fn escape_attribute(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 8);
+    let mut dropped = 0usize;
     for ch in value.chars() {
         match ch {
             '&' => out.push_str("&amp;"),
@@ -410,10 +433,22 @@ pub fn escape_attribute(value: &str) -> String {
             '\r' => out.push_str("&#13;"),
             '\n' => out.push_str("&#10;"),
             '\t' => out.push_str("&#9;"),
+            _ if is_illegal_xml_char(ch) => dropped += 1,
             _ => out.push(ch),
         }
     }
+    if dropped > 0 {
+        log::warn!("属性值含 {dropped} 个 XML 非法控制字符，已丢弃以免产出非法 XML");
+    }
     out
+}
+
+/// XML 1.0 的 `Char` 产生式不允许的字符。
+fn is_illegal_xml_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0}'..='\u{8}' | '\u{B}' | '\u{C}' | '\u{E}'..='\u{1F}' | '\u{FFFE}' | '\u{FFFF}'
+    )
 }
 
 fn decode_utf8(bytes: &[u8]) -> Result<String> {
@@ -683,5 +718,81 @@ mod tests {
         assert!(out.contains(r#"value="第一行&#10;第二行""#));
         // 再读回来必须一致
         assert_eq!(scan_translatable(&out)[0].value, "第一行\n第二行");
+    }
+
+    /// 同一 contentuid 出现两次时，两个替换区间完全相同：从后往前替换会导致
+    /// 第二次用的是**已经失效**的区间，把刚落盘的译文又切一刀。
+    ///
+    /// 复现（修复前）：`value="old"` 写两个译文 → `value="新二一"`（串了）。
+    #[test]
+    fn duplicate_entries_are_applied_once_instead_of_corrupting_the_value() {
+        let xml = r#"<save><region id="x"><node id="n"><attribute id="Description" type="LSString" value="old" /></node></region></save>"#;
+        let fields = scan_translatable(xml);
+
+        let mut first = TranslationEntry::new("m.lsx", "Description#0", "1", "old");
+        first.mark_translated("新一");
+        let mut second = first.clone();
+        second.mark_translated("新二");
+
+        let plan = plan_replacements(&fields, std::slice::from_ref(&first));
+        assert_eq!(plan.len(), 1, "单条必须只有一个替换区间");
+
+        let out = apply_replacements(xml, &plan);
+        assert_eq!(scan_translatable(&out)[0].value, "新一");
+        assert!(!out.contains("新二一"));
+
+        // ② 同一条目被提交两次 → 仍然只能出现一个区间（否则第二次会用失效偏移）
+        let dup_plan = plan_replacements(&fields, &[first.clone(), second.clone()]);
+        assert_eq!(
+            dup_plan.len(),
+            1,
+            "重复 contentuid 必须只产生一个替换区间: {dup_plan:?}"
+        );
+        let out_dup = apply_replacements(xml, &dup_plan);
+        assert_eq!(first_value(&out_dup), "新一", "实际: {out_dup}");
+
+        // ③ 直接给一个含重复区间的计划，也必须只生效一次（纵深防御）
+        let doubled: Vec<_> = plan.iter().cloned().chain(plan.iter().cloned()).collect();
+        let out2 = apply_replacements(xml, &doubled);
+        assert_eq!(first_value(&out2), "新一", "实际: {out2}");
+
+        // ④ 重叠但不相等的区间同样要拒绝（防止用失效偏移把文件切坏）
+        let span = fields[0].value_span.clone();
+        let overlapping = vec![
+            (span.clone(), "甲".to_string()),
+            ((span.start + 1)..span.end, "乙".to_string()),
+        ];
+        let out3 = apply_replacements(xml, &overlapping);
+        assert_eq!(first_value(&out3), "甲", "实际: {out3}");
+    }
+
+    /// 取第一个可翻译字段的值（测试内部用）。
+    fn first_value(xml: &str) -> String {
+        scan_translatable(xml)
+            .first()
+            .map(|f| f.value.clone())
+            .unwrap_or_default()
+    }
+
+    /// XML 1.0 不允许控制字符：落进属性值就是整个 `.lsx` 变非法文件。
+    ///
+    /// 复现（修复前）：`escape_attribute("你好\u{1}世界")` 原样保留 0x01。
+    #[test]
+    fn illegal_control_characters_never_reach_the_attribute_value() {
+        let mut entry = TranslationEntry::new("m.lsx", "Description#0", "1", "old");
+        entry.mark_translated("你好\u{1}世界\u{7}");
+
+        let xml = r#"<save><node><attribute id="Description" type="LSString" value="old" /></node></save>"#;
+        let plan = plan_replacements(&scan_translatable(xml), &[entry]);
+        let out = apply_replacements(xml, &plan);
+
+        assert!(
+            !out.contains('\u{1}') && !out.contains('\u{7}'),
+            "非法控制字符必须被丢弃: {out:?}"
+        );
+        assert_eq!(scan_translatable(&out)[0].value, "你好世界");
+        // 合法的换行/制表符仍按字符引用写出（不能变成裸控制字符）
+        assert_eq!(escape_attribute("a\nb"), "a&#10;b");
+        assert_eq!(escape_attribute("a\tb"), "a&#9;b");
     }
 }

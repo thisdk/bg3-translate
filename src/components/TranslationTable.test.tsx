@@ -204,6 +204,28 @@ describe("TranslationTable 虚拟滚动", () => {
 
     expect(container.textContent).toContain("显示 1/20000 条（已筛选）");
   });
+
+  it("过滤后虚拟列表的行与条目一一对应（index 不错位）", async () => {
+    await render();
+
+    const errorChip = [...container.querySelectorAll("button")].find((btn) =>
+      btn.textContent?.startsWith("出错"),
+    );
+    await act(async () => {
+      errorChip!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    // fixture 的状态按下标轮转：只有 i % 4 === 3 是 error，即 e-3 / e-7 / e-11…
+    const rows = [...container.querySelectorAll<HTMLElement>("[data-index]")];
+    expect(rows.length).toBeGreaterThan(0);
+    rows.forEach((row, position) => {
+      const expectedIndex = 4 * position + 3;
+      expect(row.textContent).toContain(`Entry number ${expectedIndex}`);
+      expect(row.textContent).toContain(`uid-${expectedIndex}`);
+    });
+    // 第一行是 e-3 而不是原始数组的第 0 条
+    expect(rows[0].textContent).toContain("Entry number 3");
+  });
 });
 
 describe("TranslationTable 空状态", () => {

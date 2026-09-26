@@ -27,8 +27,11 @@
 #   * 不新增任何依赖：只用 python3（标准库）、cargo（rustfmt/clippy 组件）、bun。
 #   * 不改动受版本控制的文件：dist/、target/、*.tsbuildinfo 都是 .gitignore 里的构建产物。
 #   * 为什么没有 src-tauri：Tauri 壳依赖 webkit2gtk/gtk/dbus 等 GUI 系统库，
-#     在多数开发机与 ubuntu CI 上都编不了，它的 check/clippy 固定在 CI 的
-#     Windows tauri-shell job 里跑（见 .github/workflows/ci.yml）。
+#     在没装这些库的开发机与 ubuntu CI 上都编不了（装了 webkit2gtk 的 Linux
+#     机器可以真跑 cargo check/clippy -p bg3-translate --all-targets，但门禁
+#     不能要求每台机器都有 GUI 系统库）。它的 check/clippy 固定在 CI 的
+#     Windows tauri-shell job 里跑（见 .github/workflows/ci.yml）；命令层
+#     自己的单元测试用 cargo test -p bg3-translate --lib 单跑。
 #   * 在 GitHub Actions 里会自动用 ::group:: 折叠每个阶段、失败时打 ::error:: 注解。
 # =============================================================================
 

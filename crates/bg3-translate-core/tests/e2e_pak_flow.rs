@@ -514,3 +514,88 @@ fn error_entries_never_reach_the_packed_pak() {
     assert!(reparsed[2].source.contains("冰风暴"));
     assert_eq!(reparsed[3].source, "末日之剑");
 }
+
+/// 端到端：MOD 自带的中文文件里「英文原文没有」的条目，绝不能因为写回而消失。
+///
+/// 复现（修复前）：`Localization/Chinese/extra.xml` 已存在于 PAK 中，含一个英文
+/// 文件里没有的 contentuid；前端按「英文优先」只提交英文那份条目 → 写回按条目
+/// 列表重建整个 XML，多出来的那条被永久删掉，游戏里对应文本变成原始句柄。
+#[test]
+fn existing_target_entries_survive_a_subset_write_back_and_repack() {
+    const EN_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<contentList>
+  <content contentuid="h11111111g2222u3333i4444" version="1">Hello, adventurer.</content>
+</contentList>"#;
+    const ZH_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<contentList>
+  <content contentuid="h11111111g2222u3333i4444" version="1">你好，冒险者。</content>
+  <content contentuid="h99999999g0000u1111i2222" version="5">模组作者自己加的中文条目</content>
+</contentList>"#;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("src");
+    fs::create_dir_all(source.join("Localization/English")).unwrap();
+    fs::create_dir_all(source.join("Localization/Chinese")).unwrap();
+    fs::write(source.join("Localization/English/extra.xml"), EN_XML).unwrap();
+    fs::write(source.join("Localization/Chinese/extra.xml"), ZH_XML).unwrap();
+
+    let input_pak = tmp.path().join("M.pak");
+    pack(&source, &input_pak, 0);
+
+    let work_root = tmp.path().join("work");
+    fs::create_dir_all(&work_root).unwrap();
+    let (work_dir, _) = pak::open_and_extract_in(input_pak.to_str().unwrap(), &work_root).unwrap();
+
+    // 只读英文那份，翻译后写回中文路径（与前端「英文优先」的策略一致）
+    let entries = formats::read_entries(
+        work_dir.to_str().unwrap(),
+        "Localization/English/extra.xml",
+        PakFileKind::LocalizationXml,
+    )
+    .unwrap();
+    assert_eq!(entries.len(), 1, "英文文件只有 1 条");
+    let translated: Vec<TranslationEntry> = entries
+        .into_iter()
+        .map(|mut entry| {
+            entry.mark_translated("【译】Hello, adventurer.");
+            entry
+        })
+        .collect();
+
+    formats::write_entries(
+        work_dir.to_str().unwrap(),
+        "Localization/Chinese/extra.xml",
+        PakFileKind::LocalizationXml,
+        &translated,
+    )
+    .unwrap();
+
+    let written =
+        fs::read_to_string(work_dir.join("unpacked/Localization/Chinese/extra.xml")).unwrap();
+    assert!(written.contains("【译】Hello, adventurer."), "{written}");
+    assert!(
+        written.contains("h99999999g0000u1111i2222"),
+        "只属于中文文件的条目被删掉了: {written}"
+    );
+
+    // 打包 → 重新解包，条目仍然在，且 XML 依然合法
+    let output_pak = tmp.path().join("M_zh.pak");
+    pak::repack(work_dir.to_str().unwrap(), output_pak.to_str().unwrap()).unwrap();
+    let verify_root = tmp.path().join("verify");
+    fs::create_dir_all(&verify_root).unwrap();
+    let (verify_dir, _) =
+        pak::open_and_extract_in(output_pak.to_str().unwrap(), &verify_root).unwrap();
+
+    let reparsed = formats::read_entries(
+        verify_dir.to_str().unwrap(),
+        "Localization/Chinese/extra.xml",
+        PakFileKind::LocalizationXml,
+    )
+    .unwrap();
+    assert_eq!(reparsed.len(), 2, "重打包后条目数必须还是 2: {reparsed:#?}");
+    assert_eq!(reparsed[0].source, "【译】Hello, adventurer.");
+    assert_eq!(reparsed[0].contentuid, "h11111111g2222u3333i4444");
+    assert_eq!(reparsed[1].contentuid, "h99999999g0000u1111i2222");
+    assert_eq!(reparsed[1].version, "5");
+    assert_eq!(reparsed[1].source, "模组作者自己加的中文条目");
+}

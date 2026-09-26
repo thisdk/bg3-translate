@@ -73,6 +73,31 @@ export function shortSourcePath(fileName: string): string {
   return parts.slice(-2).join("/");
 }
 
+/**
+ * 是否有「可以写回 PAK」的译文。
+ *
+ * 后端 `TranslationEntry::has_writable_target()` 的前端镜像：`target` 非空
+ * **且** 状态不是 `error`（error 条目一律退回原文）。写回链路的每个判断都
+ * 必须复用这一个定义，别再各写各的。
+ */
+export function hasWritableTarget(entry: TranslationEntry): boolean {
+  return entry.target.trim() !== "" && entry.status !== "error";
+}
+
+/**
+ * 写回前的最后一道闸门：把「还没有权威结果」的条目降级为待翻译。
+ *
+ * 为什么必须在这里做：后端写回时只在 `status === "error"` 时退回原文
+ * （`TranslationEntry::has_writable_target()`），**`status === "translating"`
+ * 的非空 target 会被当成真译文写进 PAK**。取消 / 收尾回滚与迟到事件过滤
+ * 已经在 `useTranslationRun` 里把关，这里是纵深防御：任何原因残留下来的
+ * `translating` 条目都不允许把半截文本带进写回请求（退回原文比写坏 MOD 好）。
+ */
+export function toWritableEntry(entry: TranslationEntry): TranslationEntry {
+  if (entry.status !== "translating") return entry;
+  return { ...entry, target: "", status: "pending", error: null };
+}
+
 /** 过滤 + 搜索（纯函数，供表格与单测使用） */
 export function filterEntries(
   entries: TranslationEntry[],

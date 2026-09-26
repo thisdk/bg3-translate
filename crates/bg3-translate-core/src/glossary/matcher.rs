@@ -168,9 +168,29 @@ fn needle_for(case_sensitive: bool, source: &str) -> String {
     }
 }
 
-/// 编译 `\b...\b` 词边界正则；失败时返回 `None`。
+/// 编译词边界正则；失败时返回 `None`。
+///
+/// `\b` 只在**紧邻 `\w` 的那一侧**成立。旧实现一律写成 `\b{needle}\b`：
+/// 术语首尾是标点时（`+1 Sword`、`{1} damage`），对应那一侧的 `\b` 两侧都是
+/// 非单词字符，正则永远不成立 —— 预筛明明命中了，边界校验却把整条术语丢掉，
+/// 用户看到的是「这条术语怎么都不生效」。
 fn compile_boundary(needle: &str) -> Option<Regex> {
-    Regex::new(&format!(r"\b{}\b", regex::escape(needle))).ok()
+    let left = if needle.chars().next().is_some_and(is_word_char) {
+        r"\b"
+    } else {
+        ""
+    };
+    let right = if needle.chars().next_back().is_some_and(is_word_char) {
+        r"\b"
+    } else {
+        ""
+    };
+    Regex::new(&format!("{left}{}{right}", regex::escape(needle))).ok()
+}
+
+/// 与 regex 的 `\w` 对齐（Unicode 感知：字母 / 数字 / 下划线）。
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 /// 词边界校验。
@@ -254,6 +274,29 @@ mod tests {
         assert_eq!(sources("A cantrip!", &glossary), vec!["Cantrip"]);
         // 标点/空白都算边界
         assert_eq!(sources("(Cantrip)", &glossary), vec!["Cantrip"]);
+    }
+
+    /// 术语首尾是标点时，`\b` 会**永远**匹配不上：整条术语静默失效。
+    ///
+    /// `\b` 的含义是「一侧是 `\w`、另一侧不是」。`{1} damage` 的开头是 `{`、
+    /// `+1 Sword` 的开头是 `+`，它们与前面的空格之间都不是词边界，于是
+    /// `\b\{1\} damage\b` 在任何正常句子里都不成立——预筛命中了也会被边界
+    /// 校验丢掉。术语表里这类条目（`+1`、`{1}` 开头的句式模板）真实存在。
+    #[test]
+    fn whole_word_terms_with_punctuation_edges_still_match() {
+        let glossary = glossary_of(&[("+1 Sword", "＋1 长剑"), ("{1} damage", "伤害")]);
+        let found = sources("Deal {1} damage with a +1 Sword", &glossary);
+        assert_eq!(found, vec!["{1} damage", "+1 Sword"]);
+    }
+
+    /// 反过来：标点结尾的术语也不能因此变成「任意后缀都算命中」。
+    #[test]
+    fn punctuation_edged_terms_still_respect_the_word_side() {
+        // 结尾是标点 → 右侧不加 `\b`；但左侧仍是词首，`Sword+` 不应在
+        // `Swords+` 里命中（左边界靠 `\b` 保住）
+        let glossary = glossary_of(&[("Sword+", "剑+")]);
+        assert_eq!(sources("a Sword+ here", &glossary), vec!["Sword+"]);
+        assert!(sources("Swords+ here", &glossary).is_empty());
     }
 
     #[test]
@@ -424,6 +467,19 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(2),
             "真实术语表 200 次匹配耗时过长: {elapsed:?}"
+        );
+    }
+
+    /// 真实术语表回归：`'Brake' Lever` 这类「首字符是引号」的条目
+    /// 过去因为 `\b` 永远命中不了（19,524 条可用术语里有 266 条属于这一类）。
+    #[test]
+    fn real_glossary_punctuation_edged_terms_now_match() {
+        let matcher = GlossaryMatcher::new(&real_glossary());
+        let matches = matcher.find_matches("Pull the 'Brake' Lever now");
+        let sources: Vec<&str> = matches.iter().map(|m| m.source.as_str()).collect();
+        assert!(
+            sources.contains(&"'Brake' Lever"),
+            "真实条目必须能命中，实际: {sources:?}"
         );
     }
 

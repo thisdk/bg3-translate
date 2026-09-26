@@ -12,8 +12,16 @@
 //!   标签属性值里的占位符同样参与比对：属性值可以改写，但 `{1}` 不能丢。
 //! - 标签：`<LSTag ...>`、`</LSTag>`、`<br/>` 的**标签名序列**必须一致
 //!   （开 / 闭 / 空元素三种形态分开算，`<br>` 这类空元素不要求闭合）；
-//!   属性值、标签之间的正文不参与比较。非空元素的 `<x/>` 与 `<x></x>` 视为
+//!   开始标签的**属性名多重集也必须一致**（顺序不计、大小写敏感），
+//!   属性值与标签之间的正文不参与比较。非空元素的 `<x/>` 与 `<x></x>` 视为
 //!   同一签名（XML 语义等价），代价是「空标签」与「包住文本的标签对」也分不出来。
+//!
+//! 为什么属性名要参与比较：写回链路（`formats::content_list` 的 `render` →
+//! `write_text_fragment`）拿到的是 `entry.effective_text()`，也就是**模型输出的
+//! 那段文本**，标签会被逐字节写进 PAK，原文的标签写法**不会**被恢复。于是
+//! `<LSTag Type="Spell">` 一旦被模型写成 `<LSTag 类型="Spell">` 或 `<LSTag>`，
+//! 产物仍然是合法 XML、配对检查也过得去，但游戏侧已经读不到这个属性了。
+//! 属性值不同：它是玩家能看到的自然语言（Tooltip 之类），必须允许翻译。
 //!
 //! ## 明确不抓什么（防误报）
 //!
@@ -21,9 +29,10 @@
 //! - 不在写回白名单里的标签名一律当普通文本（`<name>`、`<color>`）：
 //!   `content_list::write_text_fragment` 只把白名单标签写成真标签，其余会转义，
 //!   所以它们本来就没有「必须配对」的义务；
+//! - 属性解析不出来（引号不闭合等）时整段当普通文本，不做半吊子比较；
 //! - `&lt;` / `&gt;` 先还原成字面尖括号再比较：解析层已经把 `&lt;` 还原过一次，
 //!   模型若把译文里的 `<` 重新转义回去，不算结构变化；
-//! - 属性值变化、标签内文本被翻译、正文整体改写都不报；唯一会报的「非缺失」
+//! - **属性值**变化、标签内文本被翻译、正文整体改写都不报；唯一会报的「非缺失」
 //!   情形是标签的出现顺序 / 嵌套结构与原文不同。
 //!
 //! 原则：**宁可漏报，不可误报** —— 误报会把本来正确的译文判失败，代价比偶尔
@@ -227,6 +236,9 @@ impl Signature {
 /// 只做这一步：`<br/>` 这类空元素（[`VOID_TAGS`]）保持原样，因为写回层也不要求
 /// 它闭合。没有这一步，`<i/>` 与 `<i></i>` 这对等价写法会互相判失败，
 /// 把本来正确的译文判成 `error`（F-03）。
+///
+/// token 里可能带属性名（`<LSTag Tooltip Type/>`），所以标签名要单独取出来：
+/// 判断空元素看名字，展开出来的闭合标签不能带属性。
 fn normalize_self_closing(tags: Vec<String>) -> Vec<String> {
     let mut out = Vec::with_capacity(tags.len());
     for tag in tags {
@@ -234,11 +246,16 @@ fn normalize_self_closing(tags: Vec<String>) -> Vec<String> {
             .strip_prefix('<')
             .and_then(|rest| rest.strip_suffix("/>"))
         {
-            Some(name) if !VOID_TAGS.contains(&name) => {
-                out.push(format!("<{name}>"));
-                out.push(format!("</{name}>"));
+            Some(inner) => {
+                let name = inner.split_whitespace().next().unwrap_or("");
+                if VOID_TAGS.contains(&name) {
+                    out.push(tag);
+                } else {
+                    out.push(format!("<{inner}>"));
+                    out.push(format!("</{name}>"));
+                }
             }
-            _ => out.push(tag),
+            None => out.push(tag),
         }
     }
     out
@@ -278,19 +295,40 @@ fn scan_tags(text: &str) -> Vec<String> {
 /// 尝试把 `text[start..]` 开头的 `<...>` 解析成标签；失败返回 `None`。
 fn parse_tag(text: &str, start: usize) -> Option<(String, usize)> {
     let after = text[start..].strip_prefix('<')?;
-    let gt = after.find('>')?;
-    let tag = &text[start..start + 1 + gt + 1];
+    let gt = find_tag_end(after)?;
+    let end = start + 1 + gt + 1;
+    let tag = &text[start..end];
     let inner = &after[..gt];
-    // `<` 之后又出现 `<`：`a <b <c>` 不是标签
-    if inner.contains('<') {
-        return None;
-    }
     // 严格形态检查在前，白名单在后：`< 5`、`<5>`、`<name>` 都要被挡掉
     let token = render_tag(inner)?;
     if !is_allowed_inline_tag(tag) {
         return None;
     }
-    Some((token, start + 1 + gt + 1))
+    Some((token, end))
+}
+
+/// 找到标签结束的 `>`，返回它相对 `<` 之后文本的偏移。
+///
+/// 属性值里的 `>` 不是标签结束（`<LSTag Tooltip="a > b">` 是合法 XML）；
+/// 引号不闭合、或 `<` 之后又出现 `<`（`a <b <c>`）都不算标签。
+fn find_tag_end(after_lt: &str) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    for (index, ch) in after_lt.char_indices() {
+        match quote {
+            Some(open) => {
+                if ch == open {
+                    quote = None;
+                }
+            }
+            None => match ch {
+                '"' | '\'' => quote = Some(ch),
+                '>' => return Some(index),
+                '<' => return None,
+                _ => {}
+            },
+        }
+    }
+    None
 }
 
 /// 标签名必须是 ASCII 字母开头、只含字母数字；返回名字与其后的剩余部分。
@@ -310,7 +348,11 @@ fn tag_name(body: &str) -> Option<(&str, &str)> {
     Some((&body[..end], &body[end..]))
 }
 
-/// 把标签正文渲染成稳定的 token：`<LSTag>` / `</LSTag>` / `<br/>`。
+/// 把标签正文渲染成稳定的结构 token：`<LSTag>` / `</LSTag>` / `<br/>`。
+///
+/// 开始标签的 token **带属性名**（排序后、空格分隔），属性值一律丢掉：
+/// 属性值是玩家可见文本，允许被翻译；属性名是结构，写回时会被原样写进 PAK，
+/// 所以必须逐个对上（顺序不计 —— 排序后再拼接）。
 fn render_tag(inner: &str) -> Option<String> {
     if let Some(body) = inner.strip_prefix('/') {
         // 结束标签：名字之后只允许空白
@@ -322,17 +364,66 @@ fn render_tag(inner: &str) -> Option<String> {
     }
     // 开始标签：`<` 之后必须紧跟字母，所以 `< 5` / `a < b > c` 到不了这里
     let (name, rest) = tag_name(inner)?;
-    let tail = rest.trim_end();
-    if tail.ends_with('/') {
-        return Some(format!("<{name}/>"));
+    let (mut attrs, self_closing) = scan_attributes(rest)?;
+    attrs.sort();
+    let head = if attrs.is_empty() {
+        format!("<{name}")
+    } else {
+        format!("<{name} {}", attrs.join(" "))
+    };
+    if self_closing || VOID_TAGS.contains(&name) {
+        Some(format!("{head}/>"))
+    } else {
+        Some(format!("{head}>"))
     }
-    if tail.is_empty() || tail.starts_with(char::is_whitespace) {
-        if VOID_TAGS.contains(&name) {
-            return Some(format!("<{name}/>"));
+}
+
+/// 解析开始标签里「标签名之后」的部分，返回（属性名，是否自闭合）。
+///
+/// 语法不合法就返回 `None`：调用方会把整段当普通文本，不做半吊子比较
+/// （宁可漏报，不可误报 —— 半解析出来的属性名集合会让正确译文互相判失败）。
+fn scan_attributes(rest: &str) -> Option<(Vec<String>, bool)> {
+    let mut names = Vec::new();
+    let mut cursor = rest;
+    loop {
+        let trimmed = cursor.trim_start();
+        if trimmed.is_empty() {
+            return Some((names, false));
         }
-        return Some(format!("<{name}>"));
+        if let Some(after_slash) = trimmed.strip_prefix('/') {
+            // 自闭合：`/` 之后只允许空白
+            return after_slash.trim().is_empty().then_some((names, true));
+        }
+        let name_end = trimmed
+            .find(|c: char| c.is_whitespace() || c == '=' || c == '/' || c == '"' || c == '\'')
+            .unwrap_or(trimmed.len());
+        if name_end == 0 {
+            // `"` / `=` / `/` 打头：不是合法属性名
+            return None;
+        }
+        names.push(trimmed[..name_end].to_string());
+        let after_name = trimmed[name_end..].trim_start();
+        let Some(after_eq) = after_name.strip_prefix('=') else {
+            // 没有 `=`：宽松接受（XML 要求属性有值，但这里不为难模型）
+            cursor = after_name;
+            continue;
+        };
+        let value = after_eq.trim_start();
+        match value.chars().next() {
+            Some(quote @ ('"' | '\'')) => {
+                // 引号里的内容整体跳过：空格、`/`、`=` 都只是值的一部分
+                let body = &value[quote.len_utf8()..];
+                let close = body.find(quote)?;
+                cursor = &body[close + quote.len_utf8()..];
+            }
+            Some(_) => {
+                let end = value.find(char::is_whitespace).unwrap_or(value.len());
+                cursor = &value[end..];
+            }
+            // `name=` 后面什么都没有
+            None => return None,
+        }
     }
-    None
 }
 
 /// 扫描占位符，返回 `{1}` 这类 token 序列（含重复）。
@@ -547,16 +638,86 @@ mod tests {
         ));
     }
 
+    /// 属性**值**是玩家可见的自然语言，允许改写；属性**名**是结构，必须逐字保留。
+    ///
+    /// 写回链路（`content_list::render` → `write_text_fragment`）会把模型输出的
+    /// 标签文本原样写进 PAK，**不会**恢复原文的属性 —— 所以属性名一旦被模型
+    /// 改坏或删掉，产物里的标签对游戏就失效了，必须在这里拦住。
     #[test]
-    fn attribute_changes_are_ignored() {
-        // 属性值不参与比较：模型改了属性值不该判失败（写回时属性原样保留）
+    fn attribute_values_are_free_but_names_must_match() {
+        // 值被翻译 / 改写：保真
         assert!(is_faithful(
             r#"<LSTag Type="Spell" Tooltip="Fireball">Fireball</LSTag>"#,
             r#"<LSTag Type="法术" Tooltip="火球术">火球术</LSTag>"#
         ));
         assert!(is_faithful(
-            "<font color=\"red\">红</font>",
+            r#"<font color="red">红</font>"#,
+            r#"<font color="深红">红字</font>"#
+        ));
+        // 属性被整段删掉：不保真
+        assert!(!is_faithful(
+            r#"<font color="red">红</font>"#,
             "<font>红字</font>"
+        ));
+        assert_eq!(
+            check_fidelity(
+                r#"<LSTag Type="Spell">Fireball</LSTag>"#,
+                r#"<LSTag>火球术</LSTag>"#
+            ),
+            vec![
+                FidelityIssue::MissingTag {
+                    tag: "<LSTag Type>".into(),
+                    count: 1
+                },
+                FidelityIssue::ExtraTag {
+                    tag: "<LSTag>".into(),
+                    count: 1
+                },
+            ]
+        );
+    }
+
+    /// 属性名是结构签名的一部分：改名、大小写、增删都要报（顺序不算）。
+    #[test]
+    fn attribute_names_are_part_of_the_signature() {
+        let source = r#"<LSTag Type="Spell" Tooltip="Deals {1} damage">Fireball</LSTag>"#;
+
+        // 属性名被翻译（模型把标记也翻了）
+        assert!(!is_faithful(source, &source.replace("Type=", "类型=")));
+        // 属性名拼错
+        assert!(!is_faithful(source, &source.replace("Type=", "Typ=")));
+        // 属性名大小写变化：XML 属性名大小写敏感，游戏不认
+        assert!(!is_faithful(source, &source.replace("Type=", "type=")));
+        // 少一个属性
+        assert!(!is_faithful(
+            source,
+            &source.replace(r#"Type="Spell" "#, "")
+        ));
+        // 多一个属性
+        assert!(!is_faithful(
+            source,
+            &source.replace(r#"Tooltip="#, r#"Extra="x" Tooltip="#)
+        ));
+
+        // 属性顺序调换：不参与比较 → 保真
+        assert!(is_faithful(
+            r#"<LSTag Type="Spell" Tooltip="Fireball">Fireball</LSTag>"#,
+            r#"<LSTag Tooltip="火球术" Type="法术">火球术</LSTag>"#
+        ));
+        // 多余空白 / 单引号 / 值里含空格与比较符号：保真
+        assert!(is_faithful(
+            r#"<LSTag Type="Spell" Tooltip="Fireball">Fireball</LSTag>"#,
+            "<LSTag   Type='Spell'\tTooltip='火球术' >火球术</LSTag>"
+        ));
+        // 属性值里带 `>` / `/` 也不能让扫描错位（合法 XML，属性值内的 `>` 不是标签结束）
+        assert!(is_faithful(
+            r#"<LSTag Tooltip="Deals > 10 / hit">Fireball</LSTag>"#,
+            r#"<LSTag Tooltip="造成 > 10 / 次伤害">火球术</LSTag>"#
+        ));
+        // 自闭合写法：属性名一致就保真
+        assert!(is_faithful(
+            r#"<LSTag Type="Spell"/>"#,
+            r#"<LSTag Type='Spell' />"#
         ));
     }
 
@@ -627,6 +788,12 @@ mod tests {
         // 代价（刻意的盲点）：一旦承认 `<x/>` 与 `<x></x>` 等价，就再也分不出
         // 「空标签」和「包住文本的标签对」——正文位置本来就不参与结构比对。
         assert!(is_faithful(
+            r#"<LSTag Type="Spell"/>"#,
+            r#"<LSTag Type="Spell">火球</LSTag>"#
+        ));
+        // 但属性名丢了仍然要报：写回写的是模型输出的这段标签文本，
+        // `<LSTag>` 落进 PAK 之后游戏就读不到 `Type` 了。
+        assert!(!is_faithful(
             r#"<LSTag Type="Spell"/>"#,
             r#"<LSTag>火球</LSTag>"#
         ));
@@ -750,6 +917,42 @@ mod tests {
         assert!(summary.ends_with("等 5 项"), "实际: {summary}");
         assert_eq!(summary.matches('；').count(), 3, "最多列 3 条");
         assert!(correction_hint(&issues).contains("等 5 项结构问题"));
+    }
+
+    /// 端到端证据：被模型改坏的标签属性名会**真的进 PAK**。
+    ///
+    /// 这条不是重复上面那条单测 —— 它盯的是「为什么必须在这里拦」：
+    /// `content_list::render` 拿 `entry.effective_text()`（= 模型输出）里的标签
+    /// 逐字节写出去，原文的属性不会被恢复。所以校验漏掉属性名 = 坏标签静默落盘。
+    #[test]
+    fn mangled_attribute_names_reach_the_written_file_when_not_caught() {
+        use crate::formats::content_list::render;
+        use crate::types::TranslationEntry;
+
+        let source = r#"<LSTag Type="Spell">Fireball</LSTag>"#;
+        let mangled = r#"<LSTag 类型="Spell">火球术</LSTag>"#;
+        // 校验先拦下来（引擎会重试 / 标 error，error 条目不写回）
+        assert!(
+            !is_faithful(source, mangled),
+            "属性名被改坏必须判不保真，否则下面的坏标签会落盘"
+        );
+
+        let mut entry = TranslationEntry::new("L.xml", "h1", "1", source);
+        entry.mark_translated(mangled);
+        let out = render(&[entry], &[]).unwrap();
+        assert!(
+            out.contains(r#"<LSTag 类型="Spell">"#),
+            "写回确实会照抄模型输出：{out}"
+        );
+        // `error` 条目退回原文，所以「校验失败 → 前端置 error」之后盘上是安全的
+        let mut rejected = TranslationEntry::new("L.xml", "h1", "1", source);
+        rejected.mark_translated(mangled);
+        rejected.mark_error("结构校验未通过");
+        let out = render(&[rejected], &[]).unwrap();
+        assert!(
+            out.contains(r#"<LSTag Type="Spell">Fireball</LSTag>"#),
+            "被拒条目必须写回原文：{out}"
+        );
     }
 
     #[test]

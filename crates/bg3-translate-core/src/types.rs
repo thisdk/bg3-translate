@@ -397,7 +397,14 @@ impl LlmSettings {
         self.api_key = self.api_key.trim().to_string();
         self.model = self.model.trim().to_string();
         self.concurrency = self.concurrency.clamp(1, 64);
-        self.temperature = self.temperature.clamp(0.0, 2.0);
+        // NaN 与任何数比较都是 false，`clamp` 会把它原样放过去，最后序列化成
+        // `"temperature": null`（serde_json 对 NaN 的表示）—— 部分网关会直接 400。
+        // NaN 没有「更接近哪一端」可言，退回默认温度。
+        self.temperature = if self.temperature.is_nan() {
+            default_temperature()
+        } else {
+            self.temperature.clamp(0.0, 2.0)
+        };
         if self.base_url.is_empty() {
             self.base_url = default_base_url();
         }
@@ -418,18 +425,27 @@ impl LlmSettings {
     /// | `https://host/v1` | `https://host/v1/chat/completions` |
     /// | `https://host/openai/v1` | `https://host/openai/v1/chat/completions` |
     /// | `https://host/v1/chat/completions` | 原样使用 |
+    /// | `https://host/v1?api-version=1` | `https://host/v1/chat/completions?api-version=1` |
     ///
     /// 第二行是必须的：`https://api.deepseek.com/v1` 是最常见的填法之一，
     /// 直接拼 `/v1/chat/completions` 会得到 `/v1/v1/chat/completions` → 404。
     pub fn chat_completions_url(&self) -> String {
-        let base = self.base_url.trim().trim_end_matches('/');
-        if base.ends_with("/chat/completions") {
-            base.to_string()
-        } else if base.ends_with("/v1") {
-            format!("{base}/chat/completions")
+        let base = self.base_url.trim();
+        // query / fragment 只属于最终地址：`.../v1?api-version=1` 的路径部分是 `/v1`，
+        // 直接往后拼会得到 `?api-version=1/v1/chat/completions` 这种废地址。
+        let (path, suffix) = match base.find(['?', '#']) {
+            Some(index) => (&base[..index], &base[index..]),
+            None => (base, ""),
+        };
+        let path = path.trim_end_matches('/');
+        let url = if path.ends_with("/chat/completions") {
+            path.to_string()
+        } else if path.ends_with("/v1") {
+            format!("{path}/chat/completions")
         } else {
-            format!("{base}/v1/chat/completions")
-        }
+            format!("{path}/v1/chat/completions")
+        };
+        format!("{url}{suffix}")
     }
 
     /// 是否已配置到可以发起请求。
@@ -736,6 +752,84 @@ mod tests {
         assert_eq!(settings.model, "deepseek-chat");
         assert_eq!(settings.concurrency, 1);
         assert_eq!(settings.temperature, 2.0);
+    }
+
+    /// NaN 温度必须归一化掉：`clamp` 对 NaN 无效，会一路序列化成 `"temperature": null`。
+    #[test]
+    fn nan_temperature_falls_back_to_the_default() {
+        let settings = LlmSettings {
+            temperature: f32::NAN,
+            ..LlmSettings::default()
+        }
+        .normalized();
+        assert!(
+            settings.temperature.is_finite(),
+            "NaN 必须被归一化，实际: {}",
+            settings.temperature
+        );
+        assert_eq!(settings.temperature, 0.3);
+        // 序列化出来不能是 null（部分网关会因此 400）。
+        // 比字符串而不是 `to_value`：`to_value` 会把 f32 拓宽成 f64，
+        // 报出的是永远上不了线的 0.30000001192092896。
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains("\"temperature\":0.3"), "实际序列化: {json}");
+        assert!(!json.contains("\"temperature\":null"), "实际序列化: {json}");
+
+        // 其他非有限值仍然按 clamp 语义处理
+        assert_eq!(
+            LlmSettings {
+                temperature: f32::INFINITY,
+                ..LlmSettings::default()
+            }
+            .normalized()
+            .temperature,
+            2.0
+        );
+        assert_eq!(
+            LlmSettings {
+                temperature: f32::NEG_INFINITY,
+                ..LlmSettings::default()
+            }
+            .normalized()
+            .temperature,
+            0.0
+        );
+    }
+
+    /// 带 query 的 baseUrl（Azure / 自建网关常见）不能被拼成废地址。
+    #[test]
+    fn chat_completions_url_keeps_the_query_string_at_the_end() {
+        let url = |base: &str| {
+            LlmSettings {
+                base_url: base.into(),
+                ..LlmSettings::default()
+            }
+            .normalized()
+            .chat_completions_url()
+        };
+
+        assert_eq!(
+            url("https://gw.test/v1?api-version=2024-02-01"),
+            "https://gw.test/v1/chat/completions?api-version=2024-02-01"
+        );
+        assert_eq!(
+            url("https://gw.test/openai?x=1"),
+            "https://gw.test/openai/v1/chat/completions?x=1"
+        );
+        assert_eq!(
+            url("https://gw.test/v1/chat/completions?api-version=1"),
+            "https://gw.test/v1/chat/completions?api-version=1"
+        );
+        // 尾斜杠 + query 同时出现
+        assert_eq!(
+            url("https://gw.test/v1/?x=1"),
+            "https://gw.test/v1/chat/completions?x=1"
+        );
+        // 没有 query 的老行为逐字不变
+        assert_eq!(
+            url("https://api.deepseek.com"),
+            "https://api.deepseek.com/v1/chat/completions"
+        );
     }
 
     #[test]

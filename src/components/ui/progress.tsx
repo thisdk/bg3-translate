@@ -12,6 +12,11 @@ const Progress = React.forwardRef<HTMLDivElement, ProgressProps>(
     return (
       <div
         ref={ref}
+        // 无障碍：进度条必须带 role/aria-value*，否则屏幕阅读器读不出翻译进度
+        role="progressbar"
+        aria-valuemin={0}
+        aria-valuemax={max}
+        aria-valuenow={value}
         className={cn(
           "relative h-2 w-full overflow-hidden rounded-full bg-secondary",
           className,

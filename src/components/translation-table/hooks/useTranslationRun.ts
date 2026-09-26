@@ -65,6 +65,9 @@ export function useTranslationRun({
   const setEntryStatus = useAppStore((s) => s.setEntryStatus);
   const applyDeltas = useAppStore((s) => s.applyDeltas);
   const setError = useAppStore((s) => s.setError);
+  const beginRun = useAppStore((s) => s.beginRun);
+  const endRun = useAppStore((s) => s.endRun);
+  const getEntryById = useAppStore((s) => s.getEntryById);
 
   const [translating, setTranslating] = useState(false);
   const [cancelling, setCancelling] = useState(false);
@@ -80,6 +83,30 @@ export function useTranslationRun({
   /** 本轮已开始过尝试（收到过 progress(translating) 或 delta）的条目 */
   const attemptedIdsRef = useRef<Set<string>>(new Set());
   const runningRef = useRef(false);
+  /**
+   * 当前活跃的那一轮翻译的序号；`null` = 没有任何一轮在跑。
+   *
+   * 为什么需要它：`await translateEntries(...)` settle（后端命令返回）之后，
+   * IPC 通道里仍可能有消息迟到 —— 迟到的 delta 一旦被接受，就会把已经收尾
+   * 回滚、或者已经拿到权威译文的条目重新改写成 `translating` + 半截文本。
+   * 而 `translating` 的非空 target **是会被写进 PAK 的**（后端只在 `error`
+   * 状态退回原文，见 crates/bg3-translate-core/src/types.rs），所以这类幽灵
+   * 文本会直接污染用户的 MOD。
+   *
+   * 同一个序号还能挡住「上一轮的迟到 delta 落到下一轮」：旧回调发现
+   * `activeRunRef.current !== 自己那一轮` 时直接丢弃，不会去动新一轮的状态。
+   */
+  const activeRunRef = useRef<number | null>(null);
+  const runSeqRef = useRef(0);
+  /**
+   * 组件是否还挂在树上。
+   *
+   * 卸载（点「返回」回首页 / 打开新 MOD）后这一轮不该再触碰 store：条目 id 是
+   * `{PAK 内路径}#{contentuid}`，新 MOD 里同名文件的 id 与旧 MOD 完全相同，
+   * 迟到的 `progress` / 收尾回滚会命中新条目 —— 把刚翻好的译文改成
+   * `translating`（会被写回 PAK）甚至清空。
+   */
+  const aliveRef = useRef(true);
 
   const batcher = useMemo(
     () => createDeltaBatcher({ commit: (batch) => applyDeltas(batch) }),
@@ -89,11 +116,24 @@ export function useTranslationRun({
   // 卸载时把尚未提交的 delta 落地（组件已经不在，但 store 里的文本要完整）
   useEffect(() => () => batcher.dispose(), [batcher]);
 
+  // 卸载即本轮生命周期结束：停止接收事件、不再收尾回滚（StrictMode 会
+  // 先卸载再挂载，所以这里在挂载时复位 alive）
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => {
+      aliveRef.current = false;
+      activeRunRef.current = null;
+    };
+  }, []);
+
   /** 统一的一次翻译执行：事件回调 + 取消回滚 */
   const runTranslation = useCallback(
     async (request: TranslationEntry[]) => {
       if (!workDir || request.length === 0 || runningRef.current) return;
       runningRef.current = true;
+      const runId = runSeqRef.current + 1;
+      runSeqRef.current = runId;
+      activeRunRef.current = runId;
       cancelRequestedRef.current = false;
       completedIdsRef.current = new Set();
       settledIdsRef.current = new Set();
@@ -103,9 +143,14 @@ export function useTranslationRun({
       setCancelling(false);
       setRunSummary(null);
       setError(null);
+      // 写回闸门：翻译期间禁止打包（半截译文是 translating 状态，会被写进 PAK）
+      const runToken = beginRun();
 
       try {
         await translateEntries(workDir, request, styleHint.trim(), (event) => {
+          // 本轮已经收尾（命令返回）或已经换成新一轮：任何迟到消息一律丢弃，
+          // 否则会把已回滚/已完成的条目重新写成 translating + 半截文本
+          if (activeRunRef.current !== runId) return;
           if (cancelRequestedRef.current && event.type !== "all_done") return;
           switch (event.type) {
             case "progress": {
@@ -144,6 +189,9 @@ export function useTranslationRun({
             case "delta":
               // done / error 之后到达的 delta：条目已有权威文本，直接丢弃
               if (settledIdsRef.current.has(event.entryId)) break;
+              // 用户已手工保存译文：模型文本不得再追加（store 的 applyDeltas
+              // 也会再挡一次，这里提前拦住、避免白白进批处理）
+              if (getEntryById(event.entryId)?.status === "edited") break;
               attemptedIdsRef.current.add(event.entryId);
               inFlightIdsRef.current.add(event.entryId);
               batcher.push(event.entryId, event.text);
@@ -154,6 +202,8 @@ export function useTranslationRun({
               settledIdsRef.current.add(event.entryId);
               completedIdsRef.current.add(event.entryId);
               inFlightIdsRef.current.delete(event.entryId);
+              // 人工成果优先：用户已经保存过译文时，模型结果不得覆盖它
+              if (getEntryById(event.entryId)?.status === "edited") break;
               updateEntry(event.entryId, {
                 target: event.text,
                 status: "translated",
@@ -168,6 +218,9 @@ export function useTranslationRun({
               batcher.flush();
               settledIdsRef.current.add(event.entryId);
               inFlightIdsRef.current.delete(event.entryId);
+              // 人工成果优先：用户保存过的译文不能被标成 error
+              //（error 会让写回退回原文，等于丢掉人工译文）
+              if (getEntryById(event.entryId)?.status === "edited") break;
               updateEntry(event.entryId, {
                 status: "error",
                 error: event.message,
@@ -187,32 +240,43 @@ export function useTranslationRun({
         // 收尾：丢掉尚未提交的 delta（下面的回滚会把目标重置掉，
         // 若先落地再回滚只会白白多一次通知）
         batcher.discardAll();
-        if (cancelRequestedRef.current) {
-          // 取消：未完成的条目回滚为待翻译
+        if (!aliveRef.current) {
+          // 工作台已卸载：条目不再属于这一轮，回滚只会误伤新 MOD 里同 id 的
+          // 条目（取消回滚 / 未完成回滚都跳过）
+        } else if (cancelRequestedRef.current) {
+          // 取消：未完成的条目回滚为待翻译（人工保存过的译文除外）
           for (const entry of request) {
-            if (!completedIdsRef.current.has(entry.id)) {
-              updateEntry(entry.id, {
-                target: "",
-                status: "pending",
-                error: null,
-              });
-            }
+            if (completedIdsRef.current.has(entry.id)) continue;
+            if (getEntryById(entry.id)?.status === "edited") continue;
+            updateEntry(entry.id, {
+              target: "",
+              status: "pending",
+              error: null,
+            });
           }
         } else {
           // 正常结束：把「翻译中」但没收到 done/error 的条目回滚，避免计数卡住
           for (const id of inFlightIdsRef.current) {
+            if (getEntryById(id)?.status === "edited") continue;
             updateEntry(id, { target: "", status: "pending", error: null });
           }
         }
         inFlightIdsRef.current = new Set();
+        // 本轮到此为止：之后到达的任何事件都会被上面的 runId 校验丢弃
+        if (activeRunRef.current === runId) activeRunRef.current = null;
         runningRef.current = false;
         setTranslating(false);
         setCancelling(false);
+        // 收尾回滚已经完成，此时才允许写回（只有登记本轮 token 的那一轮能关闸门）
+        endRun(runToken);
         cancelRequestedRef.current = false;
       }
     },
     [
       batcher,
+      beginRun,
+      endRun,
+      getEntryById,
       setEntryStatus,
       setError,
       styleHint,

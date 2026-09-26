@@ -227,4 +227,31 @@ describe("FileDropZone 拖放与打开", () => {
 
     expect(tauri.openMod).toHaveBeenCalledWith("/tmp/mod.pak");
   });
+
+  it("文件对话框 reject 时给出错误提示，而不是未捕获的 Promise rejection", async () => {
+    // Tauri 对话框在某些环境下会 reject（IPC 不可用 / 权限问题）。直接用 async
+    // 函数当 onClick 会把 rejection 变成 unhandled rejection：用户看不到任何
+    // 反馈，测试运行器则会把它报成未处理错误。
+    tauri.pickModFile.mockRejectedValue(new Error("对话框不可用"));
+    await render();
+
+    await act(async () => {
+      click(findButton(mounted.container, "选择文件")!);
+    });
+    await waitMs(0);
+
+    expect(useAppStore.getState().error).toContain("对话框不可用");
+  });
+
+  it("仅解压时对话框 reject 也要有错误提示", async () => {
+    tauri.pickModFile.mockRejectedValue(new Error("对话框不可用"));
+    await render();
+
+    await act(async () => {
+      click(findButton(mounted.container, "仅解压")!);
+    });
+    await waitMs(0);
+
+    expect(useAppStore.getState().error).toContain("对话框不可用");
+  });
 });

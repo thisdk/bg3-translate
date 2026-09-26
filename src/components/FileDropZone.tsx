@@ -44,26 +44,34 @@ export function FileDropZone({ className }: { className?: string }) {
   );
 
   const onClickPick = useCallback(async () => {
-    const picked = await pickModFile();
-    if (picked) await handleOpen(picked);
-  }, [handleOpen]);
+    try {
+      const picked = await pickModFile();
+      if (picked) await handleOpen(picked);
+    } catch (e) {
+      // 对话框 reject（IPC/权限问题）不能变成未捕获的 Promise rejection：
+      // 用户看不到任何反馈，控制台只剩一条 unhandled rejection
+      setError(String(e));
+    }
+  }, [handleOpen, setError]);
 
   const onClickExtract = useCallback(async () => {
-    const picked = await pickModFile();
-    if (!picked) return;
-    const outputDir = await pickExtractDirectory();
-    if (!outputDir) return;
-
-    setExtracting(true);
-    setError(null);
-    setExtractResult(null);
     try {
-      const files = await extractMod(picked, outputDir);
-      setExtractResult({ dir: outputDir, count: files.length });
+      const picked = await pickModFile();
+      if (!picked) return;
+      const outputDir = await pickExtractDirectory();
+      if (!outputDir) return;
+
+      setExtracting(true);
+      setError(null);
+      setExtractResult(null);
+      try {
+        const files = await extractMod(picked, outputDir);
+        setExtractResult({ dir: outputDir, count: files.length });
+      } finally {
+        setExtracting(false);
+      }
     } catch (e) {
       setError(String(e));
-    } finally {
-      setExtracting(false);
     }
   }, [setError]);
 

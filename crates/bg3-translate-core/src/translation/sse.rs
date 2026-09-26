@@ -17,8 +17,19 @@
 
 use std::mem;
 
-use async_openai::types::chat::CreateChatCompletionStreamResponse;
+use async_openai::types::chat::{CreateChatCompletionStreamResponse, FinishReason};
 use serde::Deserialize;
+
+use crate::error::{AppError, Result};
+
+/// 单个 SSE 数据行的字节上限。
+///
+/// 服务端只要一直不发换行，解码器就会一直攒字节 —— 真实的 delta 分片都是几百
+/// 字节级，1 MiB 一行已经离谱；超过就报错让这次请求失败重试，**不静默截断**。
+const MAX_LINE_BYTES: usize = 1 << 20;
+
+/// 单个事件（多行 `data:` 拼接后）的字节上限。
+const MAX_EVENT_BYTES: usize = 4 << 20;
 
 /// 一条解析出来的 SSE 事件。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +67,31 @@ impl SseDecoder {
     /// 喂入一段字节，返回本次能解析出的所有事件。
     pub fn push(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
         self.buffer.extend_from_slice(chunk);
+        self.drain_lines()
+    }
+
+    /// 带内存保护的 [`Self::push`]：超限返回错误而不是继续攒内存。
+    ///
+    /// 公开的 [`Self::push`] 保持原语义（无上限、返回 `Vec`），生产路径走这个。
+    pub(crate) fn push_checked(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>> {
+        self.buffer.extend_from_slice(chunk);
+        if take_line(&self.buffer).is_none() && self.buffer.len() > MAX_LINE_BYTES {
+            return Err(AppError::Llm(format!(
+                "SSE 数据行已超过 {MAX_LINE_BYTES} 字节仍没有换行（服务端可能没有按 SSE 返回），已中止本次请求"
+            )));
+        }
+        let events = self.drain_lines();
+        let pending: usize = self.data_lines.iter().map(String::len).sum();
+        if pending > MAX_EVENT_BYTES {
+            return Err(AppError::Llm(format!(
+                "SSE 单个事件已超过 {MAX_EVENT_BYTES} 字节，已中止本次请求"
+            )));
+        }
+        Ok(events)
+    }
+
+    /// 把缓冲区里已经完整的行全部解析出来。
+    fn drain_lines(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
         while let Some((line, consumed)) = take_line(&self.buffer) {
             self.buffer.drain(..consumed);
@@ -81,6 +117,16 @@ impl SseDecoder {
             events.push(event);
         }
         events
+    }
+
+    /// 带内存保护的 [`Self::finish`]：残留的「没有换行的超长行」同样报错。
+    pub(crate) fn finish_checked(&mut self) -> Result<Vec<SseEvent>> {
+        if self.buffer.len() > MAX_LINE_BYTES {
+            return Err(AppError::Llm(format!(
+                "SSE 数据行已超过 {MAX_LINE_BYTES} 字节仍没有换行，已中止本次请求"
+            )));
+        }
+        Ok(self.finish())
     }
 
     /// 处理一行（不含行结束符）。
@@ -159,27 +205,71 @@ fn take_line(buffer: &[u8]) -> Option<(String, usize)> {
 ///
 /// 两次都失败（心跳、非 JSON、空 choices、错误体）返回 `None`，由调用方跳过。
 pub fn parse_chat_chunk(data: &str) -> Option<String> {
-    match serde_json::from_str::<CreateChatCompletionStreamResponse>(data) {
-        Ok(chunk) => chunk
-            .choices
-            .into_iter()
-            .next()
-            .and_then(|choice| choice.delta.content),
-        Err(_) => {
-            let chunk: LenientChunk = serde_json::from_str(data).ok()?;
-            chunk
-                .choices
-                .into_iter()
-                .next()
-                .and_then(|choice| choice.delta.content)
+    parse_chat_chunk_parts(data)?.content
+}
+
+/// 一条流式 chunk 的完整解析结果。
+///
+/// 比 [`parse_chat_chunk`] 多带一个 `finish_reason`：调用方要能区分
+/// 「模型正常收尾」与「撞上长度上限被截断」，后者绝不能当成成功译文。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ChatStreamChunk {
+    /// `choices[0].delta.content`
+    pub(crate) content: Option<String>,
+    /// `choices[0].finish_reason`，保留线上字符串形态（`stop` / `length` / …）
+    pub(crate) finish_reason: Option<String>,
+}
+
+impl ChatStreamChunk {
+    /// 表示「这次响应不完整」的结束原因；`None` 表示服务端自报收尾正常。
+    ///
+    /// - `length`：撞上输出上限被截断；
+    /// - `content_filter`：内容被过滤掉了，同样不是完整译文。
+    pub(crate) fn truncation_reason(&self) -> Option<&str> {
+        match self.finish_reason.as_deref() {
+            Some("length") => Some("length"),
+            Some("content_filter") => Some("content_filter"),
+            _ => None,
         }
     }
+}
+
+/// [`parse_chat_chunk`] 的完整版：同时给出增量文本与结束原因。
+///
+/// 判定边界与旧行为逐字一致 —— 标准结构解析成功就用它（`choices` 为空 → `None`），
+/// 失败才退回宽松结构，两条路径都不再额外放宽。
+pub(crate) fn parse_chat_chunk_parts(data: &str) -> Option<ChatStreamChunk> {
+    if let Ok(chunk) = serde_json::from_str::<CreateChatCompletionStreamResponse>(data) {
+        let choice = chunk.choices.into_iter().next()?;
+        return Some(ChatStreamChunk {
+            content: choice.delta.content,
+            finish_reason: choice.finish_reason.map(finish_reason_text),
+        });
+    }
+    let chunk: LenientChunk = serde_json::from_str(data).ok()?;
+    let choice = chunk.choices.into_iter().next()?;
+    Some(ChatStreamChunk {
+        content: choice.delta.content,
+        finish_reason: choice.finish_reason,
+    })
+}
+
+/// 协议枚举 → 线上字符串（与 serde 的 `snake_case` 表示一致）。
+fn finish_reason_text(reason: FinishReason) -> String {
+    match reason {
+        FinishReason::Stop => "stop",
+        FinishReason::Length => "length",
+        FinishReason::ToolCalls => "tool_calls",
+        FinishReason::ContentFilter => "content_filter",
+        FinishReason::FunctionCall => "function_call",
+    }
+    .to_string()
 }
 
 /// 宽松兜底结构：字段全可选，只为兼容「字段不全」的第三方网关。
 ///
 /// 它不再是主解析路径，只是标准结构解析失败后的第二次机会，所以刻意做得最小：
-/// 只关心 `choices[0].delta.content`。
+/// 只关心 `choices[0].delta.content` 与 `choices[0].finish_reason`。
 #[derive(Debug, Deserialize)]
 struct LenientChunk {
     #[serde(default)]
@@ -190,6 +280,8 @@ struct LenientChunk {
 struct LenientChoice {
     #[serde(default)]
     delta: LenientDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -404,6 +496,102 @@ mod tests {
         // 非 JSON（心跳/注释）
         assert_eq!(parse_chat_chunk("ping"), None);
         assert_eq!(parse_chat_chunk(""), None);
+    }
+
+    // ── finish_reason（截断信号）──
+
+    #[test]
+    fn parts_expose_finish_reason_on_both_parse_paths() {
+        let full = r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}"#;
+        let minimal = r#"{"choices":[{"delta":{},"finish_reason":"length"}]}"#;
+        for payload in [full, minimal] {
+            let chunk = parse_chat_chunk_parts(payload).expect("应能解析");
+            assert_eq!(chunk.finish_reason.as_deref(), Some("length"));
+            assert_eq!(chunk.truncation_reason(), Some("length"));
+            assert_eq!(chunk.content, None);
+        }
+        // `stop` / 缺失都不是截断
+        for payload in [
+            r#"{"choices":[{"delta":{"content":"x"},"finish_reason":"stop"}]}"#,
+            r#"{"choices":[{"delta":{"content":"x"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"x"},"finish_reason":null}]}"#,
+        ] {
+            let chunk = parse_chat_chunk_parts(payload).expect("应能解析");
+            assert_eq!(chunk.truncation_reason(), None, "payload={payload}");
+        }
+        // 内容过滤同样算「不完整」
+        assert_eq!(
+            parse_chat_chunk_parts(
+                r#"{"choices":[{"delta":{},"finish_reason":"content_filter"}]}"#
+            )
+            .unwrap()
+            .truncation_reason(),
+            Some("content_filter")
+        );
+        // content 的解析结果与旧 API 逐字一致
+        assert_eq!(
+            parse_chat_chunk_parts(r#"{"choices":[{"delta":{"content":"你好"}}]}"#)
+                .unwrap()
+                .content
+                .as_deref(),
+            parse_chat_chunk(r#"{"choices":[{"delta":{"content":"你好"}}]}"#).as_deref()
+        );
+    }
+
+    // ── 内存上限（服务端不发换行也不能把内存吃光）──
+
+    #[test]
+    fn oversized_line_is_rejected_instead_of_buffered_forever() {
+        let mut decoder = SseDecoder::new();
+        let mut payload = b"data: ".to_vec();
+        payload.resize(MAX_LINE_BYTES + 1, b'a');
+        let err = decoder.push_checked(&payload).unwrap_err();
+        assert!(err.to_string().contains("没有换行"), "实际: {err}");
+        // 公开的 push 不带上限（保持既有语义）：同样的输入不报错
+        let mut lenient = SseDecoder::new();
+        assert!(lenient.push(&payload).is_empty());
+        // 残留缓冲超限时 finish_checked 也要报
+        let mut tail = SseDecoder::new();
+        let err = tail.finish_checked();
+        assert!(err.is_ok(), "空缓冲不该报错");
+        let mut leftover = SseDecoder::new();
+        let mut payload = b"data: ".to_vec();
+        payload.resize(MAX_LINE_BYTES + 1, b'a');
+        leftover.push(&payload);
+        assert!(leftover.finish_checked().is_err());
+    }
+
+    #[test]
+    fn long_but_terminated_lines_are_still_fine() {
+        // 上限只针对「一直没有换行」的行，正常的长行/多行事件不受影响
+        let mut decoder = SseDecoder::new();
+        let mut payload = b"data: ".to_vec();
+        payload.resize(MAX_LINE_BYTES - 1, b'a');
+        payload.extend_from_slice(b"\n\n");
+        let events = decoder.push_checked(&payload).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(decoder.finish_checked().unwrap().is_empty());
+    }
+
+    #[test]
+    fn oversized_event_accumulation_is_rejected() {
+        let mut decoder = SseDecoder::new();
+        let line = {
+            let mut line = b"data: ".to_vec();
+            line.resize(MAX_LINE_BYTES, b'a');
+            line.push(b'\n');
+            line
+        };
+        let mut err = None;
+        // 多行 data 之间没有空行 → 事件一直累积
+        for _ in 0..8 {
+            if let Err(e) = decoder.push_checked(&line) {
+                err = Some(e);
+                break;
+            }
+        }
+        let err = err.expect("事件累积超过上限必须报错");
+        assert!(err.to_string().contains("单个事件"), "实际: {err}");
     }
 
     #[test]

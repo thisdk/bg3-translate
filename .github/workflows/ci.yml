@@ -204,3 +204,11 @@ jobs:
 
       - name: Clippy（零告警）
         run: cargo clippy -p bg3-translate --all-targets -- -D warnings
+
+      # 命令层的单元测试（IPC 参数校验、工作目录绑定、路径逃逸防线……）跑在这里。
+      # 为什么不是 scripts/verify.sh 里的第 7 道门禁：`cargo test -p bg3-translate`
+      # 要先编译整个 Tauri 壳，Linux/ubuntu runner 上没有 webkit2gtk 连编译都过不去
+      # （见 verify.sh 头部注释）。Windows runner 是本仓库唯一能真正执行它们的 CI 环境。
+      # 没有这一步，`--all-targets` 只会**编译**这些测试而不执行，回归防线等于静默失效。
+      - name: 命令层单元测试
+        run: cargo test -p bg3-translate --lib

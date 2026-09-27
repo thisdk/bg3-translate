@@ -29,7 +29,14 @@ export function useEntryEditing(): EntryEditing {
 
   const saveEdit = useCallback(() => {
     if (editingId) {
-      updateEntry(editingId, { target: draft, status: "edited" });
+      // `error` 一起清掉：人工改好的译文已经解决了上一轮的问题，留着旧诊断会让
+      // 行内一直挂着过期错误；更糟的是「全选重译」时它会作为纠错提示带给模型
+      // （后端按 `entry.error` 注入，见 `planner::previous_failure_of`）。
+      updateEntry(editingId, {
+        target: draft,
+        status: "edited",
+        error: null,
+      });
     }
     setEditingId(null);
   }, [draft, editingId, updateEntry]);

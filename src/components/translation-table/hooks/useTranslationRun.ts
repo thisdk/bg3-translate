@@ -317,11 +317,12 @@ export function useTranslationRun({
     async (id: string) => {
       const entry = entries.find((e) => e.id === id);
       if (!entry) return;
+      // `error` 刻意保留：它是上一轮结构校验的诊断，后端会当纠错提示注入重试
+      // prompt（清掉的话模型只会原样再错一次）。界面上那份在下面 updateEntry 里清。
       const request: TranslationEntry = {
         ...entry,
         target: "",
         status: "pending",
-        error: null,
       };
       updateEntry(id, { target: "", status: "pending", error: null });
       await runTranslation([request]);

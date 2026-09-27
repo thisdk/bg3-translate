@@ -13,6 +13,7 @@ use crate::glossary::{GlossaryMatcher, MatchedTerm};
 use crate::types::TranslationEntry;
 
 use super::engine::{EventSink, emit_done};
+use super::fidelity::previous_failure_reason;
 use super::series::{
     ConsistencyTerm, build_consistency_memory, build_series_aliases, compose_variant_translation,
     find_consistency_references, normalize_consistency_key, split_series_variant,
@@ -48,6 +49,25 @@ pub struct TranslationJob {
     pub consistency_terms: Vec<ConsistencyTerm>,
     /// 结果分发方式
     pub output: TranslationOutput,
+    /// 上一次翻译失败的结构校验诊断（条目上的 `error`），注入重试 prompt。
+    ///
+    /// 只在本组条目里**任意一条**还留着结构诊断时才有值 —— 那是「用户点了重试」
+    /// 的信号。见 [`previous_failure_of`]。
+    pub previous_failure: Option<String>,
+}
+
+/// 取这一组条目里「上一次结构校验失败的原因」，用于重试 prompt。
+///
+/// 用户点「重试」时，前端会把条目上留着的上一轮错误文案一起发回来（前端只清
+/// 界面上的文案，payload 里保留）。带上它，模型才知道上一次**具体**错在哪；
+/// 不带的话它往往原样再错一次。
+///
+/// 只取 [`previous_failure_reason`] 认得出来的结构诊断：网络错误与网关报错的
+/// 文案不进 prompt（既是注入面，也帮不上「怎么改译文」）。
+fn previous_failure_of<'a>(entries: impl Iterator<Item = &'a TranslationEntry>) -> Option<String> {
+    entries
+        .filter_map(|entry| entry.error.as_deref())
+        .find_map(previous_failure_reason)
 }
 
 impl TranslationJob {
@@ -79,6 +99,8 @@ pub struct TranslationPlan {
 struct PendingSeriesGroup {
     base_source: String,
     members: Vec<SeriesMember>,
+    /// 组内第一条带结构诊断的条目给出的「上一次失败原因」（见 [`previous_failure_of`]）
+    previous_failure: Option<String>,
 }
 
 /// 规划任务。规划阶段就会通过 `sink` 发出「直接完成」的事件（与旧行为一致）。
@@ -120,17 +142,20 @@ pub fn plan_jobs(
         if !series_groups.contains_key(&base_key) {
             series_order.push(base_key.clone());
         }
-        series_groups
+        let group = series_groups
             .entry(base_key)
             .or_insert_with(|| PendingSeriesGroup {
                 base_source,
                 members: Vec::new(),
-            })
-            .members
-            .push(SeriesMember {
-                entry_id: entry.id.clone(),
-                suffix: variant.suffix,
+                previous_failure: None,
             });
+        if group.previous_failure.is_none() {
+            group.previous_failure = previous_failure_of(std::iter::once(*entry));
+        }
+        group.members.push(SeriesMember {
+            entry_id: entry.id.clone(),
+            suffix: variant.suffix,
+        });
     }
 
     // 只有 ≥2 个成员才值得合并：单成员系列合并后反而丢了它自己的 matches
@@ -151,6 +176,7 @@ pub fn plan_jobs(
             output: TranslationOutput::Series {
                 members: group.members,
             },
+            previous_failure: group.previous_failure,
         });
     }
 
@@ -205,6 +231,7 @@ pub fn plan_jobs(
             matches: matcher.find_matches(&first.source),
             consistency_terms: find_consistency_references(&first.source, &memory),
             output,
+            previous_failure: previous_failure_of(group.iter().copied()),
         });
     }
 
@@ -241,6 +268,19 @@ mod tests {
         entry
     }
 
+    /// 带「上一次结构校验失败」诊断的条目：模拟用户点「重试」时前端发回来的形态
+    /// （`status` 已被重置为 pending，但 `error` 还留着）。
+    fn failed_entry(source: &str, uid: &str, reason: &str) -> TranslationEntry {
+        use crate::translation::fidelity::FIDELITY_FAILURE_MARKER;
+
+        let mut entry = entry(source, uid);
+        entry.status = crate::types::TranslationStatus::Error;
+        entry.error = Some(format!(
+            "大模型调用错误: {FIDELITY_FAILURE_MARKER}{reason}（已重试 1 次）"
+        ));
+        entry
+    }
+
     fn empty_matcher() -> GlossaryMatcher {
         GlossaryMatcher::new(&Glossary { terms: Vec::new() })
     }
@@ -260,6 +300,72 @@ mod tests {
                 Some((id, kind))
             })
             .collect()
+    }
+
+    /// 重试时 job 必须带上「上一次失败原因」，把结构诊断喂回给模型。
+    ///
+    /// 这里覆盖三条路径：单条、相同原文合并（取组内第一条带诊断的）、以及
+    /// 首次翻译（`error` 为空 → 不注入，行为与改动前逐字一致）。
+    #[test]
+    fn retry_jobs_carry_the_previous_failure_reason() {
+        let sink = CollectingSink::new();
+
+        // ① 首次翻译：没有任何诊断
+        let (jobs, _) = plan_jobs(
+            &[entry("Fireball", "u1")],
+            &empty_matcher(),
+            &CollectingSink::new(),
+        );
+        assert_eq!(jobs[0].previous_failure, None, "首次翻译不该注入原因");
+
+        // ② 单条重试：诊断被取出来（剥掉前缀与「（已重试 1 次）」尾巴）
+        let (jobs, _) = plan_jobs(
+            &[failed_entry("Fireball", "u1", "占位符 [1] 多出")],
+            &empty_matcher(),
+            &sink,
+        );
+        assert_eq!(jobs[0].previous_failure.as_deref(), Some("占位符 [1] 多出"));
+
+        // ③ 相同原文合并：组内任一成员带诊断就要带上（否则那一条又白错一轮）
+        let (jobs, _) = plan_jobs(
+            &[
+                entry("Fireball", "u1"),
+                failed_entry("Fireball", "u2", "缺少标签 <LSTag>"),
+            ],
+            &empty_matcher(),
+            &sink,
+        );
+        assert_eq!(jobs.len(), 1, "相同原文仍然只发一次请求");
+        assert_eq!(
+            jobs[0].previous_failure.as_deref(),
+            Some("缺少标签 <LSTag>")
+        );
+
+        // ④ 网络类错误不注入：它既是注入面，也帮不上「怎么改译文」
+        let mut network_failure = entry("Fireball", "u1");
+        network_failure.status = crate::types::TranslationStatus::Error;
+        network_failure.error = Some("大模型调用错误: 连接超时（60 秒）".into());
+        let (jobs, _) = plan_jobs(&[network_failure], &empty_matcher(), &sink);
+        assert_eq!(jobs[0].previous_failure, None, "网络错误不该进 prompt");
+    }
+
+    /// 系列组成员的诊断同样要带回去。
+    #[test]
+    fn series_retry_jobs_carry_the_previous_failure_reason() {
+        let sink = CollectingSink::new();
+        let (jobs, _) = plan_jobs(
+            &[
+                failed_entry("Silver's Hair 9b", "u1", "占位符 [1] 多出"),
+                entry("Silver's Hair 10b", "u2"),
+            ],
+            &empty_matcher(),
+            &sink,
+        );
+        let series = jobs
+            .iter()
+            .find(|job| matches!(job.output, TranslationOutput::Series { .. }))
+            .expect("两条变体应合成系列组");
+        assert_eq!(series.previous_failure.as_deref(), Some("占位符 [1] 多出"));
     }
 
     #[test]
@@ -507,6 +613,7 @@ mod tests {
             source: "a".into(),
             matches: Vec::new(),
             consistency_terms: Vec::new(),
+            previous_failure: None,
             output: TranslationOutput::Single {
                 entry_id: "e1".into(),
             },
@@ -517,6 +624,7 @@ mod tests {
             source: "a".into(),
             matches: Vec::new(),
             consistency_terms: Vec::new(),
+            previous_failure: None,
             output: TranslationOutput::ExactGroup {
                 entry_ids: vec!["e1".into(), "e2".into()],
             },
@@ -527,6 +635,7 @@ mod tests {
             source: "a".into(),
             matches: Vec::new(),
             consistency_terms: Vec::new(),
+            previous_failure: None,
             output: TranslationOutput::Series {
                 members: vec![
                     SeriesMember {

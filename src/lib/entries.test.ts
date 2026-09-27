@@ -244,7 +244,9 @@ describe("buildTranslationRequest", () => {
     expect(plan.retranslateAll).toBe(true);
     expect(plan.request.map((e) => e.target)).toEqual(["", ""]);
     expect(plan.request.map((e) => e.status)).toEqual(["pending", "pending"]);
-    expect(plan.request.map((e) => e.error)).toEqual([null, null]);
+    // 错误文案**保留**（本轮语义变更）：它是上一轮的结构诊断，后端会当纠错提示
+    // 注入重试 prompt；界面上那份由调用方清掉。旧断言要求这里清成 null。
+    expect(plan.request.map((e) => e.error)).toEqual([null, "boom"]);
   });
 
   it("空输入不触发重新翻译", () => {
@@ -270,7 +272,24 @@ describe("buildRetryRequest", () => {
       entry("4", { status: "error", error: "empty source", source: " " }),
     ]);
     expect(request.map((e) => e.id)).toEqual(["1", "3"]);
-    expect(request[0]).toMatchObject({ target: "", status: "pending", error: null });
+    expect(request[0]).toMatchObject({ target: "", status: "pending" });
+  });
+
+  /**
+   * 上一轮的错误文案**必须**跟着 payload 一起发回后端：后端把它当纠错提示
+   * 注入重试 prompt（`planner::previous_failure_of`），模型才知道上次错在哪。
+   * 之前这里把它清成 null，于是「重试」永远只是原样再问一遍。
+   */
+  it("保留上一轮的错误文案，供后端注入纠错提示", () => {
+    const reason =
+      "大模型调用错误: 结构校验未通过：占位符 [1] 多出（已重试 1 次）";
+    const request = buildRetryRequest([
+      entry("1", { status: "error", error: reason, target: "半截译文" }),
+    ]);
+
+    expect(request[0].error).toBe(reason);
+    expect(request[0].target).toBe("");
+    expect(request[0].status).toBe("pending");
   });
 
   it("没有错误条目时返回空数组", () => {

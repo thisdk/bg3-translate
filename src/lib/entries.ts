@@ -211,6 +211,9 @@ export interface TranslationRequestPlan {
  *
  * 业务语义保持不变：**只翻译 source 非空且 target 为空的条目**。
  * 当所选条目全部已有译文时，退回「清空全部并重译」的模式。
+ *
+ * 重译分支同样**保留 `error`**：它可能带着上一轮的结构校验诊断，后端会当纠错
+ * 提示注入（界面上的文案由调用方清掉，见 `buildRetryRequest` 的说明）。
  */
 export function buildTranslationRequest(
   entries: TranslationEntry[],
@@ -227,7 +230,6 @@ export function buildTranslationRequest(
       ...entry,
       target: "",
       status: "pending" as TranslationStatus,
-      error: null,
     })),
     retranslateAll: work.length > 0,
   };
@@ -236,6 +238,11 @@ export function buildTranslationRequest(
 /**
  * 把错误条目重置为待翻译，供「重试失败条目」使用。
  * 返回可直接发给后端的条目数组（译文已清空）。
+ *
+ * **错误文案保留**：它是上一轮结构校验给出的诊断，后端会把它当纠错提示注入
+ * 重试 prompt（见 `planner::previous_failure_of`）—— 模型知道上次错在哪，才有
+ * 机会避开同一个坑。界面上那份由调用方的 `updateEntry(..., { error: null })`
+ * 清掉，所以用户不会看到过期错误。
  */
 export function buildRetryRequest(
   entries: TranslationEntry[],
@@ -246,6 +253,5 @@ export function buildRetryRequest(
       ...entry,
       target: "",
       status: "pending" as TranslationStatus,
-      error: null,
     }));
 }

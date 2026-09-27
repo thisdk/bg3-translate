@@ -22,7 +22,8 @@ use crate::error::{AppError, Result};
 
 use super::events::{CancelToken, EventSink, emit_progress, wait_until_cancelled};
 use super::fidelity::{
-    FidelityIssue, check_fidelity, correction_hint, repair_placeholders, summarize,
+    FIDELITY_FAILURE_MARKER, FidelityIssue, check_fidelity, correction_hint, repair_placeholders,
+    summarize,
 };
 use super::planner::{TranslationJob, TranslationOutput};
 use super::series::compose_variant_translation;
@@ -109,7 +110,7 @@ pub(crate) async fn translate_with_retry(
                     summarize(&remaining)
                 );
                 Err(AppError::Llm(format!(
-                    "结构校验未通过：{}（已重试 1 次）",
+                    "{FIDELITY_FAILURE_MARKER}{}（已重试 1 次）",
                     summarize(&remaining)
                 )))
             }
@@ -117,7 +118,7 @@ pub(crate) async fn translate_with_retry(
         // 取消：不记失败
         Ok(None) => Ok(None),
         Err(err) => Err(AppError::Llm(format!(
-            "结构校验未通过：{}（已重试 1 次）；纠错重试失败：{}",
+            "{FIDELITY_FAILURE_MARKER}{}（已重试 1 次）；纠错重试失败：{}",
             summarize(&issues),
             error_message(&err)
         ))),
@@ -230,6 +231,7 @@ fn build_request<'a>(
         matches: &job.matches,
         consistency_terms: &job.consistency_terms,
         style_hint,
+        previous_failure: job.previous_failure.as_deref(),
         stream_entry_ids,
         sink,
         cancel,
@@ -359,6 +361,7 @@ mod tests {
             source: "Silver's Hair".into(),
             matches: Vec::new(),
             consistency_terms: Vec::new(),
+            previous_failure: None,
             output: TranslationOutput::Series {
                 members: vec![
                     crate::translation::planner::SeriesMember {
@@ -392,6 +395,7 @@ mod tests {
             source: "Silver's Hair".into(),
             matches: Vec::new(),
             consistency_terms: Vec::new(),
+            previous_failure: None,
             output: TranslationOutput::Series {
                 members: vec![
                     crate::translation::planner::SeriesMember {
@@ -540,6 +544,7 @@ mod tests {
             source: source.into(),
             matches: Vec::new(),
             consistency_terms: Vec::new(),
+            previous_failure: None,
             output: TranslationOutput::Single {
                 entry_id: "e1".into(),
             },

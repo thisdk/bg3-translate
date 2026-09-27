@@ -25,7 +25,7 @@ use crate::glossary::MatchedTerm;
 use crate::types::{LlmSettings, TranslationEvent};
 
 use super::events::{CancelToken, EventSink, wait_until_cancelled};
-use super::prompt::{SYSTEM_PROMPT, build_user_prompt};
+use super::prompt::{SYSTEM_PROMPT, build_user_prompt_with_feedback};
 use super::series::ConsistencyTerm;
 use super::sse::{SseDecoder, SseEvent, parse_chat_chunk_parts};
 
@@ -59,6 +59,9 @@ pub struct TranslateRequest<'a> {
     pub consistency_terms: &'a [ConsistencyTerm],
     /// 已归一化的语境提示
     pub style_hint: Option<&'a str>,
+    /// 上一次失败的结构校验诊断（用户点重试时由条目上的 `error` 带回来），
+    /// 注入 prompt 帮助模型避开同一个坑；没有就传 `None`
+    pub previous_failure: Option<&'a str>,
     /// 需要接收流式增量的条目；`Series` 组为空（成员各自拼后缀）
     pub stream_entry_ids: &'a [String],
     /// 事件出口
@@ -353,11 +356,12 @@ pub(crate) fn build_request_prompt(
     request: &TranslateRequest<'_>,
     correction: Option<&str>,
 ) -> String {
-    let prompt = build_user_prompt(
+    let prompt = build_user_prompt_with_feedback(
         request.source,
         request.matches,
         request.consistency_terms,
         request.style_hint,
+        request.previous_failure,
     );
     match correction.map(str::trim).filter(|hint| !hint.is_empty()) {
         Some(hint) => format!("{prompt}\n\n【结构校验未通过，请修正】{hint}"),
@@ -404,6 +408,7 @@ mod tests {
                     matches: &[],
                     consistency_terms: &[],
                     style_hint: None,
+                    previous_failure: None,
                     stream_entry_ids: &[],
                     sink: &sink,
                     cancel: &cancel,
@@ -425,6 +430,7 @@ mod tests {
             matches: &[],
             consistency_terms: &[],
             style_hint: Some("MOD 语境"),
+            previous_failure: None,
             stream_entry_ids: &[],
             sink: &sink,
             cancel: &cancel,
@@ -444,6 +450,33 @@ mod tests {
         // 空白提示按「没有提示」处理
         assert_eq!(build_request_prompt(&request, Some("   ")), plain);
         assert_eq!(build_request_prompt(&request, Some("")), plain);
+    }
+
+    /// 重试请求里要带上「上一次失败原因」：只讲规则，模型往往原样再错一次。
+    #[test]
+    fn request_prompt_carries_previous_failure_reason() {
+        let sink = CollectingSink::new();
+        let cancel = CancelToken::new();
+        let request = TranslateRequest {
+            source: "Can hit a maximum of 2 different targets.",
+            matches: &[],
+            consistency_terms: &[],
+            style_hint: None,
+            previous_failure: Some("占位符 [1] 多出"),
+            stream_entry_ids: &[],
+            sink: &sink,
+            cancel: &cancel,
+        };
+
+        let prompt = build_request_prompt(&request, None);
+        assert!(prompt.contains("【上一次失败原因】"), "实际: {prompt}");
+        assert!(prompt.contains("占位符 [1] 多出"));
+        assert!(prompt.ends_with("原文：\nCan hit a maximum of 2 different targets."));
+        assert!(
+            prompt.find("【上一次失败原因】").unwrap() < prompt.find("原文：").unwrap(),
+            "原因段落必须排在原文之前"
+        );
+        assert!(!prompt.contains("【结构校验未通过，请修正】"));
     }
 
     #[test]
@@ -541,6 +574,7 @@ mod tests {
             matches: &[],
             consistency_terms: &[],
             style_hint: None,
+            previous_failure: None,
             stream_entry_ids: &["e1".to_string()],
             sink: &sink,
             cancel: &cancel,
@@ -621,6 +655,7 @@ mod tests {
             matches: &[],
             consistency_terms: &[],
             style_hint: None,
+            previous_failure: None,
             stream_entry_ids: &[],
             sink: &sink,
             cancel: &cancel,

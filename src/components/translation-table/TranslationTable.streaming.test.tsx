@@ -39,6 +39,8 @@ const backend = vi.hoisted(() => ({
   onEvent: null as null | ((event: import("@/lib/types").TranslationEvent) => void),
   /** 手动 resolve：模拟"翻译仍在进行中" */
   finish: null as null | (() => void),
+  /** 每次 `translate_entries` 收到的条目 payload（断言「重试是否带回上一次原因」） */
+  sent: [] as import("@/lib/types").TranslationEntry[][],
 }));
 
 vi.mock("@/lib/tauri", () => ({
@@ -46,10 +48,11 @@ vi.mock("@/lib/tauri", () => ({
   translateEntries: vi.fn(
     async (
       _workDir: string,
-      _entries: TranslationEntry[],
+      entries: TranslationEntry[],
       _styleHint: string,
       onEvent: (event: TranslationEvent) => void,
     ) => {
+      backend.sent.push(entries);
       backend.onEvent = onEvent;
       await new Promise<void>((resolve) => {
         backend.finish = resolve;
@@ -67,6 +70,7 @@ beforeEach(() => {
   backend.entries = buildEntries(ENTRY_COUNT, FILE_NAME);
   backend.onEvent = null;
   backend.finish = null;
+  backend.sent = [];
 
   const api = useAppStore.getState();
   api.reset();
@@ -317,6 +321,17 @@ describe("重试 / 纠错时的显示文本（F-09）", () => {
       target: "已经翻好的译文",
       status: "translated",
     });
+
+    // 界面上清掉了错误文案，但**发给后端的那份必须留着**：后端拿它当纠错提示
+    // 注入重试 prompt，模型才知道上一轮为什么被判不合格；清掉就等于原样再问一遍。
+    expect(backend.sent).toHaveLength(1);
+    const sentBad = backend.sent[0].find((e) => e.id === "e-bad");
+    expect(sentBad).toMatchObject({
+      status: "pending",
+      target: "",
+      error: "结构校验未通过：占位符 {1} 缺失（已重试 1 次）",
+    });
+    expect(backend.sent[0].map((e) => e.id)).toEqual(["e-bad"]);
 
     // 这一轮又失败：只保留最后一轮文本，已完成条目仍然不受影响
     const send = backend.onEvent!;

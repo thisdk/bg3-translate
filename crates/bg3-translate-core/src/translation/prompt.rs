@@ -21,7 +21,8 @@ pub const SYSTEM_PROMPT: &str = r#"你是一位精通《龙与地下城》第五
 
 3. **保留占位符**：原文里的参数占位符必须**逐字照抄**，一个字符都不能改。本游戏语料里的占位符是 `[数字]` 形态：
 
-   - **方括号和花括号是两套不同的标记，绝对不能互换**：原文写 `[1]` 就必须写 `[1]`（不许改成 `{1}`），原文写 `{1}` 就必须写 `{1}`（不许改成 `[1]`）。换了类型这个值就填不进去，游戏里只会显示成字面量。例：`strike [1] different targets` → 「打击[1]个不同的目标」。
+   - **方括号和花括号是两套不同的标记，绝对不能互换**：原文写 `[1]` 就必须写 `[1]`（不许改成 `{1}`），原文写 `{1}` 就必须写 `{1}`（不许改成 `[1]`）。换了类型这个值就填不进去，游戏里只会显示成字面量。
+   - **绝对不许凭空造占位符**：原文里没有 `[数字]`（也没有 `{数字}`）时，译文里**一个都不许出现**。原文里的普通数字就是普通数字，照样写成数字、数值也不许改：`strike [1] enemies` → 「打击[1]个敌人」，而 `strike 2 enemies` → 「打击2个敌人」——后者那个 `2` 若写成 `[1]`，游戏不会替换它，玩家看到的就是字面的方括号。
    - 括号一律用半角：`[1]`，不可写成 `【1】` 或 `［1］`。
    - 编号不可改动（`[1]` 不能变成 `[2]`），数量不可增减，顺序可按中文语序调整。
 
@@ -56,6 +57,24 @@ pub fn build_user_prompt(
     consistency_terms: &[ConsistencyTerm],
     style_hint: Option<&str>,
 ) -> String {
+    build_user_prompt_with_feedback(source, matches, consistency_terms, style_hint, None)
+}
+
+/// 同上，另带一条「上一次失败原因」。
+///
+/// 用户点「重试」时，条目上还留着上一轮结构校验给出的诊断（`entry.error`），
+/// 把它附在原文**紧前面**喂回去，模型这一次才有机会避开同一个坑：
+/// 只重复一遍规则 3 而不点明「上次就是因为多写了 `[1]` 被判不合格」时，
+/// 同一个模型往往原样再错一次。原因由
+/// [`super::fidelity::previous_failure_reason`] 从错误文案里取出，
+/// 只有我们自己的结构诊断会被取到（网络错误 / 网关报错一律不注入）。
+pub fn build_user_prompt_with_feedback(
+    source: &str,
+    matches: &[MatchedTerm],
+    consistency_terms: &[ConsistencyTerm],
+    style_hint: Option<&str>,
+    previous_failure: Option<&str>,
+) -> String {
     let mut sections = Vec::new();
     if let Some(style_hint) = style_hint.and_then(normalize_style_hint) {
         sections.push(format!(
@@ -80,6 +99,12 @@ pub fn build_user_prompt(
         sections.push(format!(
             "【本 MOD 已确定译名】（必须保持一致，不可改写同一名称的译法）：\n{}",
             terms.join("\n")
+        ));
+    }
+    // 放在最后一段（紧邻原文）：越靠近原文，模型越容易把它当成这一次的硬约束。
+    if let Some(reason) = previous_failure.map(str::trim).filter(|r| !r.is_empty()) {
+        sections.push(format!(
+            "【上一次失败原因】（工具的结构校验诊断，不是原文的一部分；这一次必须避免重复这个问题）：\n{reason}"
         ));
     }
 
@@ -312,6 +337,76 @@ mod tests {
         let consistency = prompt.find("【本 MOD 已确定译名】").unwrap();
         let source = prompt.find("原文：").unwrap();
         assert!(ctx < glossary && glossary < consistency && consistency < source);
+    }
+
+    /// 重试时把「上一次失败原因」附在原文紧前面；没有原因时一个字都不加。
+    ///
+    /// 顺序要求：语境 → 术语 → 一致性 → 上一次失败原因 → 原文。越靠近原文，
+    /// 模型越容易把这条当成这一次的硬约束。
+    #[test]
+    fn user_prompt_carries_previous_failure_right_before_the_source() {
+        let prompt = build_user_prompt_with_feedback(
+            "Can hit a maximum of 2 different targets.",
+            &[matched("A", "甲")],
+            &[consistency("B", "乙")],
+            Some("语境"),
+            Some("占位符 [1] 多出"),
+        );
+        assert!(prompt.contains("【上一次失败原因】"), "实际: {prompt}");
+        assert!(prompt.contains("占位符 [1] 多出"));
+        assert!(prompt.contains("这一次必须避免重复这个问题"));
+
+        let ctx = prompt.find("【本 MOD 翻译语境】").unwrap();
+        let glossary = prompt.find("【术语参考】").unwrap();
+        let consistency_at = prompt.find("【本 MOD 已确定译名】").unwrap();
+        let failure = prompt.find("【上一次失败原因】").unwrap();
+        let source = prompt.find("原文：").unwrap();
+        assert!(
+            ctx < glossary
+                && glossary < consistency_at
+                && consistency_at < failure
+                && failure < source,
+            "顺序必须是 语境 → 术语 → 一致性 → 上一次失败原因 → 原文"
+        );
+        assert!(prompt.ends_with("原文：\nCan hit a maximum of 2 different targets."));
+    }
+
+    /// 空白 / 缺省的原因不产生空段落（否则每一条重试 prompt 都多一截噪音）。
+    #[test]
+    fn blank_previous_failure_adds_nothing() {
+        let plain = build_user_prompt("Fireball", &[], &[], None);
+        for blank in [None, Some(""), Some("   \n ")] {
+            assert_eq!(
+                build_user_prompt_with_feedback("Fireball", &[], &[], None, blank),
+                plain,
+                "空白原因不该改变 prompt: {blank:?}"
+            );
+        }
+        assert!(!plain.contains("【上一次失败原因】"));
+    }
+
+    /// 提示词必须**明说**不许凭空造占位符，并且给出「普通数字 vs 占位符」的对照。
+    ///
+    /// 真实报障：`Can hit a maximum of 2 different targets.` 被译成
+    /// 「最多可打击[1]个不同的目标。」—— 旧提示词里唯一的例子
+    /// `strike [1] different targets` → 「打击[1]个不同的目标」与它几乎同形，
+    /// 模型照着例子把普通数字 `2` 也写成了 `[1]`，结构校验报「占位符 [1] 多出」。
+    #[test]
+    fn system_prompt_forbids_inventing_placeholders() {
+        assert!(
+            SYSTEM_PROMPT.contains("绝对不许凭空造占位符"),
+            "必须显式禁止凭想象添加占位符"
+        );
+        assert!(
+            SYSTEM_PROMPT.contains("strike [1] enemies")
+                && SYSTEM_PROMPT.contains("strike 2 enemies"),
+            "必须给出「占位符 vs 普通数字」的对照例子"
+        );
+        // 旧例子与真实报障句几乎同形，是这次误译的直接诱因：删掉之后不许回来
+        assert!(
+            !SYSTEM_PROMPT.contains("different targets"),
+            "不许再用 `different targets` 当例子（会被 pattern-match 到普通数字句子上）"
+        );
     }
 
     #[test]

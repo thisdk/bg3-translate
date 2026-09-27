@@ -232,6 +232,33 @@ describe("手工编辑与流式翻译并发", () => {
     });
   });
 
+  it("手工保存译文后，条目上不留上一轮的失败诊断", async () => {
+    await renderTable();
+    const send = await startTranslation();
+
+    // 这一轮以结构校验失败收尾：条目留下诊断文案
+    await act(async () => {
+      send({ type: "progress", entryId: "e-0", status: "translating" });
+      send({ type: "delta", entryId: "e-0", text: "坏译文" });
+      send({
+        type: "error",
+        entryId: "e-0",
+        message: "大模型调用错误: 结构校验未通过：占位符 [1] 多出（已重试 1 次）",
+      });
+      send({ type: "all_done", total: 1, failed: 1 });
+      await Promise.resolve();
+    });
+    expect(storedEntry("e-0").error).toContain("占位符 [1] 多出");
+
+    // 用户手工改好并保存：错误已解决，诊断必须一起清掉
+    await editRow(0, "用户手工译文");
+    expect(storedEntry("e-0")).toMatchObject({
+      target: "用户手工译文",
+      status: "edited",
+      error: null,
+    });
+  });
+
   it("取消收尾回滚不得清掉用户已经保存的译文", async () => {
     await renderTable();
     const send = await startTranslation();

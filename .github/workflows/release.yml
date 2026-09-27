@@ -56,6 +56,10 @@ jobs:
 
       - name: 安装 Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          # 发布前门禁要跑 cargo fmt --check 与 clippy：这两个组件通常随默认
+          # profile 一起装，显式声明是为了不依赖 runner 镜像的默认值
+          components: rustfmt, clippy
 
       - name: 缓存 Rust 构建
         uses: Swatinem/rust-cache@v2
@@ -64,6 +68,27 @@ jobs:
 
       - name: 安装前端依赖
         run: bun install --frozen-lockfile
+
+      # 为什么发布链自己要兜一道门禁：tag push **不会**触发 ci.yml
+      # （那边只监听 push 到 dev/main 与 PR），所以「核心库 fmt / clippy / 单测」
+      # 与「命令层单测」在发布路径上是没有别人保证的 —— 一个从没跑过测试的提交
+      # 打上标签就会被直接发出去。
+      #
+      # 位置：都放在 `bun tauri build` 之前，测试不过就不浪费十几分钟的 Windows
+      # 打包，更走不到 publish job。两条命令与 CI 里跑的是同一串，可重跑。
+      #   * `--core-only --no-ipc`：只碰 bg3-translate-core（fmt / clippy / 单测），
+      #     不需要前端产物；IPC 契约由 ci.yml 的 meta job 负责，这里 --no-ipc。
+      #   * 命令层单测跑的是 debug 构建，`generate_context!` 在 dev 下（未启用
+      #     tauri/custom-protocol）不嵌入 frontendDist，所以此刻还没有 dist/ 也能跑；
+      #     已实测：移走 dist/ 并强制重编 src-tauri 后 `cargo test -p bg3-translate --lib`
+      #     仍然 22 passed。
+      - name: 发布前门禁（核心库 fmt / clippy / test）
+        shell: bash
+        run: bash scripts/verify.sh --core-only --no-ipc
+
+      - name: 发布前门禁（命令层单元测试，与 ci.yml 的 tauri-shell job 一致）
+        shell: bash
+        run: cargo test -p bg3-translate --lib
 
       - name: 读取版本号
         id: version
@@ -256,6 +281,14 @@ jobs:
           draft: false
           generate_release_notes: true
           body: |
+            **打开 BG3 MOD → 用大模型流式翻译 → 重新打包成游戏能加载的 `.pak`。**
+
+            翻译这类文本真正会坏的地方在于**结构**：`{1}`/`[2]` 占位符、
+            `<LSTag Tooltip="…">` 富文本标签、`Type="Spell"` 这类查表 key 一旦被模型改写，
+            轻则该条译文显示异常，重则整个本地化文件变成坏 XML、游戏直接读不了。
+            本工具在**写回之前会把原文与译文的结构真的比一遍**，不合格的条目标成「出错」、
+            打包时退回原文，而不是把半成品写进 MOD。
+
             ## 下载哪个
 
             | 文件 | 说明 |
@@ -264,20 +297,32 @@ jobs:
             | `*-Setup.exe` | NSIS 安装程序（简体中文界面，可选择为当前用户或所有用户安装） |
             | `*-Installer.msi` | MSI 安装包（适合企业批量分发） |
 
-            `SHA256SUMS.txt` 是各产物的 SHA-256 校验和。
+            `SHA256SUMS.txt` 是各产物的 SHA-256 校验和，下载后建议核对。
+
+            ## 首次使用
+
+            1. 打开软件，选择 `.pak` 或 `.zip`（也可以直接把文件拖进窗口）
+            2. 「设置」里填大模型接口（OpenAI 兼容协议，默认对接 DeepSeek）
+            3. 在文件树里勾选要翻的文件，开始翻译（文本边生成边显示）
+            4. 检查几条重点文本、需要时直接在表格里改，然后「保存并打包」
+
+            输出默认叫 `<原名>_zh.pak`，丢进 MOD 管理器即可。
+            **建议先拿一个小 MOD 走通整条链路，再上大工程。**
 
             ## 平台说明
 
             只提供 **Windows x64**。这个工具的使用场景是「在 Windows 上翻译 MOD，
-            然后在 Windows 上玩 BG3」，所以不再构建 macOS/Linux 产物。
+            然后在 Windows 上玩 BG3」，所以不构建 macOS/Linux 产物。
+            需要 WebView2 运行时（Windows 11 自带；Windows 10 上安装程序会联网自动下载安装）。
 
-            ## 首次使用
+            ## 质量
 
-            1. 打开软件，选择 `.pak` 或 `.zip`
-            2. 在设置里填大模型接口（OpenAI 兼容协议，默认 DeepSeek）
-            3. 选中要翻译的文件，开始翻译
-            4. 检查几条重点文本后重新打包
+            每一条提交都要过这几道门禁：跨层 IPC 契约检查、`cargo fmt --check`、
+            `cargo clippy -D warnings`、Rust 核心测试（含真实 PAK 端到端闭环与 1971 条真实
+            语料的 9088 个结构校验用例）、前端 vitest 与 `tsc` 类型检查 + 构建；
+            发布链在构建前自己再跑一遍核心门禁与命令层单测。
 
-            详见仓库 README。
+            本版本的详细变更、已知限制与使用说明见仓库
+            [README](https://github.com/thisdk/bg3-translate#readme)。
           files: release-assets/**/*
           fail_on_unmatched_files: true

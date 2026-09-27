@@ -217,6 +217,28 @@ describe("setError / setLoading", () => {
   });
 });
 
+describe("shippedBaseline（写回底稿快照）", () => {
+  it("只记第一次读到的底稿：第二次调用不覆盖（否则「自己合并自己」）", () => {
+    const original = [entry("1", { source: "官方中文" })];
+    const polluted = [entry("1", { source: "上一次写回的产物" })];
+
+    state().cacheShippedBaseline("Localization/Chinese/x.xml", original);
+    state().cacheShippedBaseline("Localization/Chinese/x.xml", polluted);
+
+    expect(state().shippedBaseline["Localization/Chinese/x.xml"]).toBe(original);
+  });
+
+  it("重新打开 MOD / reset 会清掉上一份底稿", () => {
+    state().cacheShippedBaseline("Localization/Chinese/x.xml", [entry("1")]);
+    state().setModOpened("/tmp/b.pak", "/tmp/work2", [pakFile("b.xml")]);
+    expect(state().shippedBaseline).toEqual({});
+
+    state().cacheShippedBaseline("Localization/Chinese/x.xml", [entry("1")]);
+    state().reset();
+    expect(state().shippedBaseline).toEqual({});
+  });
+});
+
 describe("reset", () => {
   it("清空所有流程数据但保留主题与设置", () => {
     state().setModOpened("/tmp/a.pak", "/tmp/work", [pakFile("a.xml")]);

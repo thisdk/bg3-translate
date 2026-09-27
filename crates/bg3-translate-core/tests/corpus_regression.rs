@@ -154,7 +154,7 @@ fn missing_corpus_fails_loudly_instead_of_skipping() {
     assert!(message.contains("真实语料缺失"), "实际: {message}");
     // 提示必须可操作。曾经这里写的是 `git checkout -- samples/english.xml`，
     // 而那个文件当时还没入库，照做只会得到 `pathspec did not match` ——
-    // 独立验证（docs/CORPUS-AUDIT.md D2）实测过，所以这条断言钉的是「重新 clone /
+    // 独立验证实测过（该轮报告已随发布清理），所以这条断言钉的是「重新 clone /
     // 取回文件」而不是那条无效命令。
     assert!(
         message.contains("重新 clone") && message.contains("git checkout"),

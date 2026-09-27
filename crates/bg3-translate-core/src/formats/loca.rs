@@ -471,7 +471,7 @@ mod tests {
     /// 整个应用连同用户未保存的进度一起死。`.loca` 来自用户的 MOD，是不可信输入。
     ///
     /// 复现（修复前）：`memory allocation of 137438953440 bytes failed` → SIGABRT
-    /// （整条测试进程被杀，见 docs/review-r4/formats.md 的探针输出）。
+    /// （整条测试进程被杀，当时的探针输出见发布说明）。
     #[test]
     fn lying_entry_count_is_rejected_without_a_giant_allocation() {
         let dir = tempfile::tempdir().unwrap();

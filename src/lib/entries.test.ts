@@ -5,6 +5,8 @@ import {
   computeEntryStats,
   countByFilter,
   filterEntries,
+  hasVisibleText,
+  hasWritableTarget,
   isDoneStatus,
   isTranslatableNow,
   isTranslationWorkItem,
@@ -225,15 +227,34 @@ describe("shortSourcePath", () => {
 });
 
 describe("buildTranslationRequest", () => {
-  it("只挑出译文为空的条目", () => {
+  it("正常分支的 payload 是全部工作条目（含已有译文，供后端建一致性记忆）", () => {
     const plan = buildTranslationRequest([
       entry("1", { source: "A", target: "" }),
       entry("2", { source: "B", target: "乙", status: "translated" }),
       entry("3", { source: "", target: "" }),
       entry("4", { source: "D", target: "", status: "error" }),
+      entry("5", { source: "E", target: "戊", status: "edited" }),
     ]);
     expect(plan.retranslateAll).toBe(false);
-    expect(plan.request.map((e) => e.id)).toEqual(["1", "4"]);
+    // 原文为空的条目不是工作条目，永远不进 payload
+    expect(plan.request.map((e) => e.id)).toEqual(["1", "2", "4", "5"]);
+    // 已有译文的条目**原样**带上（target 不清、状态不改）：core 用整份 payload
+    // 建 `planner::build_consistency_memory`（只认 has_writable_target 的条目）。
+    // 只发 pending 的话这份记忆恒为空 —— 专名跨批次不一致、【本 MOD 已确定译名】
+    // 段落从不出现、系列 base 复用失效。
+    expect(plan.request.find((e) => e.id === "2")).toMatchObject({
+      target: "乙",
+      status: "translated",
+    });
+    expect(plan.request.find((e) => e.id === "5")).toMatchObject({
+      target: "戊",
+      status: "edited",
+    });
+    // 本轮真正会被后端翻译的只有这批（调用方的收尾回滚也必须只动它们）
+    expect(plan.request.filter(isTranslatableNow).map((e) => e.id)).toEqual([
+      "1",
+      "4",
+    ]);
   });
 
   it("全部已有译文时退回重新翻译全部，并清空译文", () => {
@@ -244,6 +265,8 @@ describe("buildTranslationRequest", () => {
     expect(plan.retranslateAll).toBe(true);
     expect(plan.request.map((e) => e.target)).toEqual(["", ""]);
     expect(plan.request.map((e) => e.status)).toEqual(["pending", "pending"]);
+    // 重译分支里每一条都是「本轮要翻的」（没有上下文条目，语义与旧实现一致）
+    expect(plan.request.every(isTranslatableNow)).toBe(true);
     // 错误文案**保留**（本轮语义变更）：它是上一轮的结构诊断，后端会当纠错提示
     // 注入重试 prompt；界面上那份由调用方清掉。旧断言要求这里清成 null。
     expect(plan.request.map((e) => e.error)).toEqual([null, "boom"]);
@@ -294,5 +317,70 @@ describe("buildRetryRequest", () => {
 
   it("没有错误条目时返回空数组", () => {
     expect(buildRetryRequest([entry("1")])).toEqual([]);
+  });
+});
+
+/**
+ * `hasVisibleText` / `hasWritableTarget` 必须与 Rust 的
+ * `crates/bg3-translate-core/src/types.rs::has_visible_text` **同义**。
+ *
+ * 为什么值得单独钉：这两个判据决定「MOD 自带的真实中文要不要被 incoming 挤掉」
+ * （`localization::mergeWithExistingTarget`）。只有 BOM / 零宽空格的 target 会被
+ * 后端当成「没有译文」而写回英文原文；前端若还按 `trim()` 判成「有译文」，
+ * 自带中文就被静默覆盖了。跨层契约检查脚本覆盖不到这层语义。
+ */
+describe("hasVisibleText / hasWritableTarget", () => {
+  it("只有空白 / 控制符 / 不可见零宽字符的译文不算可写回", () => {
+    const invisible = [
+      "",
+      "   ",
+      "\t\r\n",
+      "\uFEFF", // BOM / 零宽不换行空格
+      "\u200B", // 零宽空格
+      "\u00AD", // 软连字符
+      "\u2060", // word joiner
+      "\u200E", // LRM
+      "\u202E", // RLO
+      "\uFE0F", // 变体选择符
+      "\u0000", // C0 控制符
+      "\u0085", // C1 控制符
+      "\u200B\uFEFF\u00AD", // 全是不可见字符的组合
+    ];
+    for (const text of invisible) {
+      expect(hasVisibleText(text), JSON.stringify(text)).toBe(false);
+      expect(
+        hasWritableTarget(entry(`x-${text.length}`, { target: text, status: "translated" })),
+        JSON.stringify(text),
+      ).toBe(false);
+    }
+  });
+
+  it("零宽字符夹在正文中间仍算可见（变体选择符 / word joiner 是有意义的）", () => {
+    const visible = [
+      "火\u200B球\uFE0F术", // 零宽 + emoji 变体选择符夹在正文中间
+      "普通中文",
+      "a",
+      "\u200B火",
+      "火\u2060球",
+      "1",
+    ];
+    for (const text of visible) {
+      expect(hasVisibleText(text), JSON.stringify(text)).toBe(true);
+      expect(
+        hasWritableTarget(entry(`y-${text.length}`, { target: text, status: "translated" })),
+        JSON.stringify(text),
+      ).toBe(true);
+    }
+  });
+
+  it("U+06DD 这类**可见**的 Cf 字符不能被当成空白（不按 Cf 类别一刀切）", () => {
+    expect(hasVisibleText("\u06DD")).toBe(true);
+    expect(hasWritableTarget(entry("z", { target: "\u06DD", status: "translated" }))).toBe(true);
+  });
+
+  it("error 状态一律不可写回，即便译文可见", () => {
+    expect(hasWritableTarget(entry("e", { target: "火球", status: "error" }))).toBe(false);
+    expect(hasWritableTarget(entry("e", { target: "火球", status: "pending" }))).toBe(true);
+    expect(hasWritableTarget(entry("e", { target: "火球", status: "edited" }))).toBe(true);
   });
 });

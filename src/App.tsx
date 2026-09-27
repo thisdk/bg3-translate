@@ -50,6 +50,7 @@ function FilesPage() {
   const workDir = useAppStore((s) => s.workDir);
   const entriesByFile = useAppStore((s) => s.entriesByFile);
   const runActive = useAppStore((s) => s.runToken !== null);
+  const cacheShippedBaseline = useAppStore((s) => s.cacheShippedBaseline);
   const setStage = useAppStore((s) => s.setStage);
   const setError = useAppStore((s) => s.setError);
 
@@ -94,6 +95,10 @@ function FilesPage() {
    * `shippedName` 是 `files` 里实际存在的那个路径（可能与写回目标只有大小写
    * 不同，例如 `Localization/CHINESE/x.xml`）：读它、写回目标路径。
    *
+   * 底稿**只在第一次写回时读一次**，之后用 store 里的快照：写回会把工作目录里
+   * 的这个文件改成我们的产物，第二次写回再读它就成了「自己合并自己」——用户
+   * 「还原」掉的条目会被上一次写回的译文复活，原始底稿也再取不回来。
+   *
    * 读不到底稿时**必须中止这次写回**：合并的前提就是「拿到这个文件里已有的
    * 内容」，拿不到还照常写回，等于用计划条目（英文原文）整体覆盖它 ——
    * 未翻译条目退回原文、底稿独有的 contentuid 丢失，正是 R-05 要防的那次
@@ -105,8 +110,11 @@ function FilesPage() {
     plan: LocalizationWritePlan,
     shippedName: string,
   ): Promise<TranslationEntry[]> => {
+    const baseline = useAppStore.getState().shippedBaseline[plan.fileName];
+    if (baseline) return mergeWithExistingTarget(plan.entries, baseline);
     try {
       const existing = await readFileEntries(dir, shippedName);
+      cacheShippedBaseline(plan.fileName, existing);
       return mergeWithExistingTarget(plan.entries, existing);
     } catch (e) {
       throw new Error(

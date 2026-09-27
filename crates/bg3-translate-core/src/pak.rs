@@ -510,8 +510,78 @@ pub fn pick_largest_pak(dir: &Path) -> Option<PathBuf> {
 /// 同一路径可能有多个版本（PAK 允许重复条目）；优先使用**最后一个可读**的版本，
 /// 与游戏加载器行为一致。
 fn extract_package_files(pkg: &Package, extract_dir: &Path) -> Result<Vec<PakFile>> {
+    extract_package_files_limited(pkg, extract_dir, ExtractLimits::default())
+}
+
+/// PAK 解包的防护上限（与 [`ZipLimits`] **对称**：`.pak` 同样是用户下载的不可信输入）。
+///
+/// 为什么必须有：LZ4 的最大压缩比约 255×，一块 257 KB 的全零条目能解出 64 MiB
+/// （实测 43 ms，见 `pak_expansion_is_capped`）。zip 那条路早就有上限，
+/// 而 PAK 这条路以前**一个上限都没有** —— 一个百来 MB 的恶意 PAK 就能写出几十 GB、
+/// 同时把每个条目的解压结果整份读进内存。
+///
+/// 取值理由与 [`ZipLimits`] 一致：真实 MOD 的单个 4K 材质文件可达数 GB，
+/// 上限必须宽松到不误伤，但「几百 KB → 几十 GB」这种放大一定要在**创建文件之前**
+/// 被拦住。
+#[derive(Debug, Clone, Copy)]
+struct ExtractLimits {
+    /// 单个条目解压后的字节上限
+    max_entry_bytes: u64,
+    /// 所有条目解压后的总字节上限
+    max_total_bytes: u64,
+    /// 条目数上限（防海量小文件耗尽 inode 与时间）
+    max_entries: usize,
+}
+
+impl Default for ExtractLimits {
+    fn default() -> Self {
+        Self {
+            // 6 GiB / 16 GiB / 20 万：与 `ZipLimits::default()` 同一组数字
+            max_entry_bytes: 6 * 1024 * 1024 * 1024,
+            max_total_bytes: 16 * 1024 * 1024 * 1024,
+            max_entries: 200_000,
+        }
+    }
+}
+
+/// [`extract_package_files`] 的实现（上限可注入，便于用小样本测炸弹防线）。
+fn extract_package_files_limited(
+    pkg: &Package,
+    extract_dir: &Path,
+    limits: ExtractLimits,
+) -> Result<Vec<PakFile>> {
+    // ① 先按**声明大小**预检：压缩炸弹在创建任何文件之前就该被拦住
+    // （`.pak` 的文件表就在归档里，不需要解压任何数据就能读到这些数字）。
+    let all_files = pkg.files();
+    if all_files.len() > limits.max_entries {
+        return Err(AppError::pak(format!(
+            "PAK 条目数 {} 超过上限 {}，已中止解包（疑似恶意归档，真实 MOD 不会有这么多文件）",
+            all_files.len(),
+            limits.max_entries
+        )));
+    }
+    let mut declared_total: u64 = 0;
+    for file in all_files {
+        let declared = file.size();
+        if declared > limits.max_entry_bytes {
+            return Err(AppError::pak(format!(
+                "PAK 条目 {} 声明解压后 {} 字节，超过单文件上限 {}，已中止解包",
+                file.name(),
+                declared,
+                limits.max_entry_bytes
+            )));
+        }
+        declared_total = declared_total.saturating_add(declared);
+        if declared_total > limits.max_total_bytes {
+            return Err(AppError::pak(format!(
+                "PAK 解压总量将超过上限 {} 字节（已声明 {declared_total} 字节），已中止解包（疑似压缩炸弹）",
+                limits.max_total_bytes
+            )));
+        }
+    }
+
     let mut groups: BTreeMap<String, Vec<&PackagedFile>> = BTreeMap::new();
-    for file in pkg.files() {
+    for file in all_files {
         groups
             .entry(normalize_entry_name(file.name()))
             .or_default()
@@ -519,7 +589,22 @@ fn extract_package_files(pkg: &Package, extract_dir: &Path) -> Result<Vec<PakFil
     }
 
     let mut files = Vec::with_capacity(groups.len());
+    let mut written_total: u64 = 0;
     for (name, candidates) in groups {
+        // 归档里的「目录条目」：名字以 `/` 结尾，本身不携带内容（LSPK 的文件表
+        // 是扁平的，少数打包器会额外写这种条目）。必须特判，否则它会被当成普通
+        // 文件写成 `unpacked/Localization`，随后同目录下的
+        // `Localization/English/x.xml` 在 `create_dir_all` 处直接失败
+        // （`Not a directory`）—— 整个 MOD 一个文件都解不出来，用户只看到一句
+        // 与条目无关的 IO 错误。空名字的条目同样没有落盘意义，一并跳过。
+        if name.is_empty() || name.ends_with('/') {
+            if !name.is_empty() {
+                std::fs::create_dir_all(safe_output_path(extract_dir, &name)?)?;
+            }
+            log::debug!("跳过归档里的目录条目: {name:?}");
+            continue;
+        }
+
         let mut selected: Option<(&PackagedFile, Vec<u8>)> = None;
         let mut errors = Vec::new();
 
@@ -541,6 +626,23 @@ fn extract_package_files(pkg: &Package, extract_dir: &Path) -> Result<Vec<PakFil
                 "PAK 条目 {name} 有 {} 个不可读副本，已使用可读版本",
                 errors.len()
             );
+        }
+
+        // ② 再按**实际解压**字节数兜底：声明大小是可以撒谎的。
+        // 检查放在写盘**之前**：超限的条目一个字节都不该落到磁盘上。
+        let written = data.len() as u64;
+        if written > limits.max_entry_bytes {
+            return Err(AppError::pak(format!(
+                "PAK 条目 {name} 实际解压 {} 字节，超过单文件上限 {}，已中止解包（声明大小与内容不符）",
+                written, limits.max_entry_bytes
+            )));
+        }
+        written_total = written_total.saturating_add(written);
+        if written_total > limits.max_total_bytes {
+            return Err(AppError::pak(format!(
+                "PAK 解压总量超过上限 {} 字节，已中止解包（疑似压缩炸弹）",
+                limits.max_total_bytes
+            )));
         }
 
         let output_path = safe_output_path(extract_dir, &name)?;
@@ -603,10 +705,12 @@ pub fn repack(work_dir: &str, output_path: &str) -> Result<()> {
         output.display()
     );
 
-    let builder = PackageBuilder::new()
-        .priority(priority)
-        .add_directory(&unpacked)
-        .map_err(|e| AppError::pak(format!("读取待打包目录失败: {e}")))?;
+    // 自己走一遍目录（而不是 `add_directory`）只为了能**排除**原子写残留的
+    // 临时文件：`add_directory` 只能整目录添加，没法跳过单个文件。
+    let mut builder = PackageBuilder::new().priority(priority);
+    for (path, archive_path) in collect_pack_files(&unpacked)? {
+        builder = builder.add_file(path, archive_path);
+    }
 
     // 先打到**同目录**下的临时文件，成功后再 rename 覆盖目标。
     //
@@ -630,6 +734,81 @@ pub fn repack(work_dir: &str, output_path: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// 递归收集待打包的文件：`(磁盘上的路径, PAK 内路径)`。
+///
+/// # 为什么要自己走目录
+///
+/// 上游的 `PackageBuilder::add_directory` 只能整目录添加，**没法排除单个文件**。
+/// 而 `unpacked/` 里可能残留原子写的临时文件（`english.tmp63760.0`）：
+/// `write_atomic` 的失败清理只覆盖「同一次调用内失败」，进程被强杀 / 掉电留下的
+/// 那些不会被清掉，直接打进产物就是一条被截断的本地化文件混进了用户的 PAK
+/// （独立验证者 R5-01 实测：产物多出两个 `Localization/English/*.tmp*` 垃圾条目）。
+///
+/// 判定用写入端同一个 [`crate::config::is_atomic_temp_name`]，规则只有一份。
+///
+/// # 语义与 `add_directory` 对齐
+///
+/// - 读目录 / 读条目失败**必须报错**：静默跳过等于产物里少文件（静默损坏）；
+/// - 符号链接一律拒绝（`repack` 开头已经查过一遍，这里再兜一次）；
+/// - 只收普通文件：目录递归下去，FIFO / 设备文件之类跳过（`add_directory` 同样不收）；
+/// - 结果按 PAK 内路径排序，同一份工作目录每次打出同样的条目顺序。
+fn collect_pack_files(root: &Path) -> Result<Vec<(PathBuf, String)>> {
+    let mut out: Vec<(PathBuf, String)> = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|err| AppError::pak(format!("读取待打包目录失败 {}: {err}", dir.display())))?;
+        for entry in entries {
+            let entry = entry.map_err(|err| {
+                AppError::pak(format!("读取待打包目录项失败 {}: {err}", dir.display()))
+            })?;
+            let file_type = entry.file_type().map_err(|err| {
+                AppError::pak(format!(
+                    "读取待打包条目的类型失败 {}: {err}",
+                    entry.path().display()
+                ))
+            })?;
+            if file_type.is_symlink() {
+                return Err(AppError::pak(format!(
+                    "工作目录里存在符号链接，拒绝打包（它会把工作目录外的文件打进 PAK）: {}",
+                    entry.path().display()
+                )));
+            }
+            let path = entry.path();
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
+                log::warn!("跳过非常规文件（不是普通文件）: {}", path.display());
+                continue;
+            }
+            let relative = path.strip_prefix(root).map_err(|err| {
+                AppError::pak(format!("无法计算归档内路径 {}: {err}", path.display()))
+            })?;
+            let archive_path = normalize_entry_name(&relative.to_string_lossy());
+            let file_name = relative
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned);
+            // 只在能拿到 UTF-8 文件名时判定：判不出来就照常打包
+            // （漏打用户内容是比多打一个临时文件严重得多的错误）。
+            if let Some(name) = file_name {
+                if crate::config::is_atomic_temp_name(&name) {
+                    log::warn!(
+                        "跳过原子写残留的临时文件（不打包，可能是上次写回失败/进程被杀留下的）: {}",
+                        archive_path
+                    );
+                    continue;
+                }
+            }
+            out.push((path, archive_path));
+        }
+    }
+    out.sort_by(|a, b| a.1.cmp(&b.1));
+    Ok(out)
 }
 
 /// 重打包用的临时文件名（与目标同目录，`rename` 才能原子生效）。
@@ -975,10 +1154,229 @@ mod tests {
         assert!(!output.exists(), "拒绝打包时不该产出文件");
     }
 
+    /// `repack` 必须跳过原子写残留的临时文件，**且一个合法文件都不能漏打**。
+    ///
+    /// 复现（修复前）：写回失败（EFBIG/ENOSPC）或进程被强杀会在 `unpacked/` 里
+    /// 留下 `english.tmp<pid>.<序号>`，`repack` 返回 `Ok(())` 并把它原样打进
+    /// 用户的产物（独立验证者 R5-01 实测：产物多出两个 8 KB 的
+    /// `Localization/English/*.tmp*` 垃圾条目，其中内容是**被截断的 XML**）。
+    ///
+    /// 判定复用写入端同一份规则（`config::is_atomic_temp_name`），所以这里同时钉住
+    /// 两侧：只有那条完整形状的名字被跳过，`a.tmp` / `notes.tmp123.txt` /
+    /// `a.tmp..1` 这类合法名字必须照常进包（误判 = 静默丢用户内容）。
+    #[test]
+    fn repack_skips_stale_atomic_write_temp_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        let dir = work.join(UNPACKED_DIR).join("Localization/English");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("english.xml"), b"<contentList/>").unwrap();
+
+        // 陈旧的原子写临时文件：形状与写入端一致（`english.xml` → `english.tmp<pid>.<n>`），
+        // 内容是**被截断的 XML** —— 打进 PAK 就是一条坏掉的本地化文件
+        let stale_name = format!("english.tmp{}.7", std::process::id());
+        std::fs::write(
+            dir.join(&stale_name),
+            b"<contentList><content contentuid=\"h1",
+        )
+        .unwrap();
+
+        // 合法文件名（都与临时文件形状擦肩而过），一条都不能漏
+        let legal = [
+            "english.xml",         // 正常目标
+            "a.tmp",               // 没有 pid/序号
+            "notes.tmp123.txt",    // 结尾不是数字
+            "tmp.xml",             // 没有主名
+            "a.tmp1.b",            // 结尾是 .b
+            "a.tmp..1",            // pid 缺失（空）
+            "english.tmp12.3.xml", // 序号后面还有扩展名
+        ];
+        for name in legal {
+            std::fs::write(dir.join(name), b"<contentList/>").unwrap();
+        }
+
+        let output = tmp.path().join("Out.pak");
+        repack(work.to_str().unwrap(), output.to_str().unwrap()).unwrap();
+
+        let pkg = Package::open(&output).unwrap();
+        let names: Vec<String> = build_pak_files(&pkg).into_iter().map(|f| f.name).collect();
+        assert!(
+            !names.iter().any(|name| name.ends_with(&stale_name)),
+            "陈旧临时文件不能进产物: {names:?}"
+        );
+        assert_eq!(
+            names.len(),
+            legal.len(),
+            "条目数应等于合法文件数: {names:?}"
+        );
+        for name in legal {
+            let expected = format!("Localization/English/{name}");
+            assert!(
+                names.contains(&expected),
+                "{expected} 必须照常打进产物: {names:?}"
+            );
+        }
+    }
+
+    /// 判定要**窄**：只有完整的临时文件形状才跳过，合法名字一律照打。
+    ///
+    /// 直接对着打包收集器测（比只测 `is_atomic_temp_name` 更靠得住：
+    /// 钉的是「打包路径真的用了这份规则、而且只丢该丢的那一个」）。
+    #[test]
+    fn collect_pack_files_only_drops_the_real_temp_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unpacked = tmp.path().join(UNPACKED_DIR);
+        std::fs::create_dir_all(unpacked.join("Mods")).unwrap();
+        for name in [
+            "Mods/meta.lsx",
+            "Mods/a.tmp",
+            "Mods/notes.tmp123.txt",
+            "Mods/a.tmp..1",
+            "Mods/english.xml.tmp123",
+            "Mods/.hidden.tmp9.0", // 唯一的临时文件形状
+        ] {
+            std::fs::write(unpacked.join(name), b"x").unwrap();
+        }
+
+        let collected = collect_pack_files(&unpacked).unwrap();
+        let paths: Vec<&str> = collected.iter().map(|(_, path)| path.as_str()).collect();
+
+        assert!(
+            !paths.contains(&"Mods/.hidden.tmp9.0"),
+            "临时文件形状必须被排除: {paths:?}"
+        );
+        for kept in [
+            "Mods/meta.lsx",
+            "Mods/a.tmp",
+            "Mods/notes.tmp123.txt",
+            "Mods/a.tmp..1",
+            "Mods/english.xml.tmp123",
+        ] {
+            assert!(paths.contains(&kept), "{kept} 不能被丢掉: {paths:?}");
+        }
+        assert_eq!(paths.len(), 5, "{paths:?}");
+        // 条目顺序稳定（同一份工作目录每次打出同样的顺序）
+        let mut sorted = paths.clone();
+        sorted.sort_unstable();
+        assert_eq!(paths, sorted, "条目顺序必须稳定: {paths:?}");
+    }
+
     #[test]
     fn open_and_extract_rejects_missing_file() {
         let err = open_and_extract("/nope/missing.pak").unwrap_err();
         assert_eq!(err.code(), "config");
+    }
+
+    /// 归档里的「目录条目」（名字以 `/` 结尾）不能把整个 MOD 变成打不开。
+    ///
+    /// 复现（修复前）：条目 `Localization/` 被当成普通文件写成
+    /// `unpacked/Localization`，随后同目录下的 `Localization/English/x.xml`
+    /// 在 `create_dir_all` 处直接失败（`Not a directory`），`open_and_extract_in`
+    /// 只抛出一句 `文件读写失败: Not a directory (os error 20)` —— 用户不知道
+    /// 是哪个条目、也不知道为什么，整个 MOD 一个文件都解不出来。
+    ///
+    /// 目录条目不携带内容（LSPK 的文件表是扁平的），正确处置是建目录 + 跳过：
+    /// 它既不进文件列表，也不该影响同目录下的真实文件。
+    #[test]
+    fn directory_style_entries_do_not_break_extraction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("Localization/English")).unwrap();
+        std::fs::write(
+            src.join("Localization/English/x.xml"),
+            br#"<contentList><content contentuid="h1" version="1">A</content></contentList>"#,
+        )
+        .unwrap();
+        // 少数打包器会为目录写一条以 `/` 结尾的空条目
+        std::fs::write(tmp.path().join("dummy"), b"").unwrap();
+        let pak = tmp.path().join("dirlike.pak");
+        PackageBuilder::new()
+            .add_directory(&src)
+            .unwrap()
+            .add_file(tmp.path().join("dummy"), "Localization/")
+            .build(&pak)
+            .unwrap();
+
+        let work_root = tmp.path().join("work");
+        std::fs::create_dir_all(&work_root).unwrap();
+        let (work_dir, files) = open_and_extract_in(pak.to_str().unwrap(), &work_root).unwrap();
+
+        assert_eq!(
+            files.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            vec!["Localization/English/x.xml"],
+            "目录条目不该出现在文件列表里"
+        );
+        let extracted =
+            std::fs::read_to_string(work_dir.join("unpacked/Localization/English/x.xml")).unwrap();
+        assert!(extracted.contains("contentuid=\"h1\""), "{extracted}");
+        assert!(
+            work_dir.join("unpacked/Localization").is_dir(),
+            "目录条目应该变成真目录"
+        );
+
+        // 重打包也不该被目录条目影响：产物里只有真实文件
+        let out = tmp.path().join("out.pak");
+        repack(work_dir.to_str().unwrap(), out.to_str().unwrap()).unwrap();
+        let pkg = Package::open(&out).unwrap();
+        assert_eq!(
+            build_pak_files(&pkg)
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Localization/English/x.xml"]
+        );
+    }
+
+    /// PAK 允许重复条目（同一路径多份数据）；解包必须与**游戏加载器的选择**
+    /// 一致：上游 `Package::open` 的 `index` 是「后写覆盖先写」，`get()` 返回
+    /// 最后一条，所以解包也必须取**最后一个可读**的版本 —— 取错的话用户
+    /// 翻译的是游戏根本不会用到的那份数据。
+    #[test]
+    fn duplicate_pak_entries_use_the_last_readable_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let v1 = tmp.path().join("v1");
+        let v2 = tmp.path().join("v2");
+        std::fs::create_dir_all(v1.join("Localization/English")).unwrap();
+        std::fs::create_dir_all(v2.join("Localization/English")).unwrap();
+        let name = "Localization/English/x.xml";
+        std::fs::write(
+            v1.join(name),
+            br#"<contentList><content contentuid="h1" version="1">FIRST</content></contentList>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            v2.join(name),
+            br#"<contentList><content contentuid="h1" version="1">SECOND</content></contentList>"#,
+        )
+        .unwrap();
+
+        let pak = tmp.path().join("dup.pak");
+        PackageBuilder::new()
+            .add_directory(&v1)
+            .unwrap()
+            .add_file(v2.join(name), name)
+            .build(&pak)
+            .unwrap();
+
+        let work_root = tmp.path().join("work");
+        std::fs::create_dir_all(&work_root).unwrap();
+        let (work_dir, files) = open_and_extract_in(pak.to_str().unwrap(), &work_root).unwrap();
+
+        assert_eq!(files.len(), 1, "同名条目只能解出一份文件: {files:?}");
+        assert_eq!(files[0].name, name);
+        let extracted = std::fs::read_to_string(work_dir.join("unpacked").join(name)).unwrap();
+        assert!(
+            extracted.contains("SECOND"),
+            "必须与游戏加载器取同一份（最后一条）: {extracted}"
+        );
+
+        // 与上游的 `get()` 对齐（它就是游戏语义的那份索引）
+        let pkg = Package::open(&pak).unwrap();
+        assert_eq!(
+            pkg.get(name).map(|f| f.size()),
+            Some(files[0].size),
+            "解包选中的条目必须和 `Package::get` 指向的同一条"
+        );
     }
 
     /// 打包**失败**时不能摧毁 `output_path` 上已有的文件，也不能留下半个 pak。
@@ -1402,6 +1800,458 @@ mod tests {
             "总量上限不该小于单条目上限: {} < {}",
             limits.max_total_bytes,
             limits.max_entry_bytes
+        );
+    }
+
+    /// 造一个含指定文件的 PAK（炸弹用例的原材料）。
+    fn pak_with_files(tmp: &Path, files: &[(&str, Vec<u8>)]) -> PathBuf {
+        let src = tmp.join("payload");
+        for (name, data) in files {
+            let path = src.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, data).unwrap();
+        }
+        let pak = tmp.join("payload.pak");
+        PackageBuilder::new()
+            .add_directory(&src)
+            .unwrap()
+            .build(&pak)
+            .unwrap();
+        pak
+    }
+
+    /// PAK 解压必须有上限，而且要**对称于 zip 那条路**。
+    ///
+    /// 复现（修复前）：257 KB 的 PAK（一个 64 MiB 全零条目，LZ4 压缩比 255×）
+    /// 43 ms 内被原样解出 67108864 字节，全程没有任何上限；而同样的放大在 zip
+    /// 路径上会被 `ZipLimits` 拦住。把上限去掉（或改成 `u64::MAX`）这条用例立刻变红。
+    ///
+    /// 用注入的小上限跑（否则测试要造几 GiB 的归档），默认值另由
+    /// `extract_limits_default_stays_bounded` 钉住。
+    #[test]
+    fn pak_expansion_is_capped_like_the_zip_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 4 MiB 全零 → 归档只有几 KB
+        let pak = pak_with_files(tmp.path(), &[("bomb.bin", vec![0u8; 4 << 20])]);
+        let archive_size = std::fs::metadata(&pak).unwrap().len();
+        assert!(
+            archive_size < (1 << 20),
+            "炸弹样本应远小于解压结果: {archive_size}"
+        );
+        let pkg = Package::open(&pak).unwrap();
+
+        // ① 单条目上限。声明 4 MiB > 注入的 1 MiB，所以拦下它的是**声明预检**这一层
+        // （真正「声明撒谎」的那一层由 `lying_declared_size_is_caught_by_the_actual_bytes_layer` 覆盖）。
+        let dir = tmp.path().join("out1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let limits = ExtractLimits {
+            max_entry_bytes: 1 << 20,
+            max_total_bytes: 64 << 20,
+            max_entries: 16,
+        };
+        let err = extract_package_files_limited(&pkg, &dir, limits).unwrap_err();
+        assert_eq!(err.code(), "pak", "{err}");
+        assert!(
+            err.to_string().contains("声明解压后"),
+            "必须是「声明预检」这一层拦下来的: {err}"
+        );
+        assert!(
+            !err.to_string().contains("实际解压"),
+            "声明层能拦住就不该走到实际写入层: {err}"
+        );
+        assert!(
+            walk_files(&dir).is_empty(),
+            "超限时必须**一个文件都没写**（检查在写盘之前）: {:?}",
+            walk_files(&dir)
+        );
+
+        // ② 总量上限
+        let pak2 = pak_with_files(
+            &tmp.path().join("two"),
+            &[
+                ("a.bin", vec![0u8; 600 << 10]),
+                ("b.bin", vec![0u8; 600 << 10]),
+            ],
+        );
+        let pkg2 = Package::open(&pak2).unwrap();
+        let dir2 = tmp.path().join("out2");
+        std::fs::create_dir_all(&dir2).unwrap();
+        let err = extract_package_files_limited(
+            &pkg2,
+            &dir2,
+            ExtractLimits {
+                max_entry_bytes: 1 << 20,
+                max_total_bytes: 1 << 20,
+                max_entries: 16,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "pak", "{err}");
+        assert!(
+            err.to_string().contains("总量"),
+            "必须是「总量」这一层拦下来的: {err}"
+        );
+        assert!(walk_files(&dir2).is_empty(), "超限时不该写出任何文件");
+
+        // ③ 条目数上限
+        let pak3 = pak_with_files(
+            &tmp.path().join("many"),
+            &[("a.txt", b"a".to_vec()), ("b.txt", b"b".to_vec())],
+        );
+        let pkg3 = Package::open(&pak3).unwrap();
+        let dir3 = tmp.path().join("out3");
+        std::fs::create_dir_all(&dir3).unwrap();
+        let err = extract_package_files_limited(
+            &pkg3,
+            &dir3,
+            ExtractLimits {
+                max_entry_bytes: 1 << 20,
+                max_total_bytes: 1 << 20,
+                max_entries: 1,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "pak", "{err}");
+        assert!(err.to_string().contains("条目数"), "{err}");
+
+        // ④ 正向对照：正常体量照常解出（上限不能误伤）
+        let dir4 = tmp.path().join("out4");
+        std::fs::create_dir_all(&dir4).unwrap();
+        let files = extract_package_files_limited(&pkg, &dir4, ExtractLimits::default()).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            std::fs::metadata(dir4.join("bomb.bin")).unwrap().len(),
+            4 << 20
+        );
+    }
+
+    /// 默认上限同样必须被钉住（注入小上限的用例拦不住「默认值被改成 `u64::MAX`」）。
+    ///
+    /// ⚠️ 这条只钉「常量本身有界」，**不能**证明生产入口真的用了它 ——
+    /// 「生产入口用了默认限制」由
+    /// [`Self::production_entry_enforces_the_default_declared_total_limit`] 证明
+    /// （独立验证者 T2 的变异实验：把 `extract_package_files` 改成注入
+    /// `u64::MAX` 时，全量 492 条测试仍然全绿，就是缺了那条）。
+    #[test]
+    fn extract_limits_default_stays_bounded() {
+        let limits = ExtractLimits::default();
+
+        // 上界：默认值不能大到等于没有限制
+        assert!(
+            limits.max_entry_bytes <= 16 * 1024 * 1024 * 1024,
+            "单条目默认上限过大，压缩炸弹防线等于失效: {}",
+            limits.max_entry_bytes
+        );
+        assert!(
+            limits.max_total_bytes <= 64 * 1024 * 1024 * 1024,
+            "总量默认上限过大，压缩炸弹防线等于失效: {}",
+            limits.max_total_bytes
+        );
+        assert!(
+            limits.max_entries <= 1_000_000,
+            "条目数默认上限过大，海量小文件防线等于失效: {}",
+            limits.max_entries
+        );
+
+        // 下界：也不能小到误伤真实 MOD
+        assert!(
+            limits.max_entry_bytes >= 1024 * 1024 * 1024,
+            "单条目默认上限过小，会误伤真实的大 MOD: {}",
+            limits.max_entry_bytes
+        );
+        assert!(
+            limits.max_total_bytes >= limits.max_entry_bytes,
+            "总量上限不该小于单条目上限: {} < {}",
+            limits.max_total_bytes,
+            limits.max_entry_bytes
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 手工拼的 PAK：用来打「生产入口真的用了默认限制」这条链路
+    // ─────────────────────────────────────────────────────────────
+
+    /// V7（legacy）文件表项大小：name[256] + offset u32 + size_on_disk u32
+    /// + uncompressed_size u32 + archive_part u32。
+    const V7_ENTRY_SIZE: usize = 272;
+    /// V7 头部大小：version + data_offset + num_parts + file_list_size
+    /// + little_endian(1) + num_files。
+    const V7_HEADER_SIZE: usize = 21;
+
+    /// 拼一条 V7 文件表项。
+    fn v7_entry(name: &str, offset: u32, size_on_disk: u32, declared: u32) -> Vec<u8> {
+        let mut entry = vec![0u8; V7_ENTRY_SIZE];
+        let name_bytes = name.as_bytes();
+        assert!(name_bytes.len() < 256, "名字必须能放进 256 字节的定长字段");
+        entry[..name_bytes.len()].copy_from_slice(name_bytes);
+        entry[256..260].copy_from_slice(&offset.to_le_bytes());
+        entry[260..264].copy_from_slice(&size_on_disk.to_le_bytes());
+        entry[264..268].copy_from_slice(&declared.to_le_bytes());
+        entry[268..272].copy_from_slice(&0u32.to_le_bytes()); // archive_part
+        entry
+    }
+
+    /// 拼一个 V7 PAK：头部 + **未压缩**文件表 + 可选负载。
+    ///
+    /// 为什么是 V7：`bg3rustpaklib` 的 `has_compressed_file_list()` 是
+    /// `version >= V13`，只有 V7/V9/V10 的文件表是明文 —— V13+ 的表是 LZ4 压过的，
+    /// 要在测试里伪造声明就得先有一个 LZ4 编码器（不允许新增依赖）。
+    ///
+    /// 这也是**唯一**能在默认上限下触发声明预检的形态：V7/V18 的单条目
+    /// `uncompressed_size` 是 u32（≤ 4 GiB），低于默认单条目上限 6 GiB，
+    /// 所以「单条目声明超默认上限」在真实格式里不可达；能达的是**总量**
+    /// （多条 u32 声明累加 > 16 GiB）与**条目数**（> 20 万）两个默认值。
+    fn forge_v7_pak(entries: &[Vec<u8>], payload: &[u8]) -> Vec<u8> {
+        let file_list_len = entries.len() * V7_ENTRY_SIZE;
+        let mut pak = Vec::with_capacity(V7_HEADER_SIZE + file_list_len + payload.len());
+        pak.extend_from_slice(&7u32.to_le_bytes()); // version = V7
+        pak.extend_from_slice(&0u32.to_le_bytes()); // data_offset
+        pak.extend_from_slice(&1u32.to_le_bytes()); // num_parts
+        pak.extend_from_slice(&(file_list_len as u32).to_le_bytes());
+        pak.push(1); // little_endian
+        pak.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for entry in entries {
+            pak.extend_from_slice(entry);
+        }
+        pak.extend_from_slice(payload);
+        pak
+    }
+
+    /// 声明「解压后 4 GiB」的 V7 条目（`uncompressed_size > 0` ⇒ 被当成压缩条目，
+    /// 于是 `size()` 返回这个声明值）。
+    fn v7_entry_declaring_4gib(name: &str) -> Vec<u8> {
+        v7_entry(name, 0, 0, u32::MAX)
+    }
+
+    /// DEFLATE **stored**（不压缩）块：`BFINAL|BTYPE=00` + LEN + ~LEN + 原始字节。
+    fn deflate_stored(payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(payload.len() + 16);
+        let chunks: Vec<&[u8]> = payload.chunks(65535).collect();
+        if chunks.is_empty() {
+            out.push(0x01);
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0xFFFFu16.to_le_bytes());
+            return out;
+        }
+        for (index, chunk) in chunks.iter().enumerate() {
+            out.push(if index + 1 == chunks.len() {
+                0x01
+            } else {
+                0x00
+            });
+            let len = chunk.len() as u16;
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&(!len).to_le_bytes());
+            out.extend_from_slice(chunk);
+        }
+        out
+    }
+
+    /// Adler-32（zlib 的校验尾）。
+    fn adler32(bytes: &[u8]) -> u32 {
+        let mut a: u32 = 1;
+        let mut b: u32 = 0;
+        for &byte in bytes {
+            a = (a + u32::from(byte)) % 65521;
+            b = (b + a) % 65521;
+        }
+        (b << 16) | a
+    }
+
+    /// 把负载包成合法 zlib 流（2 字节头 + stored DEFLATE + 4 字节 Adler-32）。
+    fn zlib_stored(payload: &[u8]) -> Vec<u8> {
+        // 0x7801：CM=deflate、FLEVEL=0，且 0x7801 % 31 == 0（zlib 的 FCHECK 约束）
+        let mut out = vec![0x78, 0x01];
+        out.extend_from_slice(&deflate_stored(payload));
+        out.extend_from_slice(&adler32(payload).to_be_bytes());
+        out
+    }
+
+    /// 拼一个「**声明撒谎**」的 V7 PAK：负载真实解压出 `payload.len()` 字节，
+    /// 但文件表里写的是 `declared`。
+    ///
+    /// 上游 `decompress_zlib` 只把 `uncompressed_size` 当容量提示
+    /// （`Vec::with_capacity`），实际返回的是完整解压结果 —— 所以声明小、
+    /// 内容大是可能的，这正是「实际写入字节数」那一层存在的理由。
+    fn forge_v7_pak_with_lying_entry(name: &str, payload: &[u8], declared: u32) -> Vec<u8> {
+        let compressed = zlib_stored(payload);
+        let offset = (V7_HEADER_SIZE + V7_ENTRY_SIZE) as u32;
+        let entry = v7_entry(name, offset, compressed.len() as u32, declared);
+        forge_v7_pak(&[entry], &compressed)
+    }
+
+    /// **生产入口**必须真的用默认限制：这是「防线被静默摘掉」的哨兵。
+    ///
+    /// 独立验证者 T2 的变异实验：把 `extract_package_files` 改成注入
+    /// `ExtractLimits { u64::MAX, u64::MAX, usize::MAX }`（等于修复前的无上限），
+    /// 全量 492 条测试**全部仍然绿** —— 因为 `extract_limits_default_stays_bounded`
+    /// 只钉常量、`pak_expansion_is_capped_like_the_zip_path` 只钉注入上限的机制，
+    /// 没有一条断言生产入口真的把默认限制传了下去。
+    ///
+    /// 这条走 `open_and_extract_in`（不注入任何 limits），用一个 V7 PAK 让 5 个条目
+    /// 各声明 4 GiB（合计 20 GiB > 默认 16 GiB）触发**声明预检**：
+    /// - 不需要真的解压任何数据、不需要真的占 16 GiB 磁盘（归档只有 1.4 KB）；
+    /// - 预检在创建任何文件之前，所以断言「一个文件都没写」。
+    ///
+    /// 变异实验：把生产入口改成 `u64::MAX` ⇒ 本用例红（解包「成功」）；
+    /// 恢复 ⇒ 绿。
+    #[test]
+    fn production_entry_enforces_the_default_declared_total_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pak = tmp.path().join("declares-too-much.pak");
+        let entries: Vec<Vec<u8>> = (0..5)
+            .map(|index| v7_entry_declaring_4gib(&format!("bomb{index}.bin")))
+            .collect();
+        let bytes = forge_v7_pak(&entries, &[]);
+        assert!(
+            bytes.len() < 4096,
+            "样本必须很小（声明撒谎，不占磁盘）: {} 字节",
+            bytes.len()
+        );
+        std::fs::write(&pak, &bytes).unwrap();
+
+        // 走生产入口，不注入 limits；工作目录名以 bg3-translate- 开头 ⇒ 被直接用
+        let work = tmp.path().join("bg3-translate-probe");
+        // 不写 `.unwrap_err()`：万一防线被摘掉，`Ok` 里的几百个条目会刷满输出
+        let err = match open_and_extract_in(pak.to_str().unwrap(), &work) {
+            Ok((_, files)) => panic!("默认声明总量上限没生效：{} 个条目全被解出来了", files.len()),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code(), "pak", "必须报 pak 错误: {err}");
+        assert!(
+            err.to_string().contains("总量"),
+            "必须是「声明总量」这一层拦下来的: {err}"
+        );
+        assert!(
+            walk_files(&unpacked_dir(&work)).is_empty(),
+            "预检必须发生在写盘之前，实际写了: {:?}",
+            walk_files(&unpacked_dir(&work))
+        );
+    }
+
+    /// 默认的**条目数**上限同样要由生产入口兜住（与总量是两条独立的默认值）。
+    ///
+    /// 20 万零 1 个条目、每个 272 字节明文表项 ≈ 54 MB 的归档，条目本身都不带数据，
+    /// 所以磁盘与时间成本都可接受；断言解包被拒且一个文件都没写。
+    #[test]
+    fn production_entry_enforces_the_default_entry_count_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pak = tmp.path().join("too-many-entries.pak");
+        let count = ExtractLimits::default().max_entries + 1;
+        // 直接拼明文文件表（V7），不必给每个条目真的准备数据
+        let mut entries = Vec::with_capacity(count * V7_ENTRY_SIZE);
+        for index in 0..count {
+            entries.extend_from_slice(&v7_entry(&format!("f{index}.txt"), 0, 0, 0));
+        }
+        let mut bytes = Vec::with_capacity(V7_HEADER_SIZE + entries.len());
+        bytes.extend_from_slice(&7u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&((count * V7_ENTRY_SIZE) as u32).to_le_bytes());
+        bytes.push(1);
+        bytes.extend_from_slice(&(count as u32).to_le_bytes());
+        bytes.extend_from_slice(&entries);
+        std::fs::write(&pak, &bytes).unwrap();
+
+        let work = tmp.path().join("bg3-translate-probe");
+        // 同上：不写 `.unwrap_err()`，否则防线一被摘掉就会打印 20 万条条目
+        let err = match open_and_extract_in(pak.to_str().unwrap(), &work) {
+            Ok((_, files)) => panic!(
+                "默认条目数上限没生效：{} 个条目全被解出来了（应当报错）",
+                files.len()
+            ),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code(), "pak", "必须报 pak 错误: {err}");
+        assert!(
+            err.to_string().contains("条目数"),
+            "必须是「条目数」这一层拦下来的: {err}"
+        );
+        assert!(
+            walk_files(&unpacked_dir(&work)).is_empty(),
+            "不该写出任何文件"
+        );
+    }
+
+    /// 「声明撒谎」必须被**实际解压字节数**那一层拦住。
+    ///
+    /// 这条覆盖的是兜底层，**不是**生产默认值（生产默认的覆盖见上面两条）。
+    /// V7 条目声明只解压 4 KiB、真实内容是 4 MiB：声明层全部放行，只有实际计数能拦住。
+    /// 注入小上限是因为默认单条目上限是 6 GiB，真造一份 6 GiB 的样本不现实。
+    #[test]
+    fn lying_declared_size_is_caught_by_the_actual_bytes_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let payload = vec![b'A'; 4 << 20];
+        let declared = 4096u32;
+        let pak = tmp.path().join("liar.pak");
+        std::fs::write(
+            &pak,
+            forge_v7_pak_with_lying_entry("liar.bin", &payload, declared),
+        )
+        .unwrap();
+
+        let pkg = Package::open(&pak).unwrap();
+        assert_eq!(
+            pkg.files()[0].size(),
+            u64::from(declared),
+            "夹具的前提：文件表里的声明必须是 4 KiB（小于注入的 1 MiB 上限）"
+        );
+
+        // ① 单条目层：声明 4 KiB 放行，实际 4 MiB 超 1 MiB
+        let dir = tmp.path().join("out1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = extract_package_files_limited(
+            &pkg,
+            &dir,
+            ExtractLimits {
+                max_entry_bytes: 1 << 20,
+                max_total_bytes: 64 << 20,
+                max_entries: 16,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "pak", "{err}");
+        assert!(
+            err.to_string().contains("实际解压") && err.to_string().contains("声明大小与内容不符"),
+            "必须是「实际写入」这一层拦下来的: {err}"
+        );
+        assert!(
+            !err.to_string().contains("声明解压后"),
+            "声明层本该放行（4 KiB < 1 MiB）: {err}"
+        );
+        assert!(walk_files(&dir).is_empty(), "超限时一个字节都不该落盘");
+
+        // ② 总量层：单条目 8 MiB 放行、总量 1 MiB 被实际 4 MiB 突破
+        let dir2 = tmp.path().join("out2");
+        std::fs::create_dir_all(&dir2).unwrap();
+        let err = extract_package_files_limited(
+            &pkg,
+            &dir2,
+            ExtractLimits {
+                max_entry_bytes: 8 << 20,
+                max_total_bytes: 1 << 20,
+                max_entries: 16,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "pak", "{err}");
+        assert!(
+            err.to_string().contains("PAK 解压总量超过上限"),
+            "必须由「实际解压总量」这一层拦下来: {err}"
+        );
+        assert!(walk_files(&dir2).is_empty(), "超限时一个字节都不该落盘");
+
+        // ③ 正向对照：把上限放开到真实体量之上，内容必须原样解出
+        let dir3 = tmp.path().join("out3");
+        std::fs::create_dir_all(&dir3).unwrap();
+        let files = extract_package_files_limited(&pkg, &dir3, ExtractLimits::default()).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            std::fs::read(dir3.join("liar.bin")).unwrap(),
+            payload,
+            "夹具必须真的能解出 4 MiB（否则上面的红是假红）"
         );
     }
 }

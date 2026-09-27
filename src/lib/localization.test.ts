@@ -271,6 +271,35 @@ describe("mergeWithExistingTarget（写回已有文件的底稿合并）", () =>
     expect(merged[0].target).toBe("");
   });
 
+  /**
+   * 只有 BOM / 零宽字符的译文在后端**不算译文**（`has_writable_target()` 用
+   * `has_visible_text`，见 types.rs）→ 写回会退回英文原文。前端如果还按
+   * `target.trim() !== ""` 判成「有译文」，它就会在这里挤掉 MOD 自带的真实中文，
+   * 随后后端把英文原文写回去 —— 自带中文静默丢失（不可逆）。
+   */
+  it("只有 BOM / 零宽字符的 incoming 译文不算译文，不得挤掉底稿里的真实中文", () => {
+    const invisibleTargets = ["\uFEFF", "\u200B", "\u00AD", "  \uFEFF\u200B  "];
+    for (const target of invisibleTargets) {
+      const merged = mergeWithExistingTarget(
+        [incoming("uid-1", "Fireball", { target, status: "translated" })],
+        [base("uid-1", "火球")],
+      );
+
+      expect(merged, JSON.stringify(target)).toHaveLength(1);
+      // 底稿胜出：文本与状态都保持底稿那一份
+      expect(merged[0].source, JSON.stringify(target)).toBe("火球");
+      expect(merged[0].target, JSON.stringify(target)).toBe("");
+    }
+  });
+
+  it("零宽字符夹在正文中间的译文仍然算译文（变体选择符是有意义的）", () => {
+    const merged = mergeWithExistingTarget(
+      [incoming("uid-1", "Fireball", { target: "火\u200B球\uFE0F术", status: "translated" })],
+      [base("uid-1", "火球")],
+    );
+    expect(merged[0].target).toBe("火\u200B球\uFE0F术");
+  });
+
   it("底稿有、incoming 没有的 contentuid 保留，顺序为 incoming 在前", () => {
     const merged = mergeWithExistingTarget(
       [incoming("uid-2", "Ice")],

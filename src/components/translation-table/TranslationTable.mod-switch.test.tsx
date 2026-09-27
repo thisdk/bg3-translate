@@ -8,9 +8,15 @@
  * 回滚会命中新 MOD 里同名同 id 的条目**，把刚翻译好的结果改成 `translating`
  * 甚至清空。用例用受控 Promise 手动投递旧回调，不依赖 sleep。
  *
+ * **用 `<StrictMode>` 包裹**（`src/main.tsx` 就是 StrictMode）：这些用例覆盖的是
+ * 「工作台挂载 → 卸载 → 重挂载」生命周期最密的路径（流式批处理器、迟到事件、
+ * 编辑竞态、切换 MOD）。非 StrictMode 挂载看不见「cleanup 与挂载不一一对应」这类
+ * 结构缺陷（R5-02：`useMemo` 的 delta 批处理器被永久 dispose，流式文本全丢），
+ * 所以这里刻意用生产/开发实际运行的严格生命周期跑。
+ *
  * 跑法：`bunx vitest run src/components/translation-table/TranslationTable.mod-switch.test.tsx`
  */
-import { act } from "react";
+import { StrictMode, act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TranslationTable } from "@/components/TranslationTable";
 import { useAppStore } from "@/store/app-store";
@@ -97,7 +103,11 @@ async function openModAndRender(view: Mounted, pakPath: string, workDir: string)
   const api = useAppStore.getState();
   api.setModOpened(pakPath, workDir, [pakFile(FILE_NAME)]);
   api.setSelectedFiles([pakFile(FILE_NAME)]);
-  await view.render(<TranslationTable />);
+  await view.render(
+    <StrictMode>
+      <TranslationTable />
+    </StrictMode>,
+  );
   await waitMs(0);
 }
 
@@ -176,5 +186,47 @@ describe("翻译途中切换 MOD", () => {
       newRun.finish();
       await Promise.resolve();
     });
+  });
+});
+
+describe("离开工作台时的取消", () => {
+  it("翻译还在跑就点「返回」：必须请求后端取消，不能让它在看不见的地方继续烧额度", async () => {
+    const { cancelTranslation } = await import("@/lib/tauri");
+    const view = openView();
+    await openModAndRender(view, "/tmp/leave.pak", "/tmp/work-leave");
+    const run = await startTranslation(view);
+    vi.mocked(cancelTranslation).mockClear();
+
+    // 工作台卸载（点「返回」回首页）：取消按钮随组件一起消失，
+    // 之后用户再也没有任何入口能停掉这一轮
+    view.unmount();
+    opened.pop();
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(cancelTranslation).toHaveBeenCalledTimes(1);
+
+    // 后端收尾（取消后仍会返回），旧回调不得改动任何东西
+    await act(async () => {
+      run.send({ type: "all_done", total: 1, failed: 1 });
+      run.finish();
+      await Promise.resolve();
+    });
+  });
+
+  it("没有翻译在跑时离开工作台不得请求取消（别把令牌重置成别人的）", async () => {
+    const { cancelTranslation } = await import("@/lib/tauri");
+    const view = openView();
+    await openModAndRender(view, "/tmp/idle.pak", "/tmp/work-idle");
+    vi.mocked(cancelTranslation).mockClear();
+
+    view.unmount();
+    opened.pop();
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(cancelTranslation).not.toHaveBeenCalled();
   });
 });

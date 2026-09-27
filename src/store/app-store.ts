@@ -50,6 +50,18 @@ interface AppState {
    * `setFileEntries` 整体替换某个文件时会重建该文件的索引。
    */
   entryIdToIndex: Record<string, number>;
+  /**
+   * 写回底稿快照：目标路径 → **打开 MOD 时**该文件的条目。
+   *
+   * 为什么必须缓存：`Localization/English/x.xml` 与 MOD 自带的
+   * `Localization/Chinese/x.xml` 会映射到同一个写回路径，写回时要把自带文件
+   * 当底稿合并（R-05）。但写回本身会**改写工作目录里的那个文件**——第二次写回
+   * 再读它读到的就是我们自己的产物，等于「自己合并自己」：
+   *   - 用户「还原」掉的条目会被上一次写回留下的译文复活；
+   *   - 原始底稿（官方中文）一旦被覆盖就再也取不回来。
+   * 所以每个写回路径的底稿只从磁盘取一次，之后一直用这份快照。
+   */
+  shippedBaseline: Record<string, TranslationEntry[]>;
   // ── LLM 设置 ──
   settings: LlmSettings;
   settingsLoaded: boolean;
@@ -94,6 +106,13 @@ interface AppState {
   getAllEntries: () => TranslationEntry[];
   /** 获取某个文件的条目，用于写回 */
   getFileEntries: (fileName: string) => TranslationEntry[];
+  /**
+   * 记下某个写回目标路径的原始底稿（只记第一次，重复调用不覆盖）。
+   *
+   * 只记第一次是关键：调用方在**写回之前**读磁盘，第二次写回时磁盘上已经是
+   * 上一次的产物了，覆盖快照就等于把「自己合并自己」引回来。
+   */
+  cacheShippedBaseline: (fileName: string, entries: TranslationEntry[]) => void;
   /**
    * 按 id 取当前条目（不存在返回 undefined）。
    *
@@ -195,6 +214,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   entriesByFile: {},
   entryIdToFile: {},
   entryIdToIndex: {},
+  shippedBaseline: {},
   settings: DEFAULT_SETTINGS,
   settingsLoaded: false,
   theme: loadTheme(),
@@ -214,6 +234,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       entriesByFile: {},
       entryIdToFile: {},
       entryIdToIndex: {},
+      // 换了 MOD：底稿快照是上一个 MOD 的文件内容，必须一起清掉
+      shippedBaseline: {},
       error: null,
       // 换了 MOD：上一轮翻译的运行态与本次无关（旧一轮的回调也会因为
       // runId / 卸载而停止写 store）
@@ -298,6 +320,13 @@ export const useAppStore = create<AppState>((set, get) => ({
     return all;
   },
   getFileEntries: (fileName) => get().entriesByFile[fileName] ?? [],
+  cacheShippedBaseline: (fileName, entries) =>
+    set((s) =>
+      // 已经有快照就不再写：磁盘上的那份可能已经被上一次写回改过
+      s.shippedBaseline[fileName]
+        ? {}
+        : { shippedBaseline: { ...s.shippedBaseline, [fileName]: entries } },
+    ),
   getEntryById: (id) => {
     const hit = locateEntry(get(), id);
     return hit ? hit.list[hit.index] : undefined;
@@ -328,6 +357,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       entriesByFile: {},
       entryIdToFile: {},
       entryIdToIndex: {},
+      shippedBaseline: {},
       error: null,
       runToken: null,
     }),

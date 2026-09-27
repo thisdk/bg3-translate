@@ -5,8 +5,14 @@ import { useAppStore } from "@/store/app-store";
 /**
  * 为「已勾选但尚未加载」的文件加载条目。
  *
- * 用 ref 追踪已加载的文件，避免它进入 useEffect 依赖造成循环
- * （store 的 loadedFileNames Set 每次更新都产生新引用，会导致 effect 反复触发）。
+ * 两道账本，缺一不可：
+ *   - `loadedRef`：**本次挂载**里已发起（含仍在读）的文件，防止 effect 重入
+ *     时重复请求，取消勾选时未完成的那次会被放回；
+ *   - store 的 `loadedFileNames`：**本次会话**里已经写进 store 的文件。
+ *     工作台销毁重建后 ref 归零，但条目还在 store 里，不能再读一遍
+ *     （重读会用磁盘内容覆盖内存里的译文，见 effect 内的说明）。
+ * 用 ref 而不是把 Set 放进依赖，是因为 Set 每次更新都产生新引用，
+ * 会导致 effect 反复触发。
  */
 export function useEntryLoading(): { loading: boolean } {
   const workDir = useAppStore((s) => s.workDir);
@@ -29,7 +35,18 @@ export function useEntryLoading(): { loading: boolean } {
 
   useEffect(() => {
     if (!workDir || selectedFiles.length === 0) return;
-    const toLoad = selectedFiles.filter((f) => !loadedRef.current.has(f.name));
+    // store 里的 `loadedFileNames` 必须一起看：工作台会被销毁重建
+    // （打包页 →「返回继续编辑」、切到 home 再回来），而 `loadedRef` 随组件
+    // 一起消失。只信 ref 就会把已经加载过的文件再读一遍，用磁盘内容整体替换
+    // store 里的条目 —— 磁盘上那个源文件还是英文原文，于是刚翻译/手工编辑的
+    // 结果全变回「待翻译」，用户再点一次打包就把英文原文写回
+    // `Localization/Chinese/...`，覆盖掉上一次已经写好的中文（不可逆）。
+    // 这里直接读 store 快照而不订阅它：Set 每次更新都是新引用，订阅会让
+    // effect 在每次 `setFileEntries` 后多跑一遍（无意义）。
+    const loaded = useAppStore.getState().loadedFileNames;
+    const toLoad = selectedFiles.filter(
+      (f) => !loadedRef.current.has(f.name) && !loaded.has(f.name),
+    );
     if (toLoad.length === 0) return;
     // 立即标记为已加载，防止 effect 重入时重复请求
     toLoad.forEach((f) => loadedRef.current.add(f.name));

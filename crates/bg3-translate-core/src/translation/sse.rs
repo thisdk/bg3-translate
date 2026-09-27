@@ -13,6 +13,8 @@
 //! - `\n` / `\r\n` / 单独 `\r` 三种行结束符
 //! - 空行分隔事件；注释行 `:` 与非 data 字段（`event:`/`id:`/`retry:`）忽略
 //! - 多行 `data:` 用 `\n` 拼接（SSE 规范）
+//! - 流开头的 UTF-8 BOM（`EF BB BF`）先剥掉：不剥的话首帧的 `data:` 前缀匹配不上，
+//!   整条被当心跳丢掉（首帧往往就是第一段译文，见 [`SseDecoder::strip_leading_bom`]）
 //! - `[DONE]` 作为独立的 [`SseEvent::Done`]
 
 use std::mem;
@@ -30,6 +32,9 @@ const MAX_LINE_BYTES: usize = 1 << 20;
 
 /// 单个事件（多行 `data:` 拼接后）的字节上限。
 const MAX_EVENT_BYTES: usize = 4 << 20;
+
+/// UTF-8 BOM：部分网关（代理、静态文件式响应）会在流最前面发这三个字节。
+const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 
 /// 一条解析出来的 SSE 事件。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +59,8 @@ pub struct SseDecoder {
     buffer: Vec<u8>,
     /// 当前事件已累积的 data 行。
     data_lines: Vec<String>,
+    /// 流开头的 BOM 已经判定过（剥掉或确认没有），见 [`Self::strip_leading_bom`]。
+    bom_checked: bool,
 }
 
 impl SseDecoder {
@@ -61,12 +68,14 @@ impl SseDecoder {
         Self {
             buffer: Vec::new(),
             data_lines: Vec::new(),
+            bom_checked: false,
         }
     }
 
     /// 喂入一段字节，返回本次能解析出的所有事件。
     pub fn push(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
         self.buffer.extend_from_slice(chunk);
+        self.strip_leading_bom();
         self.drain_lines()
     }
 
@@ -75,6 +84,7 @@ impl SseDecoder {
     /// 公开的 [`Self::push`] 保持原语义（无上限、返回 `Vec`），生产路径走这个。
     pub(crate) fn push_checked(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>> {
         self.buffer.extend_from_slice(chunk);
+        self.strip_leading_bom();
         if take_line(&self.buffer).is_none() && self.buffer.len() > MAX_LINE_BYTES {
             return Err(AppError::Llm(format!(
                 "SSE 数据行已超过 {MAX_LINE_BYTES} 字节仍没有换行（服务端可能没有按 SSE 返回），已中止本次请求"
@@ -88,6 +98,29 @@ impl SseDecoder {
             )));
         }
         Ok(events)
+    }
+
+    /// 剥掉流开头的 UTF-8 BOM（三个字节），只能剥一次。
+    ///
+    /// 不剥的话第一行是 `\u{feff}data: {...}`：`data:` 前缀匹配不上，整条首帧
+    /// 会被当「字段不明的心跳」丢掉。首帧通常就是第一段译文，而它**不带来任何
+    /// 错误信号** —— 后面的 `[DONE]` 照样算「输出完整」的证据，于是少了一截的
+    /// 译文静默通过结构校验写进 PAK。
+    ///
+    /// 判定要跨越 chunk 边界：BOM 可能被切成 1+2 / 2+1 字节两段，所以不足三个
+    /// 字节时只在「不可能是 BOM 前缀」的情况下才收工。
+    fn strip_leading_bom(&mut self) {
+        if self.bom_checked {
+            return;
+        }
+        if self.buffer.starts_with(&UTF8_BOM) {
+            self.buffer.drain(..UTF8_BOM.len());
+            self.bom_checked = true;
+        } else if self.buffer.len() >= UTF8_BOM.len()
+            || !UTF8_BOM.starts_with(self.buffer.as_slice())
+        {
+            self.bom_checked = true;
+        }
     }
 
     /// 把缓冲区里已经完整的行全部解析出来。
@@ -105,6 +138,7 @@ impl SseDecoder {
     /// 流结束时冲刷残留缓冲（最后一行可能没有换行符，也可能没有收尾空行）。
     pub fn finish(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
+        self.strip_leading_bom();
         let rest = mem::take(&mut self.buffer);
         if !rest.is_empty() {
             let line = String::from_utf8_lossy(&rest);
@@ -245,6 +279,20 @@ impl ChatStreamChunk {
 /// 公开的 [`parse_chat_chunk`] 因此仍然返回 `None`（行为不变）。
 pub(crate) fn parse_chat_chunk_parts(data: &str) -> Option<ChatStreamChunk> {
     if let Ok(chunk) = serde_json::from_str::<CreateChatCompletionStreamResponse>(data) {
+        // 标准结构解析成功**不代表**服务端没报错：网关可以在一条字段齐全的 chunk
+        // 里带上 `error`，而 `choices` 可能是空的（`stream_options.include_usage`
+        // 的收尾帧本来就只有 `choices: []`）。错误判定必须优先于内容与 choices ——
+        // 否则这条「这条流没做完」的声明会被当心跳丢掉，半截译文配上 `[DONE]`
+        // 就成了「输出完整」，一路写进 PAK。
+        //
+        // 代价是这一条路上多做一次「只认 error」的小反序列化：chunk 只有几百字节，
+        // 相比一次网络往返可以忽略。
+        if let Some(error) = error_payload(data) {
+            return Some(ChatStreamChunk {
+                error: Some(error),
+                ..ChatStreamChunk::default()
+            });
+        }
         let choice = chunk.choices.into_iter().next()?;
         return Some(ChatStreamChunk {
             content: choice.delta.content,
@@ -267,6 +315,22 @@ pub(crate) fn parse_chat_chunk_parts(data: &str) -> Option<ChatStreamChunk> {
         finish_reason: choice.finish_reason,
         error: None,
     })
+}
+
+/// 只认 `error` 字段的最小结构。
+///
+/// 标准协议类型里没有 `error`（它只在网关中途报错时出现），所以单独取一次：
+/// 形状无关，够把「服务端自报这条流没做完」从任何 chunk 里捞出来就行。
+#[derive(Debug, Deserialize)]
+struct ErrorPayload {
+    #[serde(default)]
+    error: Option<serde_json::Value>,
+}
+
+/// 从一条 chunk 里取错误载荷的一句话；没有错误（或整条不是 JSON）返回 `None`。
+fn error_payload(data: &str) -> Option<String> {
+    let payload: ErrorPayload = serde_json::from_str(data).ok()?;
+    payload.error.map(|error| lenient_error_message(&error))
 }
 
 /// 从错误载荷里取一句人话。
@@ -682,6 +746,81 @@ mod tests {
             parse_chat_chunk(r#"{"choices":[{"delta":{"content":""}}]}"#).as_deref(),
             Some("")
         );
+    }
+
+    /// 流开头的 UTF-8 BOM 不能把第一帧吃掉。
+    ///
+    /// 有些网关（尤其带 BOM 的代理 / 静态文件式响应）会在最前面发 `EF BB BF`。
+    /// 不剥掉的话第一行变成 `\u{feff}data: {...}`，`data:` 前缀匹配不上，
+    /// 整条首帧被当字段不明的心跳丢掉 —— 首帧往往就是第一段译文，**而且**它不带
+    /// 任何错误信号：后面的 `[DONE]` 照样是「输出完整」的证据，少了一截的译文
+    /// 会静默通过结构校验写进 PAK。
+    #[test]
+    fn leading_utf8_bom_does_not_swallow_the_first_event() {
+        let mut decoder = SseDecoder::new();
+        let events = decoder.push(b"\xef\xbb\xbfdata: {\"a\":1}\n\ndata: [DONE]\n\n");
+        assert_eq!(events, vec![data("{\"a\":1}"), SseEvent::Done]);
+
+        // BOM 被 chunk 从中间切断（1 字节 / 2 字节）也要能剥掉
+        for split in [1usize, 2] {
+            let payload = b"\xef\xbb\xbfdata: first\n\ndata: [DONE]\n\n";
+            let mut decoder = SseDecoder::new();
+            let mut events = decoder.push(&payload[..split]);
+            events.extend(decoder.push(&payload[split..]));
+            events.extend(decoder.finish());
+            assert_eq!(events, vec![data("first"), SseEvent::Done], "split={split}");
+        }
+
+        // 没有 BOM 时行为不变（首字节不是 EF 就不该动它）
+        let mut decoder = SseDecoder::new();
+        assert_eq!(decoder.push(b"data: x\n\n"), vec![data("x")]);
+        // 不带换行的残留行（靠 finish 冲刷）同样要剥 BOM
+        let mut decoder = SseDecoder::new();
+        assert!(decoder.push(b"\xef\xbb\xbfdata: tail").is_empty());
+        assert_eq!(decoder.finish(), vec![data("tail")]);
+    }
+
+    /// 特性齐全的一条流：任何切分方式都必须解析出同一串事件。
+    ///
+    /// 覆盖 BOM、注释心跳、CRLF、单独 `\r`、多行 data、`data` 无冒号、
+    /// 跨分片被切断的多字节字符与 `[DONE]`。
+    #[test]
+    fn feature_rich_stream_is_split_invariant() {
+        let payload: &[u8] = b"\xef\xbb\xbf: keep-alive\r\n\
+             data: {\"choices\":[{\"delta\":{\"content\":\"\xe4\xbd\xa0\"}}]}\n\n\
+             data: line1\ndata: line2\n\n\
+             data\r\r\
+             data: [DONE]\r\n\r\n";
+        let expected = vec![
+            data("{\"choices\":[{\"delta\":{\"content\":\"你\"}}]}"),
+            data("line1\nline2"),
+            data(""),
+            SseEvent::Done,
+        ];
+
+        // 不切：整条一次喂
+        let mut decoder = SseDecoder::new();
+        let mut whole = decoder.push(payload);
+        whole.extend(decoder.finish());
+        assert_eq!(whole, expected, "整体解析结果不对");
+
+        // 所有两点切分
+        for split in 0..=payload.len() {
+            let mut decoder = SseDecoder::new();
+            let mut events = decoder.push(&payload[..split]);
+            events.extend(decoder.push(&payload[split..]));
+            events.extend(decoder.finish());
+            assert_eq!(events, expected, "在 {split} 处切断时解析结果不一致");
+        }
+
+        // 逐字节喂（含 BOM 被拆成 1 字节一段）
+        let mut decoder = SseDecoder::new();
+        let mut events = Vec::new();
+        for byte in payload {
+            events.extend(decoder.push(std::slice::from_ref(byte)));
+        }
+        events.extend(decoder.finish());
+        assert_eq!(events, expected);
     }
 
     #[test]

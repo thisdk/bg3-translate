@@ -112,10 +112,15 @@ pub fn add_consistency_term(
 ///
 /// 系列变体额外记一条 base → base_target：`银发 9b` 已经翻译过时，
 /// `银发 10` 就能直接复用「银发」。
+///
+/// **只认「可写回的译文」**（[`TranslationEntry::has_writable_target`]）：`error`
+/// 条目上的 `target` 是被结构校验拒掉的文本（半截流、两轮拼接、缺占位符），
+/// 它只是给用户看的。把它记成「已确定译名」，另一条待翻译条目就会直接拿到这段
+/// 坏文本并发出 `Done`（见 `planner` 的记忆复用路径），而且结构校验不会再拦。
 pub fn build_consistency_memory(entries: &[TranslationEntry]) -> HashMap<String, ConsistencyTerm> {
     let mut memory = HashMap::new();
     for entry in entries {
-        if entry.source.trim().is_empty() || entry.target.trim().is_empty() {
+        if !entry.has_writable_target() || entry.source.trim().is_empty() {
             continue;
         }
         add_consistency_term(&mut memory, &entry.source, &entry.target);
@@ -286,8 +291,18 @@ pub fn contains_cjk(text: &str) -> bool {
     })
 }
 
+/// 后缀的归一形态：小写，并去掉 `#` 与成对括号。
+///
+/// 同一系列的两种语言写法常给编号加不同装饰（`#10` / `10` / `(10)`），
+/// 归到内层数字后才好判断「两边的编号是不是**完全一样**」，见
+/// [`build_series_aliases`] 里对后缀重叠那条途径的收紧。
 fn normalized_suffix(suffix: &str) -> String {
-    suffix.trim().to_lowercase()
+    suffix
+        .trim()
+        .to_lowercase()
+        .trim_start_matches('#')
+        .trim_matches(|c| matches!(c, '(' | ')' | '[' | ']' | '{' | '}'))
+        .to_string()
 }
 
 /// 从若干候选 base 里挑「规范名」：优先含拉丁字母、后缀种类多、原文更长者。
@@ -381,7 +396,18 @@ pub fn build_series_aliases(entries: &[TranslationEntry]) -> SeriesAliases {
                     .suffixes
                     .intersection(&latin_profile.suffixes)
                     .count();
-                (overlap >= 2).then_some((latin_key, overlap, latin_profile.suffixes.len()))
+                // 判据是「两边编号**完全一致**」，不是「重叠 ≥2」。
+                //
+                // 只要求重叠的话，同一 MOD 里另一个**毫无关系**、只是从 1 开始
+                // 编号的中文系列也会被归一到这个拉丁系列上，整组拿到别的系列的
+                // 译文（`银白长发 1` → 「银发 1」），而且没有任何提示。
+                // 编号一致才是同一个系列两种语言写法的证据（注释里原本写的也是
+                // 「编号完全一致」）—— 代价只是部分本地化的双语系列不再归一，
+                // 最多多一次请求，比把译文串味轻得多。
+                (overlap >= 2
+                    && overlap == cjk_profile.suffixes.len()
+                    && overlap == latin_profile.suffixes.len())
+                .then_some((latin_key, overlap, latin_profile.suffixes.len()))
             })
             .max_by_key(|(_, overlap, suffix_count)| (*overlap, *suffix_count))
             .map(|(key, _, _)| key.clone());
@@ -638,6 +664,27 @@ mod tests {
         assert!(contains_cjk("㐀"), "CJK 扩展 A 区也应识别");
     }
 
+    /// 被拒译文（`error` 状态）不能进记忆。
+    ///
+    /// `error` 条目的 `target` 里留着**被结构校验拒掉**的文本（半截流式输出、两轮拼接、
+    /// 缺占位符），它只是给用户看的，`has_writable_target()` 明确说它不能写回。
+    /// 把它记进「已确定译名」，下一次同原文的条目就会直接 `Done` 出这段坏文本
+    /// —— 用户看到的是「另一条条目莫名拿到别人的坏译文」，而且结构校验不会再拦。
+    #[test]
+    fn rejected_targets_never_enter_the_consistency_memory() {
+        let mut rejected = translated("Fireball", "火球");
+        rejected.mark_error("结构校验未通过：占位符 {1} 缺失（已重试 1 次）");
+
+        let memory = build_consistency_memory(&[rejected.clone()]);
+        assert!(memory.is_empty(), "被拒译文不该进记忆: {memory:?}");
+
+        // 对照：人工抢救（edited）之后是可信的，照常进记忆
+        let mut rescued = translated("Fireball", "火球术");
+        rescued.status = crate::types::TranslationStatus::Edited;
+        let memory = build_consistency_memory(&[rescued]);
+        assert_eq!(memory.get("fireball").unwrap().target, "火球术");
+    }
+
     /// 扩展 F/G/H/I 也要认：漏了它们，生僻字系列名不会被归到中文一侧。
     #[test]
     fn contains_cjk_covers_the_extended_planes() {
@@ -681,5 +728,33 @@ mod tests {
         let aliases = build_series_aliases(&entries);
         let key = aliases.canonical_key(&normalize_consistency_key("银色发型"));
         assert_eq!(aliases.source_for(&key, "银色发型"), "Silver's Hair");
+    }
+
+    /// 编号只是「撞号」，不能当同一系列的证据。
+    ///
+    /// 「后缀重叠 ≥2」是启发式：两个**毫无关系**的编号系列（只要编号撞上两个）
+    /// 也会被归一。真实 MOD 里同时有英文原版与中文译名文件时，编号撞号是常态
+    /// （两边都从 1 开始编），于是「银白长发 1/2」会被并进「Silver's Hair」组，
+    /// 拿到「银发 1」这种完全错误的译文 —— 而且没有任何报错。
+    #[test]
+    fn shared_suffixes_alone_do_not_merge_unrelated_series() {
+        let entries = vec![
+            test_entry("Silver's Hair 1", "en-1"),
+            test_entry("Silver's Hair 2", "en-2"),
+            test_entry("Silver's Hair 3", "en-3"),
+            test_entry("银白长发1", "zh-1"),
+            test_entry("银白长发2", "zh-2"),
+        ];
+        let aliases = build_series_aliases(&entries);
+        let latin_key = normalize_consistency_key("Silver's Hair");
+        assert_eq!(
+            aliases.canonical_key(&normalize_consistency_key("银白长发")),
+            normalize_consistency_key("银白长发"),
+            "只有部分编号撞上时不该归一（否则会拿到别的系列的译文）"
+        );
+        assert_ne!(
+            aliases.canonical_key(&normalize_consistency_key("银白长发")),
+            latin_key
+        );
     }
 }

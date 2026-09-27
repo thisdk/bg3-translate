@@ -103,6 +103,28 @@ struct PendingSeriesGroup {
     previous_failure: Option<String>,
 }
 
+/// 一致性记忆的复用判据：原文只差**空白与大小写**时才允许直接搬用已有译文。
+///
+/// 记忆的键（[`normalize_consistency_key`]）会折掉首尾 ASCII 标点，但标点本身
+/// 带语义：`Are you sure you want to delete this save?` 与 `…save!` 归一后是同一个
+/// 键，直接复用等于把疑问句的译文静默贴到感叹句条目上（结构与占位符完全一致，
+/// 校验拦不住）。这与「相同原文合并」改用原文做键是同一条理由，只是那条只管
+/// 合并、这条管复用。
+///
+/// 判失败（不满足）的代价只是多发起一次请求，所以判据可以收紧；反过来放宽
+/// 就是把错误译文写进 PAK。
+fn memory_reuse_matches(term: &ConsistencyTerm, source: &str) -> bool {
+    fold_for_reuse(&term.source) == fold_for_reuse(source)
+}
+
+/// 折空白 + 折大小写（**刻意不折标点**，用途见 [`memory_reuse_matches`]）。
+fn fold_for_reuse(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 /// 规划任务。规划阶段就会通过 `sink` 发出「直接完成」的事件（与旧行为一致）。
 pub fn plan_jobs(
     entries: &[TranslationEntry],
@@ -129,7 +151,10 @@ pub fn plan_jobs(
         let raw_base_key = normalize_consistency_key(&variant.base);
         let base_key = series_aliases.canonical_key(&raw_base_key);
         let base_source = series_aliases.source_for(&base_key, &variant.base);
-        if let Some(term) = memory.get(&base_key) {
+        if let Some(term) = memory
+            .get(&base_key)
+            .filter(|term| memory_reuse_matches(term, &base_source))
+        {
             emit_done(
                 sink,
                 &entry.id,
@@ -188,7 +213,10 @@ pub fn plan_jobs(
             continue;
         }
         let key = normalize_consistency_key(&entry.source);
-        if let Some(term) = memory.get(&key) {
+        if let Some(term) = memory
+            .get(&key)
+            .filter(|term| memory_reuse_matches(term, &entry.source))
+        {
             emit_done(sink, &entry.id, term.target.clone());
             used_ids.insert(entry.id.clone());
             skipped += 1;
@@ -455,6 +483,128 @@ mod tests {
                 entry_ids: vec!["test.loca#u1".into(), "test.loca#u2".into()]
             }
         );
+    }
+
+    /// 一致性记忆的复用同样不能跨标点：`…save?` 的旧译文不能贴到 `…save!` 上。
+    ///
+    /// 上面那条把「相同原文合并」改用原文做键，但**记忆复用**仍走一致性 key
+    /// （折空白 / 去首尾 ASCII 标点 / 转小写）。于是「已有译文 → 新条目」这条
+    /// 路径上，疑问句的译文会被静默贴到感叹句条目上，还直接发 `Done`
+    /// —— 玩家看到的标点与语气被改掉，写回时没有任何提示。
+    #[test]
+    fn punctuation_only_differences_do_not_reuse_one_translation() {
+        let sink = CollectingSink::new();
+        let entries = vec![
+            translated(
+                "Are you sure you want to delete this save?",
+                "确定要删除此存档吗？",
+                "t1",
+            ),
+            entry("Are you sure you want to delete this save!", "u1"),
+        ];
+        let (jobs, plan) = plan_jobs(&entries, &empty_matcher(), &sink);
+
+        assert_eq!(plan.total, 1);
+        assert_eq!(
+            plan.skipped,
+            0,
+            "标点不同的原文不能直接复用旧译文，事件: {:?}",
+            sink.events()
+        );
+        assert_eq!(plan.jobs, 1, "必须重新发一次请求: {jobs:?}");
+        assert!(
+            !sink
+                .events()
+                .iter()
+                .any(|event| matches!(event, TranslationEvent::Done { .. })),
+            "不能静默产出 Done: {:?}",
+            sink.events()
+        );
+
+        // 只差大小写 / 空白的仍然复用（既有行为不许退化）
+        let sink = CollectingSink::new();
+        let entries = vec![
+            translated("Fireball", "火球术", "t1"),
+            entry("fireball", "u1"),
+            entry("  Fireball  ", "u2"),
+        ];
+        let (_, plan) = plan_jobs(&entries, &empty_matcher(), &sink);
+        assert_eq!(plan.skipped, 2, "大小写与空白差异仍应命中记忆");
+        assert_eq!(
+            sink.events()
+                .iter()
+                .filter(|event| matches!(event, TranslationEvent::Done { .. }))
+                .count(),
+            2
+        );
+    }
+
+    /// 撞号的两个系列不能互相串味：另一条中文系列的译文不能来自本系列。
+    ///
+    /// 系列别名靠「后缀重叠 ≥2」把中文系列归到拉丁系列上。同一 MOD 里另一个
+    /// 只是部分编号撞上的中文系列（与它毫无关系）也会满足这条，于是整组拿到
+    /// 英文系列的译文，且全程没有任何提示。
+    #[test]
+    fn unrelated_series_do_not_share_one_translation() {
+        let sink = CollectingSink::new();
+        let entries = vec![
+            translated("Silver's Hair 1", "银发 1", "e1"),
+            translated("Silver's Hair 2", "银发 2", "e2"),
+            translated("Silver's Hair 3", "银发 3", "e3"),
+            entry("银白长发1", "z1"),
+            entry("银白长发2", "z2"),
+        ];
+        let (jobs, plan) = plan_jobs(&entries, &empty_matcher(), &sink);
+        assert_eq!(plan.total, 2);
+        let done: Vec<_> = sink
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                TranslationEvent::Done { entry_id, text } => Some((entry_id, text)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            done,
+            Vec::<(String, String)>::new(),
+            "只是编号撞上的系列不该直接复用别人的译文"
+        );
+        // 两条自己成一组（同一个 base），送去翻译的是**它们自己的** base
+        assert_eq!(plan.jobs, 1, "只有这一组该发请求: {jobs:?}");
+        assert_eq!(jobs[0].source, "银白长发");
+        assert_eq!(
+            jobs[0].target_ids(),
+            vec!["test.loca#z1".to_string(), "test.loca#z2".to_string()]
+        );
+    }
+
+    /// 被拒译文不能通过记忆复用落到别的条目上。
+    ///
+    /// `error` 条目的 `target` 里留着被结构校验拒掉的文本（`has_writable_target()`
+    /// 明说它不能写回）。它一旦进记忆，另一条同原文的待翻译条目就会**直接拿到这段
+    /// 坏文本**并发出 `Done` —— 用户既看不到错误，也不知道这是别人的半截译文。
+    #[test]
+    fn rejected_targets_are_not_reused_for_other_entries() {
+        let sink = CollectingSink::new();
+        let mut rejected = translated("Fireball", "火球", "u1");
+        rejected.mark_error("大模型调用错误: 结构校验未通过：占位符 {1} 缺失（已重试 1 次）");
+
+        let (jobs, plan) = plan_jobs(
+            &[rejected, entry("fireball", "u2")],
+            &empty_matcher(),
+            &sink,
+        );
+        assert_eq!(plan.total, 1);
+        assert_eq!(plan.skipped, 0, "被拒译文不能算「已确定译名」");
+        assert!(
+            !sink
+                .events()
+                .iter()
+                .any(|event| matches!(event, TranslationEvent::Done { .. })),
+            "不该把被拒译文当结果发出去: {:?}",
+            sink.events()
+        );
+        assert_eq!(plan.jobs, 1, "应重新翻译: {jobs:?}");
     }
 
     #[test]

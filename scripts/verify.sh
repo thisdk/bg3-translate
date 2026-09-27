@@ -51,6 +51,11 @@ RUN_IPC=1
 RUN_CORE=1
 RUN_WEB=1
 MODE=all
+# `--list` 与模式标志是**正交**的两件事：它只决定「打印清单还是执行」。
+# 早先把它写进 MODE（MODE=list），于是 `--list --core-only` 会被后一个标志
+# 覆盖成 core-only，脚本转而**真的去执行门禁**（`--help` 明确承诺
+# 「只打印门禁清单，不执行任何命令、不需要任何工具链」）。分开存就与顺序无关。
+LIST_ONLY=0
 
 usage() {
 	cat <<'EOF'
@@ -88,7 +93,7 @@ while [ $# -gt 0 ]; do
 		RUN_IPC=0
 		;;
 	--list)
-		MODE="list"
+		LIST_ONLY=1
 		;;
 	*)
 		printf '未知参数：%s\n\n' "$1" >&2
@@ -138,7 +143,8 @@ if [ -z "$PLAN" ]; then
 fi
 
 # --list：机器可读输出（TAB 分隔），交给 CI 断言门禁没有被悄悄删掉。
-if [ "$MODE" = "list" ]; then
+# 位置无关：`--list` 出现在模式标志之前或之后都只打印清单。
+if [ "$LIST_ONLY" = 1 ]; then
 	while IFS='|' read -r group title cmd; do
 		[ -n "$group" ] || continue
 		# 被 head 之类的消费者提前关掉管道时安静结束，不算失败

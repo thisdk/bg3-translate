@@ -185,6 +185,31 @@ describe("createDeltaBatcher", () => {
     expect(commits).toHaveLength(1);
   });
 
+  it("dispose 之后 resume 可以重新接受 push（StrictMode 重挂载）", () => {
+    const { batcher, commits, scheduler } = setup();
+
+    // StrictMode 的「挂载 → cleanup → 再挂载」：同一个实例先被 dispose 再被 resume
+    batcher.dispose();
+    batcher.resume();
+
+    batcher.push("a", "重挂载后的文本");
+    scheduler.runFrame();
+    expect(commits).toEqual([[{ id: "a", text: "重挂载后的文本" }]]);
+
+    // resume 不改变 dispose 的「先落地」语义：再次 dispose 仍然提交
+    batcher.push("a", "尾巴");
+    batcher.dispose();
+    expect(commits).toEqual([
+      [{ id: "a", text: "重挂载后的文本" }],
+      [{ id: "a", text: "尾巴" }],
+    ]);
+
+    // 真实卸载之后（不再 resume）push 依旧被拒
+    batcher.push("a", "迟到的");
+    scheduler.runFrame();
+    expect(commits).toHaveLength(2);
+  });
+
   it("调度器同步执行时不会卡死后续 delta（回归）", () => {
     const commits: DeltaCommit[][] = [];
     const batcher = createDeltaBatcher({

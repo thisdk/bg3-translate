@@ -9,9 +9,15 @@
  * 违反后果：用户看到自己改好的译文在几秒后被模型文本覆盖 / 拼接，而 `edited`
  * 被改回 `translating` 之后**会被写进 PAK**（status 既不是 error 也不是空 target）。
  *
+ * **用 `<StrictMode>` 包裹**（`src/main.tsx` 就是 StrictMode）：这些用例覆盖的是
+ * 「工作台挂载 → 卸载 → 重挂载」生命周期最密的路径（流式批处理器、迟到事件、
+ * 编辑竞态、切换 MOD）。非 StrictMode 挂载看不见「cleanup 与挂载不一一对应」这类
+ * 结构缺陷（R5-02：`useMemo` 的 delta 批处理器被永久 dispose，流式文本全丢），
+ * 所以这里刻意用生产/开发实际运行的严格生命周期跑。
+ *
  * 跑法：`bunx vitest run src/components/translation-table/TranslationTable.edit-race.test.tsx`
  */
-import { act } from "react";
+import { StrictMode, act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TranslationTable } from "@/components/TranslationTable";
 import { useAppStore } from "@/store/app-store";
@@ -121,7 +127,11 @@ async function editRow(index: number, text: string): Promise<void> {
 }
 
 async function renderTable(): Promise<void> {
-  await mounted.render(<TranslationTable />);
+  await mounted.render(
+    <StrictMode>
+      <TranslationTable />
+    </StrictMode>,
+  );
   await waitMs(0);
 }
 

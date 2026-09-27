@@ -95,6 +95,31 @@ function loadedNames(): string[] {
 }
 
 describe("useEntryLoading 增量加载", () => {
+  it("工作台重新挂载（打包页返回继续编辑）不得重读已加载的文件", async () => {
+    useAppStore.getState().setSelectedFiles([pakFile(FILE_A)]);
+    await mounted.render(<Probe />);
+    await flush();
+    expect(loadedNames()).toEqual([FILE_A]);
+
+    // 用户手工编辑（或本轮已经翻译出来）的译文
+    useAppStore.getState().updateEntry("a-1", {
+      target: "手工译好的译文",
+      status: "edited",
+    });
+
+    // 工作台被销毁重建：DonePage「返回继续编辑」就是这个形态。
+    // store 里的条目还在，读一遍磁盘就等于用英文原文把它们整体覆盖掉。
+    await mounted.render(null);
+    await mounted.render(<Probe />);
+    await flush();
+
+    expect(loadedNames()).toEqual([FILE_A]);
+    expect(useAppStore.getState().entriesByFile[FILE_A][0]).toMatchObject({
+      target: "手工译好的译文",
+      status: "edited",
+    });
+  });
+
   it("新增勾选第二个文件时不会重读已经加载过的文件", async () => {
     useAppStore.getState().setSelectedFiles([pakFile(FILE_A)]);
     await mounted.render(<Probe />);

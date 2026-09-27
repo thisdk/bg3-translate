@@ -47,8 +47,23 @@ pub async fn write_file_entries(
 }
 
 /// 校验工作目录 + 归档路径，返回 `unpacked/` 下的真实路径。
+///
+/// 除了「前端回传的 `work_dir` 必须等于 AppState 记录的那个」，这里还要确认工作
+/// 目录**此刻仍然存在**：`open_mod` 打开新 MOD 时会删掉上一个工作目录，而本次调用
+/// 可能在「校验完」与「真正落盘」之间被调度（前端并发，或用户在写回在途时打开了
+/// 别的 MOD），此时上面那条 `is_same_dir` 因为两边都不存在而走词法回退、照样通过。
+/// 少了这一步，`create_dir_all` 会把已经清理掉的目录树重新建出来：文件写进一个
+/// 再也没人认领的目录，前端看到「写回成功」，随后的打包必然失败（AppState 已经指向
+/// 新目录），那个重建出来的目录也永远不会再被清理。
+///
+/// 读取侧用同一条检查，报「工作目录已失效」而不是把原因说成「文件不存在」。
 fn checked_path(recorded: Option<&Path>, work_dir: &str, file_name: &str) -> Result<PathBuf> {
     let root = checked_work_root(recorded, work_dir)?;
+    if !pak::unpacked_dir(&root).is_dir() {
+        return Err(AppError::config(
+            "工作目录已失效（可能已经打开或关闭了其它 MOD），请重新打开当前 MOD",
+        ));
+    }
     unpacked_path(&root, file_name)
 }
 
@@ -363,6 +378,49 @@ mod tests {
             let result = write_checked(Some(Path::new(&work)), &work, file_name, &entries);
             assert!(result.is_err(), "{file_name} 应被拒绝，实际: {result:?}");
         }
+    }
+
+    /// 并发 `open_mod`：写回在「校验通过」与「真正落盘」之间撞上旧工作目录被清理。
+    ///
+    /// `open_mod` 打开新 MOD 时会删掉上一个工作目录（本文件的校验也拦不住这件事：
+    /// 前端这次回传的 `work_dir` 就是那个刚被删掉的目录）。此时
+    /// `create_dir_all` 会把 `<已删掉的目录>/unpacked/...` **重新建出来**，
+    /// 文件写进一个再也没人认领的目录树：前端看到的是「写回成功」，随后的打包
+    /// 一定失败（AppState 已经指向新目录），而且这个重建出来的临时目录永远不会
+    /// 再被清理。所以落盘前必须确认工作目录还在。
+    #[test]
+    fn write_entries_refuses_when_work_dir_was_cleaned() {
+        let (_tmp, work) = work_dir("vanished");
+        let entries = translated_entries("Mods/x/localization/english.xml");
+        // 模拟「用户此刻打开了别的 MOD」：旧工作目录已被 open_mod 清理
+        std::fs::remove_dir_all(&work).expect("删掉工作目录");
+        assert!(!Path::new(&work).exists(), "用例前提：工作目录已不存在");
+
+        let result = write_checked(
+            Some(Path::new(&work)),
+            &work,
+            "Mods/x/Localization/Chinese/english.xml",
+            &entries,
+        );
+
+        assert!(
+            result.is_err(),
+            "工作目录已清理时必须报错，实际: {result:?}"
+        );
+        assert!(
+            !Path::new(&work).exists(),
+            "不得把已清理的工作目录重新建出来（文件会写进没人认领的目录树）"
+        );
+
+        // 读取侧同样要报「工作目录已失效」，而不是把原因说成「文件不存在」
+        let read = read_entries_checked(
+            Some(Path::new(&work)),
+            &work,
+            "Mods/x/localization/english.xml",
+            PakFileKind::LocalizationXml,
+        )
+        .expect_err("工作目录已清理时读取必须报错");
+        assert!(read.to_string().contains("工作目录已失效"), "{read}");
     }
 
     /// `translating` 的条目带着**半截流式文本**，绝不能写进 PAK。

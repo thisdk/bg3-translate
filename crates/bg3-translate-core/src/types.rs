@@ -207,8 +207,12 @@ impl TranslationEntry {
     }
 
     /// 是否有译文文本（**不代表可以写回**，见 [`Self::has_writable_target`]）。
+    ///
+    /// 只有空白或**不可见字符**（BOM / 零宽空格 / 软连字符……）的 `target` 不算译文：
+    /// 它在游戏里什么都不显示，写回等于把原文删掉，而 `trim()` 只吃得掉空白，
+    /// 拦不住 U+FEFF / U+200B 这类「非空白但不可见」的字符。判据见 [`has_visible_text`]。
     pub fn has_target(&self) -> bool {
-        !self.target.trim().is_empty()
+        has_visible_text(&self.target)
     }
 
     /// 是否有「可以写回 PAK」的译文：`target` 非空 **且** 状态不是 [`TranslationStatus::Error`]。
@@ -254,6 +258,43 @@ impl TranslationEntry {
         self.target.push_str(delta);
         self.status = TranslationStatus::Translating;
     }
+}
+
+/// 文本里是否有**任何可见字符**。
+///
+/// 空白、控制符与零宽 / 格式类不可见字符（BOM、零宽空格、软连字符……）都不算：
+/// 只由它们组成的「译文」在游戏里什么都不显示，写回等于把原文删掉。
+///
+/// 只判**整条**文本，不改文本本身：零宽字符夹在正常文字中间是有意义的
+/// （emoji 的变体选择符 U+FE0F、防止断行的 U+2060），不能当成空。
+pub(crate) fn has_visible_text(text: &str) -> bool {
+    text.chars().any(|ch| !is_blank_or_invisible(ch))
+}
+
+/// 空白 / 控制符 / 零宽与格式类不可见字符。
+fn is_blank_or_invisible(ch: char) -> bool {
+    ch.is_whitespace() || ch.is_control() || is_invisible_char(ch)
+}
+
+/// 不可见的零宽与格式类字符（Unicode 里的默认不可见字符，空白另算）。
+///
+/// 只收**确定不可见**的那些：变体选择符、双向控制符、word joiner 之类。
+/// 刻意不按「全部 Cf 类别」一刀切 —— `U+06DD`（阿拉伯文节末标记）这类 Cf 字符
+/// 是可见的，把它们算成空白会把正常译文误判成空。
+fn is_invisible_char(ch: char) -> bool {
+    matches!(ch,
+        '\u{00AD}'                  // 软连字符
+        | '\u{061C}'                // 阿拉伯字母标记
+        | '\u{180E}'                // 蒙古文元音分隔符
+        | '\u{200B}'..='\u{200F}'   // 零宽空格 / ZWNJ / ZWJ / LRM / RLM
+        | '\u{202A}'..='\u{202E}'   // 双向嵌入与覆盖
+        | '\u{2060}'..='\u{2064}'   // word joiner 等不可见运算符
+        | '\u{2066}'..='\u{206F}'   // 双向隔离符与废弃格式符
+        | '\u{FEFF}'                // BOM / 零宽不换行空格
+        | '\u{FFF9}'..='\u{FFFB}'   // 注释锚点
+        | '\u{FE00}'..='\u{FE0F}'   // 变体选择符
+        | '\u{E0100}'..='\u{E01EF}' // 变体选择符补充
+    )
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -620,6 +661,40 @@ mod tests {
         assert!(!entry.has_target());
         assert!(!entry.has_writable_target());
         assert_eq!(entry.effective_text(), "Fireball");
+    }
+
+    /// 只有「不可见字符」的译文也不算译文。
+    ///
+    /// `trim()` 只吃得掉**空白**：BOM（U+FEFF）、零宽空格（U+200B）、软连字符
+    /// （U+00AD）这些「非空白但不可见」的字符会让 `target` 看起来非空，
+    /// 于是写回把原文覆盖成空白 —— 实测渲染出空的 `<content>`，原文 `Fireball`
+    /// 直接消失。这类 target 必须和纯空白一样退回原文。
+    #[test]
+    fn invisible_only_targets_are_not_writable() {
+        for text in [
+            "\u{feff}\n",
+            "\u{feff}",
+            "\u{200b}\u{200b}",
+            "\u{00ad}",
+            "\u{2060}",
+        ] {
+            let mut entry = TranslationEntry::new("f.xml", "h1", "1", "Fireball");
+            entry.mark_translated(text);
+            assert!(!entry.has_target(), "{text:?} 不算译文");
+            assert!(!entry.has_writable_target(), "{text:?} 不能写回");
+            assert_eq!(
+                entry.effective_text(),
+                "Fireball",
+                "{text:?} 必须退回原文（否则原文被静默删掉）"
+            );
+        }
+
+        // 对照组：不可见字符夹在正常文字中间是有意义的（emoji 变体选择符等），不能误杀
+        let mut entry = TranslationEntry::new("f.xml", "h1", "1", "Fireball");
+        entry.mark_translated("火\u{200b}球\u{fe0f}术");
+        assert!(entry.has_target());
+        assert!(entry.has_writable_target());
+        assert_eq!(entry.effective_text(), "火\u{200b}球\u{fe0f}术");
     }
 
     #[test]

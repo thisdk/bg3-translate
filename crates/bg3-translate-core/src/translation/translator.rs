@@ -296,18 +296,33 @@ pub(crate) fn build_chat_request(
         .map_err(|err| AppError::Llm(format!("构造请求失败: {err}")))
 }
 
-/// 流读完了却一个字都没收到 → 报错。
+/// 流读完了却一个字都没收到（或只有空白 / 不可见字符）→ 报错。
 ///
 /// 不报错的话会返回空译文：对「原文没有占位符/标签」的条目，空译文能通过结构校验
 /// 被当成成功（前端显示「已翻译」但译文空白），只有写回时才因为 target 为空退回
 /// 原文。把这种情况变成一次可重试的失败，比让它静默通过更有用 —— 最常见的成因
 /// 就是网关把错误包成了 200，或者服务端压根没按 SSE 返回。
 ///
+/// 「只有不可见字符」是同一类：BOM（U+FEFF）、零宽空格（U+200B）、软连字符
+/// （U+00AD）在字符串层面非空，`trim()` 也吃不掉，于是它一路通过结构校验，
+/// 写回时把原文覆盖成空白（实测渲染成空的 `<content>`，原文直接消失）。
+/// 判据见 [`crate::types::has_visible_text`]：只判「整条有没有可见字符」，
+/// 不去动文本本身（零宽字符夹在正文中间是有意义的）。
+///
 /// 原文本身为空时不报错：那本来就不该要求模型输出任何东西。
 fn ensure_stream_produced_text(source: &str, text: &str) -> Result<()> {
-    if text.is_empty() && !source.trim().is_empty() {
+    if source.trim().is_empty() {
+        return Ok(());
+    }
+    if text.is_empty() {
         return Err(AppError::Llm(
             "流式响应结束但没有任何文本（网关可能把错误包成了 200，或服务端未按 SSE 返回）"
+                .to_string(),
+        ));
+    }
+    if !crate::types::has_visible_text(text) {
+        return Err(AppError::Llm(
+            "流式响应结束但只有空白或不可见字符（BOM / 零宽字符），已丢弃这次空译文；可重试"
                 .to_string(),
         ));
     }
@@ -561,6 +576,40 @@ mod tests {
         ensure_stream_produced_text("Fireball", "火球").unwrap();
     }
 
+    /// 只有空白 / 不可见字符的「输出」等于什么都没译，必须判失败。
+    ///
+    /// 它不是空串，所以旧实现放行：译文一路通过结构校验（原文没有占位符 / 标签时
+    /// 什么都拦不住），写回时把原文覆盖成空白（`<content contentuid="h1"></content>`，
+    /// 原文消失）。BOM / 零宽空格 / 软连字符都是网关和模型真实会吐出来的字符。
+    #[test]
+    fn invisible_only_output_is_rejected_like_an_empty_stream() {
+        for text in [
+            "\u{feff}\n",       // BOM + 换行（网关把错误包成 200 的最小形态）
+            "\u{feff}",         // 纯 BOM
+            "\u{200b}",         // 零宽空格
+            "\u{00ad}",         // 软连字符
+            "\u{2060}\u{feff}", // word joiner + BOM
+            "   \n\t",          // 纯空白（生产路径上会被 trim 掉，这里直接喂）
+        ] {
+            let err = match ensure_stream_produced_text("Fireball", text) {
+                Ok(()) => panic!("{text:?} 必须判失败"),
+                Err(err) => err,
+            };
+            assert_eq!(err.code(), "llm", "{text:?}");
+        }
+
+        // 原文本身为空时照旧不报错（本来就不该要求模型输出任何东西）
+        for text in ["", "\u{feff}\n"] {
+            ensure_stream_produced_text("", text).unwrap();
+            ensure_stream_produced_text("   ", text).unwrap();
+        }
+
+        // 不可见字符夹在正文中间不算空：正常译文不能被误杀
+        for text in ["火\u{200b}球", "\u{feff}火球", "❤\u{fe0f}"] {
+            ensure_stream_produced_text("Fireball", text).unwrap();
+        }
+    }
+
     // ── 完整 SSE 流（直接喂字节，不需要网络）──
 
     use crate::translation::events::CancelToken as TestCancelToken;
@@ -742,6 +791,37 @@ mod tests {
             assert_eq!(err.code(), "llm");
             assert!(deltas.is_empty());
         }
+    }
+
+    /// 字段齐全的 chunk 里塞错误载荷：同样不能当成功。
+    ///
+    /// 标准解析成功不代表服务端没报错：网关可以发一条 id/object/created/model
+    /// 齐全、`choices` 为空的 chunk（`stream_options.include_usage` 的收尾帧本来
+    /// 就是这个形状），把 `error` 一起带上。旧实现走标准结构那条路，
+    /// `choices` 为空直接返回 `None`，错误载荷被当心跳丢掉 —— 半截译文配上
+    /// `[DONE]` 就成了「完整输出」。
+    #[tokio::test]
+    async fn error_payload_in_a_full_protocol_chunk_is_not_swallowed() {
+        let body = format!(
+            "{}\n\n\
+             data: {{\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[],\"error\":{{\"message\":\"upstream timeout\"}}}}\n\n\
+             data: [DONE]\n\n",
+            chunk_json("造成", "null")
+        );
+        let (result, deltas) = feed(vec![body.into_bytes()], "Deals {1} damage").await;
+        assert_eq!(deltas, vec!["造成".to_string()], "增量照常推送");
+        let err = result.expect_err("标准结构里的错误载荷必须判失败");
+        assert!(err.to_string().contains("upstream timeout"), "实际: {err}");
+    }
+
+    /// 同一形状但 delta 与 error 同时出现：错误优先，错误载荷不能被内容掩盖。
+    #[tokio::test]
+    async fn error_wins_over_content_in_the_same_full_chunk() {
+        let body = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"造成\"},\"finish_reason\":\"stop\"}],\"error\":{\"message\":\"upstream timeout\"}}\n\n\
+                    data: [DONE]\n\n";
+        let (result, _) = feed(vec![body.as_bytes().to_vec()], "Deals {1} damage").await;
+        let err = result.expect_err("错误载荷必须优先于同一帧里的内容");
+        assert!(err.to_string().contains("upstream timeout"), "实际: {err}");
     }
 
     /// 流中错误载荷：半截译文 + `{"error":{...}}` + `[DONE]` 不能当成功。

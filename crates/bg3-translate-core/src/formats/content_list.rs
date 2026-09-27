@@ -85,7 +85,35 @@ pub fn read(path: &Path, file_name: &str) -> Result<Vec<TranslationEntry>> {
             "{file_name} 解析失败，已中止读取以避免写回时丢失条目: {error}"
         )));
     }
-    Ok(parsed.entries)
+    Ok(into_identified_entries(parsed.entries, file_name))
+}
+
+/// 只把**有句柄**的条目交给调用方。
+///
+/// 句柄（`contentuid`）就是游戏查表的键：没有它的 `<content>` 元素谁也查不到，
+/// 而且这些条目的 `id` 全是 `{file}#`（前端按 `id` 去重会把它们并成一条），
+/// 继续对外提供只会让写回少交几条 —— 按句柄对齐的合并会把没提交的元素
+/// 当成「已提交」而静默删掉。
+///
+/// **写回路径不受影响**：[`write`] 仍然从磁盘解析出全部元素（含无句柄的），
+/// 并按原样保留它们（见 [`merge_missing_entries`] 与 [`render_with_style`]）。
+fn into_identified_entries(
+    entries: Vec<TranslationEntry>,
+    file_name: &str,
+) -> Vec<TranslationEntry> {
+    let total = entries.len();
+    let kept: Vec<TranslationEntry> = entries
+        .into_iter()
+        .filter(|entry| !entry.contentuid.is_empty())
+        .collect();
+    let dropped = total - kept.len();
+    if dropped > 0 {
+        log::warn!(
+            "{file_name} 有 {dropped} 个 <content> 元素缺少 contentuid，已跳过这些条目\
+             （写回时会原样保留它们，但游戏查不到、翻译它们也没有意义）"
+        );
+    }
+    kept
 }
 
 /// 解析结果：条目 + 根元素属性 + 标记风格（写回时保留）。
@@ -126,14 +154,26 @@ pub fn parse(xml: &str, file_name: &str) -> ParsedContentList {
         buf.clear();
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => match e.name().as_ref() {
-                "contentList" if pending.is_none() => {
-                    parsed.root_attributes = collect_attributes(&e);
-                }
-                "content" if pending.is_none() => {
-                    pending = Some(content_identity(&e));
-                    raw.clear();
-                    nested_depth = 0;
-                }
+                "contentList" if pending.is_none() => match collect_attributes(&e) {
+                    Ok(attributes) => parsed.root_attributes = attributes,
+                    // 属性坏了就不能「带着残缺结果继续」：根属性会被写回，
+                    // 而 `contentuid` 一旦被静默改写成空串就再也救不回来。
+                    Err(error) => {
+                        parsed.error = Some(error);
+                        break;
+                    }
+                },
+                "content" if pending.is_none() => match content_identity(&e) {
+                    Ok(identity) => {
+                        pending = Some(identity);
+                        raw.clear();
+                        nested_depth = 0;
+                    }
+                    Err(error) => {
+                        parsed.error = Some(error);
+                        break;
+                    }
+                },
                 // content 内部的子标签：原样记录
                 _ if pending.is_some() => {
                     if e.name().as_ref() == "content" {
@@ -150,12 +190,15 @@ pub fn parse(xml: &str, file_name: &str) -> ParsedContentList {
                 _ => {}
             },
             Ok(Event::Empty(e)) => match e.name().as_ref() {
-                "content" if pending.is_none() => {
-                    let (contentuid, version) = content_identity(&e);
-                    parsed
+                "content" if pending.is_none() => match content_identity(&e) {
+                    Ok((contentuid, version)) => parsed
                         .entries
-                        .push(TranslationEntry::new(file_name, contentuid, version, ""));
-                }
+                        .push(TranslationEntry::new(file_name, contentuid, version, "")),
+                    Err(error) => {
+                        parsed.error = Some(error);
+                        break;
+                    }
+                },
                 _ if pending.is_some() => {
                     if is_inline_tag_name(e.name().as_ref()) {
                         parsed.markup_style = MarkupStyle::Markup;
@@ -294,6 +337,9 @@ fn merge_missing_entries(
     let known: std::collections::HashSet<&str> = submitted
         .iter()
         .map(|entry| entry.contentuid.as_str())
+        // 空句柄不是身份：拿它去 `contains` 会让磁盘上**所有**无句柄元素
+        // 都被判成「已提交」，只交其中一条就会把其余几条静默删掉。
+        .filter(|contentuid| !contentuid.is_empty())
         .collect();
     let mut merged = submitted.to_vec();
     let before = merged.len();
@@ -349,7 +395,12 @@ pub fn render_with_style(
         reject_illegal_identity(&entry.contentuid, "contentuid")?;
         reject_illegal_identity(&entry.version, "version")?;
         let mut start = BytesStart::new("content");
-        start.push_attribute(("contentuid", entry.contentuid.as_str()));
+        // 原文件没有 `contentuid` 属性时**不要凭空补一个 `contentuid=""`**
+        // （与下面的 `version` 同理）：句柄是游戏查表的键，空串既查不到任何东西，
+        // 又把「没有这个属性」的源文件改成了另一个样子 —— 零译文写回就会触发。
+        if !entry.contentuid.is_empty() {
+            start.push_attribute(("contentuid", entry.contentuid.as_str()));
+        }
         // 原文件没有 `version` 属性时**不要凭空补一个 `version=""`**：
         // 空版本号和「没有这个属性」对游戏不是一回事，而且会让「零译文写回」
         // 也改变文件内容。
@@ -432,30 +483,45 @@ fn decode_utf8(bytes: &[u8], what: &str) -> Result<String> {
 }
 
 /// 取 attribute 的反转义值（含 EOL 归一化，等价于旧版 `unescape_value`）。
-fn unescaped(attr: &quick_xml::events::attributes::Attribute<'_>) -> String {
+///
+/// 反转义失败（未定义实体 / 裸 `&` / 非法字符引用）**必须**上报，不能
+/// `unwrap_or_default()` 悄悄换成空串：这些值里既有游戏查表的句柄
+/// （`contentuid`），也有会被原样写回根元素的属性，换成空串等于**改写**文件
+/// —— 文件从「畸形」变成「良构但查不到」，而用户看不到任何错误。
+fn unescaped(
+    attr: &quick_xml::events::attributes::Attribute<'_>,
+) -> std::result::Result<String, String> {
     attr.normalized_value(XmlVersion::Implicit1_0)
-        .unwrap_or_default()
-        .into_owned()
+        .map(|value| value.into_owned())
+        .map_err(|err| format!("属性 {} 的值不是合法 XML（{err}）", attr.key.as_ref()))
 }
 
-fn collect_attributes(e: &BytesStart<'_>) -> Vec<(String, String)> {
-    e.attributes()
-        .flatten()
-        .map(|attr| (attr.key.as_ref().to_string(), unescaped(&attr)))
-        .collect()
+fn collect_attributes(e: &BytesStart<'_>) -> std::result::Result<Vec<(String, String)>, String> {
+    let mut attributes = Vec::new();
+    for attr in e.attributes() {
+        let attr = attr.map_err(|err| format!("根元素属性语法错误（{err}）"))?;
+        attributes.push((attr.key.as_ref().to_string(), unescaped(&attr)?));
+    }
+    Ok(attributes)
 }
 
-fn content_identity(e: &BytesStart<'_>) -> (String, String) {
+/// 取 `<content>` 的身份属性（`contentuid` / `version`）。
+///
+/// 属性语法错误同样要上报：`.flatten()` 会把「未加引号的 `contentuid=h1`」
+/// 连同错误一起丢掉，于是 `contentuid` 变成空串、写回时被改写成
+/// `contentuid=""` —— 句柄是游戏查表的键，改了就等于这条文本永久查不到。
+fn content_identity(e: &BytesStart<'_>) -> std::result::Result<(String, String), String> {
     let mut contentuid = String::new();
     let mut version = String::new();
-    for attr in e.attributes().flatten() {
+    for attr in e.attributes() {
+        let attr = attr.map_err(|err| format!("<content> 属性语法错误（{err}）"))?;
         match attr.key.as_ref() {
-            "contentuid" => contentuid = unescaped(&attr),
-            "version" => version = unescaped(&attr),
+            "contentuid" => contentuid = unescaped(&attr)?,
+            "version" => version = unescaped(&attr)?,
             _ => {}
         }
     }
-    (contentuid, version)
+    Ok((contentuid, version))
 }
 
 /// 把实体引用还原成字符；未知实体原样保留（含 `&` 和 `;`）。
@@ -565,7 +631,7 @@ pub(crate) fn decode_entities(text: &str) -> Cow<'_, str> {
 /// - 这里的 skip 还额外挡住 `&quot;` / `&apos;` 这类**解码后仍合法、却会让标签认不出来**
 ///   的实体 —— 裸引号在标签扫描阶段就破坏了属性边界，整条降级成字面文本。
 ///
-/// 独立验证（`docs/CORPUS-AUDIT.md` §9.3）实测过：去掉 skip、只留 `repair_tag_attributes`，
+/// 独立验证实测过：去掉 skip、只留 `repair_tag_attributes`，
 /// `&quot;` 用例立刻变红。所以**不要**因为「`repair_tag_attributes` 已经兜住了」就删它。
 fn decode_entities_outside_raw_tags(text: &str) -> Cow<'_, str> {
     decode_entities_impl(text, true)
@@ -724,7 +790,7 @@ fn write_text_fragment<W: std::io::Write>(writer: &mut Writer<W>, text: &str) ->
 ///
 /// 两道保护覆盖面不同：这里只处理**裸 `&` / 裸 `<`**（已非法）；skip 还挡住
 /// `&quot;` / `&apos;` 这类**解码后依然合法、但会让标签认不出来**的实体。
-/// 只留这里、去掉 skip，`&quot;` 用例立刻变红（`docs/CORPUS-AUDIT.md` §9.3 实测）。
+/// 只留这里、去掉 skip，`&quot;` 用例立刻变红（独立验证实测）。
 /// 两者是**互补**关系，不是一主一备。
 fn repair_tag_attributes(tag: &str) -> Option<String> {
     // 快路径：标签体里既没有 `&` 也没有 `<` 时，属性值不可能是非法 XML ——
@@ -886,7 +952,7 @@ pub fn scan_tag_end(text: &str, start: usize) -> Option<usize> {
 /// quick-xml 在**属性语法**上比 XML 1.0 宽松：`<LSTag a="1"b="2">`（属性之间
 /// 缺空白）它照样解析成功，而严格解析器（游戏侧、python expat）会拒绝
 /// **整份文档**。旧实现把这个标签原样写进产物，等于把用户的本地化文件变成
-/// 非法文件（`docs/review-r4/formats.md` F-R4-01）。所以这里自己校验：
+/// 非法文件（缺空白的属性会被游戏侧严格解析器拒绝整份文档）。所以这里自己校验：
 ///
 /// - `STag ::= '<' Name (S Attribute)* S? '>'`（属性之间**必须**有空白）
 /// - `EmptyElemTag ::= '<' Name (S Attribute)* S? '/>'`
@@ -2499,5 +2565,130 @@ mod tests {
         let back = read(&path, "Chinese/New.xml").unwrap();
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].source, "一");
+    }
+
+    /// 属性的**语法/转义错误**必须变成解析错误，不能被 `.flatten()` 吞掉。
+    ///
+    /// 复现（修复前）：`<content contentuid=h1 version="1">T</content>` 里那个没加
+    /// 引号的属性被 quick-xml 报成 `AttrError::UnquotedValue`，而 `content_identity`
+    /// 用 `attributes().flatten()` 把「错误」和「那个属性」一起丢掉 ——
+    /// `contentuid` 变成空串，`read` 返回 `Ok`，写回时句柄被**改写**成
+    /// `contentuid=""`：文件从「畸形」变成「良构但查不到」，用户看不到任何错误，
+    /// 而原来的句柄永久丢失（`read`/`write` 的文档都承诺「解析错误宁可报错」）。
+    ///
+    /// 同理，属性值里的裸 `&`（未定义实体）以前会被 `unwrap_or_default()` 悄悄
+    /// 换成空串 —— 根元素属性照旧写回，`contentuid` 直接变成空句柄。
+    #[test]
+    fn malformed_attribute_syntax_is_reported_instead_of_silently_dropping_the_uid() {
+        let cases = [
+            (
+                "contentuid 没加引号",
+                r#"<contentList><content contentuid=h1 version="1">T</content></contentList>"#,
+            ),
+            (
+                "version 缺等号",
+                r#"<contentList><content contentuid="h1" version>T</content></contentList>"#,
+            ),
+            (
+                "contentuid 值里有裸 &",
+                r#"<contentList><content contentuid="a&b" version="1">T</content></contentList>"#,
+            ),
+            (
+                "根元素属性值里有裸 &",
+                r#"<contentList xmlns:x="a&b"><content contentuid="h1" version="1">T</content></contentList>"#,
+            ),
+            (
+                "根元素属性没加引号",
+                r#"<contentList xmlns:x=urn:x><content contentuid="h1" version="1">T</content></contentList>"#,
+            ),
+        ];
+        for (label, xml) in cases {
+            let parsed = parse(xml, "t.xml");
+            assert!(
+                parsed.error.is_some(),
+                "[{label}] 属性坏了必须报解析错误，不能静默丢掉/改写属性: {parsed:?}"
+            );
+        }
+
+        // 走真实路径：读要报错，写要中止且原文件逐字节不变
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Broken.xml");
+        let raw = r#"<contentList><content contentuid=h1 version="1">T</content></contentList>"#;
+        std::fs::write(&path, raw).unwrap();
+        assert_eq!(
+            read(&path, "Broken.xml").unwrap_err().code(),
+            "xml",
+            "读路径也必须报错"
+        );
+
+        let mut entry = TranslationEntry::new("Broken.xml", "h1", "1", "T");
+        entry.mark_translated("改");
+        let err = write(&path, &[entry]).unwrap_err();
+        assert_eq!(err.code(), "xml", "写路径必须中止: {err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            raw,
+            "拒绝写回时原文件必须逐字节不变"
+        );
+    }
+
+    /// `<content>` 少了 `contentuid` 时**不能凭空补一个 `contentuid=""`**，
+    /// 也不能让多个无句柄元素在按句柄对齐的合并里互相覆盖。
+    ///
+    /// 复现（修复前）：三个元素（1 个正常 + 2 个没有 `contentuid`）读出来是 3 条
+    /// 条目，两条无句柄的 `id` 都是 `t.xml#`；前端按 `id` 去重后只提交 1 条，
+    /// `merge_missing_entries` 再用 `contentuid`（空串）去「认领」磁盘上的条目，
+    /// 于是**两个元素一起消失**，剩下的那个还被写成 `contentuid=""`。
+    #[test]
+    fn content_without_contentuid_is_never_given_an_invented_uid() {
+        let raw = concat!(
+            r#"<contentList>"#,
+            r#"<content contentuid="h1" version="1">Real</content>"#,
+            r#"<content version="1">NoUid</content>"#,
+            r#"<content version="1">Second</content>"#,
+            r#"</contentList>"#
+        );
+        let parsed = parse(raw, "t.xml");
+        assert!(parsed.error.is_none(), "{:?}", parsed.error);
+        assert_eq!(
+            parsed.entries.len(),
+            3,
+            "解析层必须仍然看到三条元素（写回靠它们保留原文）"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.xml");
+        std::fs::write(&path, raw).unwrap();
+
+        // 读取侧不能把无句柄元素交给前端（id 全是 "t.xml#"，去重会并成一条）
+        let entries = read(&path, "t.xml").unwrap();
+        assert_eq!(entries.len(), 1, "只应交出有句柄的那条: {entries:?}");
+        assert_eq!(entries[0].contentuid, "h1");
+
+        // 写回：提交 h1 的译文，两个无句柄元素必须原样保留
+        let mut h1 = entries[0].clone();
+        h1.mark_translated("真");
+        write(&path, &[h1]).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            out.contains(r#"<content contentuid="h1" version="1">真</content>"#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"<content version="1">NoUid</content>"#)
+                && out.contains(r#"<content version="1">Second</content>"#),
+            "无句柄元素必须逐字节保留: {out}"
+        );
+        assert!(
+            !out.contains(r#"contentuid="""#),
+            "绝不能凭空补一个空句柄: {out}"
+        );
+
+        // 空列表写回同样不能把它们删掉或补句柄
+        std::fs::write(&path, raw).unwrap();
+        write(&path, &[]).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(out.matches("<content ").count(), 3, "{out}");
+        assert!(!out.contains(r#"contentuid="""#), "{out}");
     }
 }

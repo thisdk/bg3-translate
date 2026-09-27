@@ -74,14 +74,66 @@ export function shortSourcePath(fileName: string): string {
 }
 
 /**
+ * 文本里是否有**任何可见字符**。
+ *
+ * **事实来源是 Rust 的 `crates/bg3-translate-core/src/types.rs::has_visible_text`，
+ * 两份实现必须一起改**（这层语义不在 IPC 契约检查的射程内，只能靠这里与测试钉住）。
+ *
+ * 空白、控制符与「确定不可见」的零宽 / 格式类字符（BOM、零宽空格、软连字符、
+ * 双向控制符、变体选择符……）都不算可见：只由它们组成的「译文」在游戏里什么都
+ * 不显示，写回等于把原文删掉。`trim()` 只吃得掉空白，拦不住 U+FEFF / U+200B。
+ *
+ * 只判**整条**文本，不改文本本身：零宽字符夹在正常文字中间是有意义的
+ * （emoji 的变体选择符 U+FE0F、防止断行的 U+2060），不能当成空。
+ */
+export function hasVisibleText(text: string): boolean {
+  for (const ch of text) {
+    if (!isBlankOrInvisible(ch)) return true;
+  }
+  return false;
+}
+
+/**
+ * 空白 / 控制符 / 零宽与格式类不可见字符（Rust `is_blank_or_invisible` 的镜像）。
+ *
+ * 刻意不按「全部 Cf 类别」一刀切：`U+06DD`（阿拉伯文节末标记）这类 Cf 字符是
+ * **可见**的，把它们算成空白会把正常译文误判成空。
+ */
+function isBlankOrInvisible(ch: string): boolean {
+  // Rust `char::is_whitespace()`（Unicode White_Space）。JS 的 `\s` 多含一个
+  // U+FEFF，而它本来就在下面的不可见表里，两种写法等价。
+  if (/\s/u.test(ch)) return true;
+  const code = ch.codePointAt(0) ?? 0;
+  // Rust `char::is_control()`（Cc：C0 与 C1 控制符）
+  if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) return true;
+  return (
+    code === 0x00ad || // 软连字符
+    code === 0x061c || // 阿拉伯字母标记
+    code === 0x180e || // 蒙古文元音分隔符
+    (code >= 0x200b && code <= 0x200f) || // 零宽空格 / ZWNJ / ZWJ / LRM / RLM
+    (code >= 0x202a && code <= 0x202e) || // 双向嵌入与覆盖
+    (code >= 0x2060 && code <= 0x2064) || // word joiner 等不可见运算符
+    (code >= 0x2066 && code <= 0x206f) || // 双向隔离符与废弃格式符
+    code === 0xfeff || // BOM / 零宽不换行空格
+    (code >= 0xfff9 && code <= 0xfffb) || // 注释锚点
+    (code >= 0xfe00 && code <= 0xfe0f) || // 变体选择符
+    (code >= 0xe0100 && code <= 0xe01ef) // 变体选择符补充
+  );
+}
+
+/**
  * 是否有「可以写回 PAK」的译文。
  *
- * 后端 `TranslationEntry::has_writable_target()` 的前端镜像：`target` 非空
- * **且** 状态不是 `error`（error 条目一律退回原文）。写回链路的每个判断都
- * 必须复用这一个定义，别再各写各的。
+ * 后端 `TranslationEntry::has_writable_target()` 的前端镜像：`target` 里要有
+ * **可见文本**（见 [`hasVisibleText`]，不只是 `trim()` 非空）**且** 状态不是
+ * `error`（error 条目一律退回原文）。写回链路的每个判断都必须复用这一个定义。
+ *
+ * 为什么不能用 `target.trim() !== ""`：只有 BOM / 零宽空格的译文会被判成「有译文」，
+ * 在 `mergeWithExistingTarget` 里挤掉 MOD 自带的真实中文，而后端按自己的语义把它
+ * 当空、写回英文原文 —— 自带中文就这样丢了。
  */
 export function hasWritableTarget(entry: TranslationEntry): boolean {
-  return entry.target.trim() !== "" && entry.status !== "error";
+  return entry.status !== "error" && hasVisibleText(entry.target);
 }
 
 /**
@@ -209,8 +261,21 @@ export interface TranslationRequestPlan {
 /**
  * 计算一次翻译请求要发送的条目。
  *
- * 业务语义保持不变：**只翻译 source 非空且 target 为空的条目**。
+ * 业务语义：**只翻译 source 非空且 target 为空的条目**（后端
+ * `is_pending_translation()` 也是这条判据，core 会自己再过滤一遍）。
  * 当所选条目全部已有译文时，退回「清空全部并重译」的模式。
+ *
+ * 正常分支的 payload 是**全部工作条目**（`work`），不是「待翻译的那批」：
+ * core 用整份 payload 建一致性记忆（`planner::build_consistency_memory`，只认
+ * `has_writable_target()` 的条目），已经有了译文的条目正是「本 MOD 已确定译名」
+ * 与系列 base 复用的唯一来源。只发 pending 的话这份记忆恒为空 —— 专名跨批次
+ * 不一致、`plan.skipped` 恒 0、【本 MOD 已确定译名】段落从不出现。带上去的
+ * 上下文条目后端不会翻译（不发事件、不计入 `plan.total`），但调用方必须知道
+ * 「payload ≠ 本轮在跑的条目」：收尾回滚只能动 `filter(isTranslatableNow)` 那批
+ * （见 `useTranslationRun`），否则会把上下文条目的译文清空。
+ *
+ * 重译分支（`retranslateAll`）依旧把全部条目清空成 pending、全部送翻，
+ * 分支条件与返回结构都不变。
  *
  * 重译分支同样**保留 `error`**：它可能带着上一轮的结构校验诊断，后端会当纠错
  * 提示注入（界面上的文案由调用方清掉，见 `buildRetryRequest` 的说明）。
@@ -222,7 +287,7 @@ export function buildTranslationRequest(
   const pending = work.filter(isTranslatableNow);
 
   if (pending.length > 0) {
-    return { request: pending, retranslateAll: false };
+    return { request: work, retranslateAll: false };
   }
 
   return {

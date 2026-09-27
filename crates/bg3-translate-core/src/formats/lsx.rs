@@ -930,6 +930,128 @@ mod tests {
         assert_eq!(scan_translatable(&out)[0].value, "abc");
     }
 
+    /// 写回只改「有译文的那个区间」，其余字节一律不动。
+    ///
+    /// 与 `write_only_touches_the_intended_attribute` 的区别：这里把真实 MOD 里
+    /// 会出现的干扰项一次摆齐 —— 注释里的伪 `<attribute>`、`TranslatedString`
+    /// 句柄、纯空白值、属性值里的 `>` 与 `'`、嵌套 node、非白名单字段 ——
+    /// 然后**逐行**比对整份文件，只有恰好 4 个白名单字段的那一行允许变。
+    #[test]
+    fn write_touches_only_the_translated_spans() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Meta.lsx");
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<save>
+  <region id="Config">
+    <node id="root">
+      <attribute id="Description" type="LSString" value="First &amp; best" />
+      <attribute id="Name" type="LSString" value="Internal" />
+      <attribute id="Description" type="TranslatedString" value="h123" />
+      <attribute id="Description" type="LSString" value="  " />
+      <attribute id="Tooltip" type="LSWString" value="Tip &#39;quoted&#39;" />
+      <attribute id="DisplayName" type="LSString" value="a > b" />
+      <children>
+        <node id="child">
+          <attribute id="Title" type="LSString" value="Deep" />
+        </node>
+      </children>
+      <attribute id="TooltipDescription" type="LSString" value="Broken original" />
+      <attribute id="Unknown" type="LSString" value="untouched" />
+      <!-- <attribute id="Description" type="LSString" value="InComment" /> -->
+    </node>
+  </region>
+</save>"#;
+        std::fs::write(&path, xml).unwrap();
+
+        let entries = read(&path, "Meta.lsx").unwrap();
+        let uids: Vec<&str> = entries.iter().map(|e| e.contentuid.as_str()).collect();
+        assert_eq!(
+            uids,
+            vec![
+                "Description#0",
+                "Tooltip#0",
+                "DisplayName#0",
+                "Title#0",
+                "TooltipDescription#0"
+            ],
+            "只有白名单字段 + 文本类型 + 非空值才是条目: {entries:#?}"
+        );
+
+        // 前 4 条正常翻译；第 5 条是**结构校验失败**的条目（status=error 但 target
+        // 非空）—— 它必须退回原文，一个字符都不能进文件。把它混进来才能让这条
+        // 测试同时钉住两件事：「只动被翻译的区间」**且**「坏译文不落盘」。
+        // 少了它，`plan_replacements` 里 `!has_writable_target()` 那道闸门被摘掉
+        // 也不会有任何测试变红（独立验证者 T3 的变异实验）。
+        let mut bad = entries[4].clone();
+        bad.mark_translated("[坏]Broken broken broken");
+        bad.mark_error("结构校验未通过：占位符 {1} 缺失");
+        assert!(
+            !bad.has_writable_target(),
+            "error 条目不该有可写回译文: {bad:#?}"
+        );
+
+        let mut translated: Vec<TranslationEntry> = entries[..4]
+            .iter()
+            .cloned()
+            .map(|mut entry| {
+                entry.mark_translated(format!("[译]{}", entry.source));
+                entry
+            })
+            .collect();
+        translated.push(bad);
+        write(&path, &translated).unwrap();
+        let out = std::fs::read_to_string(&path).unwrap();
+
+        // 坏译文（不管有没有结构错误信息）一个字符都不能出现在产物里
+        assert!(
+            !out.contains("[坏]") && !out.contains("broken broken"),
+            "error 条目的译文绝不能写回: {out}"
+        );
+
+        // 逐行比对：行数与未被替换的行必须一字不差（结构/缩进/注释/句柄都不能被重排）
+        let before: Vec<&str> = xml.lines().collect();
+        let after: Vec<&str> = out.lines().collect();
+        assert_eq!(before.len(), after.len(), "行数不能变: {out}");
+        let mut changed = Vec::new();
+        for (index, (before, after)) in before.iter().zip(&after).enumerate() {
+            if before == after {
+                continue;
+            }
+            assert!(
+                after.contains("[译]"),
+                "第 {index} 行不该被改动: {before:?} -> {after:?}"
+            );
+            changed.push(index);
+        }
+        assert_eq!(changed.len(), 4, "恰好 4 个白名单字段被改写: {out}");
+
+        // 改写后的值的转义必须仍然合法
+        assert!(out.contains(r#"value="[译]First &amp; best""#), "{out}");
+        assert!(
+            out.contains(r#"value="[译]Tip &apos;quoted&apos;""#),
+            "{out}"
+        );
+        assert!(out.contains(r#"value="[译]a &gt; b""#), "{out}");
+        // 其余字段（含 error 条目、注释里的伪字段）原样保留
+        for kept in [
+            r#"value="Internal""#,
+            r#"value="h123""#,
+            r#"value="  ""#,
+            r#"value="Broken original""#,
+            r#"value="untouched""#,
+            r#"value="InComment""#,
+        ] {
+            assert!(out.contains(kept), "{kept} 必须原样保留: {out}");
+        }
+
+        // 再读一轮：条目集合与译文都稳定（error 条目退回原文）
+        let back = read(&path, "Meta.lsx").unwrap();
+        assert_eq!(back.len(), 5);
+        assert_eq!(back[0].source, "[译]First & best");
+        assert_eq!(back[4].contentuid, "TooltipDescription#0");
+        assert_eq!(back[4].source, "Broken original");
+    }
+
     /// 回归基线：真实 MOD 的 `.lsx` 零译文写回必须**逐字节不变**。
     ///
     /// `write` 只替换「有可写回译文」的区间，所以未翻译条目提交上来时文件应当

@@ -9,10 +9,18 @@
  *   4. 取消后未完成的条目回滚为待翻译，缓存的 delta 不会写回；
  *   5. 重试（网络退避 / 结构纠错）时显示文本只对应**最后一次尝试**（F-09）。
  *
+ * **整个文件用 `<StrictMode>` 挂载**（`src/main.tsx` 就是 StrictMode，
+ * `bun run dev` 跑的就是这条生命周期）：effect 会走一遍「挂载 → cleanup →
+ * 再挂载」，而 `useMemo` 里的对象（delta 批处理器）**不会重建** —— 这正是
+ * R5-02 的现场：cleanup 里的 `dispose()` 一旦是永久闩锁，重挂载后每一次
+ * `push` 都被静默丢掉，开发模式下流式预览整个失效。非 StrictMode 挂载看不见
+ * 这条缝，所以这里刻意用严格生命周期跑（实测：把 `resume` 变异成空实现，
+ * 本文件 8 条全红 + `TranslationTable.edit-race.test.tsx` 5 条全红）。
+ *
  * 跑法：`bunx vitest run src/components/translation-table/TranslationTable.streaming.test.tsx`
  * 会打印 `[perf] table-streaming: ...` 实测数字（仅记录，不断言）。
  */
-import { act } from "react";
+import { StrictMode, act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TranslationTable } from "@/components/TranslationTable";
 import { useAppStore } from "@/store/app-store";
@@ -87,7 +95,7 @@ afterEach(() => {
 
 /** 挂载表格并等条目加载完成 */
 async function renderTable(): Promise<void> {
-  await mounted.render(<TranslationTable />);
+  await mounted.render(<StrictMode><TranslationTable /></StrictMode>);
   await waitMs(0);
 }
 
@@ -469,5 +477,179 @@ describe("重试 / 纠错时的显示文本（F-09）", () => {
     expect(entry.error).toContain("结构校验未通过");
     // target 非空 → 行内仍有「编辑」按钮，用户可以手工改好再保存
     expect(findButton(mounted.container, "编辑")).not.toBeNull();
+  });
+});
+
+/**
+ * React StrictMode 下的流式落地（`src/main.tsx` 就是 `<React.StrictMode>`）。
+ *
+ * StrictMode 会让 effect 走一遍「挂载 → cleanup → 再挂载」，而 `useMemo` 的
+ * delta 批处理器**不会重建**：cleanup 里的 `dispose()` 一旦是永久闩锁，
+ * 重新挂载后的每一次 `push` 都会被静默丢掉 —— 开发模式下流式预览整个失效，
+ * 译文只在 `done` 一跳出现，控制台里没有任何报错。
+ *
+ * 这条用例把这个语义**单独钉死**：它自带 `<StrictMode>` 包裹，不依赖本文件
+ * 其它渲染路径（那些路径以后若改回非 StrictMode，这条回归仍然有效）。
+ * 失败形态是 `target === ""`（delta 全部丢失）而 `status === "translating"`
+ * 已经落地 —— 也就是「状态机在走、文本没了」。
+ */
+describe("StrictMode 下的流式落地", () => {
+  it("StrictMode 双挂载之后，delta 仍必须写进 target", { timeout: 30_000 }, async () => {
+    // 小规模夹具：这条用例只关心「delta 有没有落地」，不需要 2 万条的噪声
+    backend.entries = buildEntries(40, FILE_NAME);
+
+    await mounted.render(
+      <StrictMode>
+        <TranslationTable />
+      </StrictMode>,
+    );
+    await waitMs(0);
+
+    const translateButton = findButton(mounted.container, "翻译 ");
+    expect(translateButton).not.toBeNull();
+    await act(async () => {
+      click(translateButton!);
+    });
+    await waitMs(0);
+    expect(backend.onEvent).not.toBeNull();
+    const send = backend.onEvent!;
+
+    await act(async () => {
+      send({ type: "progress", entryId: FIRST_ID, status: "translating" });
+      send({ type: "delta", entryId: FIRST_ID, text: "半截流式文本" });
+      await waitForFlush(FIRST_ID);
+    });
+
+    expect(entryTarget(FIRST_ID)).toBe("半截流式文本");
+    expect(storedEntry(FIRST_ID).status).toBe("translating");
+
+    // 收尾：done 的权威文本照常落地（这条路径不走批处理，用来证明
+    // 「只有 delta 丢了」而不是整条流都断了）
+    await act(async () => {
+      send({ type: "done", entryId: FIRST_ID, text: "权威译文" });
+      send({ type: "all_done", total: 1, failed: 0 });
+      backend.finish?.();
+      backend.finish = null;
+      await Promise.resolve();
+    });
+    expect(storedEntry(FIRST_ID)).toMatchObject({
+      target: "权威译文",
+      status: "translated",
+    });
+  });
+});
+
+/**
+ * 「已有译文」的条目会作为**上下文**一起发给后端（`buildTranslationRequest`
+ * 正常分支发全部工作条目），core 用它建一致性记忆（本 MOD 已确定译名 / 系列
+ * base 复用）。后端只翻 `is_pending_translation()` 的那批：上下文条目不会有
+ * 任何事件，也不在 `plan.total` 里。
+ *
+ * 所以前端必须守住：上下文条目的 `target` / `status` 一个字节都不能被动过 ——
+ * 既不能被标记成 `translating`（那是会被写进 PAK 的状态），也不能在成功收尾或
+ * 取消收尾的回滚里被清空（清空 = 抹掉用户已有的译文，不可逆）。
+ */
+describe("已有译文作为上下文一起发（一致性记忆的输入）", () => {
+  /** 一条已有译文（上下文条目）+ 一条待翻译 */
+  function contextFixtures(): void {
+    backend.entries = [
+      smallEntry("e-ctx", { target: "已经翻好的译文", status: "translated" }),
+      smallEntry("e-new"),
+    ];
+  }
+
+  it("上下文条目随 payload 原样发出，且成功收尾不得改动它", async () => {
+    contextFixtures();
+    await renderTable();
+
+    const button = findButton(mounted.container, "翻译 ");
+    expect(button).not.toBeNull();
+    // 只有 1 条要翻：上下文条目不算「可翻译」
+    expect(button!.textContent).toContain("翻译 1 条");
+    await act(async () => {
+      click(button!);
+    });
+    await waitMs(0);
+    expect(backend.onEvent).not.toBeNull();
+
+    // payload 必须带上上下文条目（原样）—— 它是后端一致性记忆的唯一来源
+    expect(backend.sent).toHaveLength(1);
+    expect(backend.sent[0].map((e) => e.id)).toEqual(["e-ctx", "e-new"]);
+    expect(backend.sent[0].find((e) => e.id === "e-ctx")).toMatchObject({
+      target: "已经翻好的译文",
+      status: "translated",
+    });
+
+    const send = backend.onEvent!;
+    await act(async () => {
+      send({ type: "progress", entryId: "e-new", status: "translating" });
+      send({ type: "delta", entryId: "e-new", text: "新译文" });
+      await waitForFlush("e-new");
+    });
+    expect(entryTarget("e-new")).toBe("新译文");
+    // 上下文条目不得被标记 translating（只有后端真正在翻的条目才会）
+    expect(storedEntry("e-ctx")).toMatchObject({
+      target: "已经翻好的译文",
+      status: "translated",
+    });
+
+    // 成功收尾（后端只对 e-new 发 done，all_done 的 total 也只算它）
+    await act(async () => {
+      send({ type: "done", entryId: "e-new", text: "新译文" });
+      send({ type: "all_done", total: 1, failed: 0 });
+      backend.finish?.();
+      backend.finish = null;
+      await Promise.resolve();
+    });
+    await waitMs(0);
+
+    expect(storedEntry("e-new")).toMatchObject({ target: "新译文", status: "translated" });
+    expect(storedEntry("e-ctx")).toMatchObject({
+      target: "已经翻好的译文",
+      status: "translated",
+    });
+    expect(mounted.container.textContent).toContain("已经翻好的译文");
+  });
+
+  it("取消收尾回滚只动本轮在跑的条目，不得清空上下文条目的译文", async () => {
+    contextFixtures();
+    await renderTable();
+
+    await act(async () => {
+      click(findButton(mounted.container, "翻译 ")!);
+    });
+    await waitMs(0);
+    expect(backend.onEvent).not.toBeNull();
+    const send = backend.onEvent!;
+
+    // e-new 流到一半，用户取消
+    await act(async () => {
+      send({ type: "progress", entryId: "e-new", status: "translating" });
+      send({ type: "delta", entryId: "e-new", text: "半截新译文" });
+      await waitForFlush("e-new");
+    });
+    expect(entryTarget("e-new")).toBe("半截新译文");
+
+    await act(async () => {
+      click(findButton(mounted.container, "取消翻译")!);
+    });
+    await waitMs(0);
+
+    // 后端收尾（取消也发 all_done），命令返回 → 回滚
+    await act(async () => {
+      send({ type: "all_done", total: 1, failed: 1 });
+      backend.finish?.();
+      backend.finish = null;
+      await Promise.resolve();
+    });
+    await waitMs(0);
+
+    // 在跑的那条回滚为待翻译
+    expect(storedEntry("e-new")).toMatchObject({ target: "", status: "pending" });
+    // 上下文条目纹丝不动（修复前这里会被回滚成 target="" / pending）
+    expect(storedEntry("e-ctx")).toMatchObject({
+      target: "已经翻好的译文",
+      status: "translated",
+    });
   });
 });

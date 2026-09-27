@@ -1,7 +1,7 @@
 /**
  * 写回闸门的确定性用例：翻译还在进行中时不允许把条目写回工作目录。
  *
- * 跨层不变量（见 docs/ARCHITECTURE.md「写回不变量」与
+ * 跨层不变量（见 README「冻结的 IPC 契约」与
  * crates/bg3-translate-core/src/types.rs 的 `has_writable_target`）：
  * 后端只在 `status === "error"` 时退回原文，`status === "translating"` 的
  * **半截流式文本会被当成真译文写进 PAK**。因此「写回时不能有未收尾的条目」

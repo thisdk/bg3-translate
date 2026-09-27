@@ -13,20 +13,23 @@
 检查项
 ------
 1. 前端 `invoke` 过的每个命令，后端都必须在 `generate_handler!` 里注册
-2. 后端注册的每个命令，都必须在 `docs/ARCHITECTURE.md` 的命令表里出现
-3. 文档命令表里不能有并未注册的命令
+2. 后端注册的每个命令，都必须在 `README.md` 的命令表里出现
+3. 命令表里不能有并未注册的命令
 4. **命令参数名**三处一致：后端 `#[tauri::command]` 形参（Tauri 注入的
    `State` / `AppHandle` / `Window` 等不算）/ 前端 `invoke` 的对象字段
-   （camelCase，经 Tauri 转 snake_case）/ 文档命令表的参数列。
+   （camelCase，经 Tauri 转 snake_case）/ 命令表的参数列。
    只查命令名会漏掉「`workDir` 写成 `workdir`」这类只有在运行期才炸的错误。
 5. 命令层写了 `#[tauri::command]` 的每个函数都必须在 `generate_handler!` 里注册
    （只从注册表出发的检查看不见「定义了但没注册」的命令）
-6. 命令的**返回类型**与文档命令表的返回列一致（`Result<Vec<PakFile>>` 归一成
+6. 命令的**返回类型**与命令表的返回列一致（`Result<Vec<PakFile>>` 归一成
    `PakFile[]`、`Result<()>` 归一成 `void` 再比对）
 7. `TranslationEvent` / `TranslationStatus` / `PakFileKind` 三组枚举的
    serde 名称与前端 TypeScript 联合类型必须一致
 8. 版本号一致：`package.json` / `src-tauri/tauri.conf.json` /
    `Cargo.toml [workspace.package]` / `Cargo.lock` 里两个工作区 crate
+9. **检查器自检**：用合成输入钉住「命令表按标题级别截断」与「嵌套泛型的
+   `invoke` 不被整条跳过」两条解析行为 —— 解析器一旦静默失效，上面 1~8
+   都会变成绿色，所以它必须自己先证明自己还在工作
 
 退出码：0 全部通过，1 存在不一致。
 """
@@ -46,7 +49,10 @@ COMMANDS_DIR = "src-tauri/src/commands"
 API_TS = "src/lib/tauri.ts"
 TYPES_TS = "src/lib/types.ts"
 TYPES_RS = "crates/bg3-translate-core/src/types.rs"
-ARCH = "docs/ARCHITECTURE.md"
+# 冻结的命令表在 README 的「### Tauri 命令」一节。
+# v1.5.0 起 `docs/` 不再随发布保留，命令表已从架构文档迁到 README；
+# 本脚本只读 README，不再依赖 `docs/**` 下的任何文件。
+ARCH = "README.md"
 PACKAGE_JSON = "package.json"
 TAURI_CONF = "src-tauri/tauri.conf.json"
 CARGO_TOML = "Cargo.toml"
@@ -201,9 +207,16 @@ def object_keys(body: str) -> list[str]:
 
 
 def js_invoke_args(source: str) -> dict[str, list[str]]:
-    """`{命令名: [前端字段名]}`（保持 camelCase），扫前端 `invoke` 调用点。"""
+    """`{命令名: [前端字段名]}`（保持 camelCase），扫前端 `invoke` 调用点。
+
+    泛型实参用 `[^(]*` 而不是 `[^<>]*`：`invoke<Record<string, Entry[]>>(…)`
+    这种**嵌套尖括号**的写法，旧正则匹配不上，于是整条调用被静默跳过 ——
+    「前端 invoke 了但后端没注册」与「参数名对不上」两道检查同时失效。
+    `[^(]*` 贪婪吃到 `(` 再回溯到最后一个 `>`，嵌套多少层都能跟上。
+    没有第二个参数（`invoke("close_mod")`）时字段列表为空。
+    """
     calls: dict[str, list[str]] = {}
-    for hit in re.finditer(r'invoke(?:<[^<>]*>)?\(\s*"([a-z_]+)"\s*(,?)', source):
+    for hit in re.finditer(r'invoke\s*(?:<[^(]*>)?\s*\(\s*"([a-z_]+)"\s*(,?)', source):
         command = hit.group(1)
         keys: list[str] = []
         if hit.group(2):
@@ -227,14 +240,24 @@ def js_invoke_args(source: str) -> dict[str, list[str]]:
     return calls
 
 
+def doc_command_section(text: str) -> str:
+    """取出 `### Tauri 命令` 一节的内容，到**下一个同级或更高级标题**为止。
+
+    为什么必须按标题级别截断：命令表在 README 里（大节是 `##`），而
+    `### Tauri 命令` 完全可能是某个 `##` 大节的最后一节。只认 `###` 的话，
+    这一节的边界会一路吃到文件末尾，后面任意一张形状相同的表格都会被当成
+    「命令表」—— 一条没写进命令表的命令，只要在 README 别处有一行同形状的
+    表格就能让门禁变绿（静默绕过）。所以终止条件取 `#` ~ `###` 任意标题。
+    """
+    section = re.search(r"### Tauri 命令(.*?)(?:\n#{1,3}[ \t]|\Z)", text, re.S)
+    return section.group(1) if section else ""
+
+
 def doc_command_table(arch: str) -> dict[str, tuple[list[str], str]]:
-    """`{命令名: (参数列字段, 返回列原文)}`，来自 `docs/ARCHITECTURE.md` 的命令表。"""
-    section = re.search(r"### Tauri 命令(.*?)(?:\n### |\Z)", arch, re.S)
-    if not section:
-        return {}
+    """`{命令名: (参数列字段, 返回列原文)}`，来自 `README.md` 的命令表。"""
     table: dict[str, tuple[list[str], str]] = {}
     for row in re.finditer(
-        r"^\| `([a-z_]+)` \| (.*?) \| (.*?) \|\s*$", section.group(1), re.M
+        r"^\| `([a-z_]+)` \| (.*?) \| (.*?) \|\s*$", doc_command_section(arch), re.M
     ):
         params = re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", row.group(2))
         table[row.group(1)] = (params, row.group(3).strip())
@@ -390,10 +413,54 @@ def ts_union_members(source: str, type_name: str) -> list[str]:
     return re.findall(r'"([A-Za-z_][A-Za-z0-9_-]*)"', "\n".join(body))
 
 
+def self_check(report: Report) -> None:
+    """用合成输入证明解析器还在工作（检查器的自检）。
+
+    为什么值得写：这个脚本的价值全在「能发现不一致」，而它一旦解析失败，
+    表现是**全绿**（少解析出一批命令 → 集合差为空 → 每条检查都通过）。
+    历史上已经踩过两次，都是静默失效：
+      1. 命令表边界只认 `###`：命令表迁到 README 后，若它是某个 `##` 大节的
+         最后一节，正则会把后面所有章节都吞进「命令表」，一条没写进命令表的
+         命令只要在别处有一行同形状的表格就能让门禁变绿；
+      2. `invoke` 的泛型实参写成嵌套尖括号（`invoke<Record<string, T[]>>(…)`）
+         时旧正则整条匹配不上，该命令既不参与「是否注册」也不参与「参数名」检查。
+    自检用合成输入（不读仓库文件），所以它验证的是解析器本身的行为。
+    """
+    readme_like = (
+        "### Tauri 命令\n\n"
+        "| `real_cmd` | `someArg` | `void` |\n\n"
+        "## 其它章节\n\n"
+        "| `ghost_cmd` | `otherArg` | `void` |\n"
+    )
+    api_like = (
+        'await invoke("real_cmd", { someArg });\n'
+        'await invoke<Record<string, Entry[]>>("nested_cmd", { otherArg });\n'
+    )
+
+    problems: list[str] = []
+    if sorted(doc_command_table(readme_like)) != ["real_cmd"]:
+        problems.append(
+            "命令表没有在 `##` 标题处截断（后面的表格被当成命令表，门禁可被静默绕过）"
+        )
+    if sorted(js_invoke_args(api_like)) != ["nested_cmd", "real_cmd"]:
+        problems.append("嵌套泛型实参的 `invoke` 被整条跳过（命令名 / 参数名检查同时失效）")
+
+    if problems:
+        report.bad("契约检查器自检未通过 —— 解析器已失效，本次检查结果不可信：")
+        for problem in problems:
+            report.detail(problem)
+        return
+    report.ok("检查器自检通过（命令表按标题级别截断、嵌套泛型 invoke 可解析）")
+
+
 def main() -> int:
     report = Report()
 
-    # ── 1/2. 命令注册 vs 前端调用 vs 文档 ────────────────────────
+    # ── 0. 检查器自检 ───────────────────────────────────────────
+    # 放在最前面：解析器静默失效时下面每条检查都会「通过」，所以先证明它还在工作。
+    self_check(report)
+
+    # ── 1/2. 命令注册 vs 前端调用 vs 命令表 ──────────────────────
     lib_rs = read(LIB_RS)
     handler = re.search(r"generate_handler!\[(.*?)\n\s*\]", lib_rs, re.S)
     if not handler:
@@ -402,16 +469,16 @@ def main() -> int:
     registered = sorted(set(re.findall(r"commands::([a-z_]+)", handler.group(1))))
 
     api_ts = read(API_TS)
-    used = sorted(set(re.findall(r'invoke(?:<[^>]*>)?\("([a-z_]+)"', api_ts)))
+    # 命令名与参数都从**同一个**解析器取：两处各写一份正则时，`invoke` 的写法
+    # 一变（例如泛型实参嵌套），两边会一起漏判，而且漏了也没人发现。
+    js_args = js_invoke_args(api_ts)
+    used = sorted(js_args)
 
-    arch = read(ARCH)
-    section = re.search(r"### Tauri 命令(.*?)(?:\n### |\Z)", arch, re.S)
-    documented = (
-        sorted(set(re.findall(r"^\| `([a-z_]+)`", section.group(1), re.M))) if section else []
-    )
+    readme = read(ARCH)
+    documented = sorted(set(re.findall(r"^\| `([a-z_]+)`", doc_command_section(readme), re.M)))
 
     print(
-        f"命令：注册 {len(registered)} 个，前端使用 {len(used)} 个，文档列出 {len(documented)} 个"
+        f"命令：注册 {len(registered)} 个，前端使用 {len(used)} 个，命令表列出 {len(documented)} 个"
     )
 
     unregistered = sorted(set(used) - set(registered))
@@ -424,19 +491,19 @@ def main() -> int:
 
     undocumented = sorted(set(registered) - set(documented))
     if undocumented:
-        report.bad(f"已注册但 {ARCH} 命令表里没有的命令：")
+        report.bad(f"已注册但 {ARCH} 的命令表里没有的命令：")
         for cmd in undocumented:
             report.detail(cmd)
     else:
-        report.ok("后端注册的命令全部写进了架构文档")
+        report.ok(f"后端注册的命令全部写进了 {ARCH} 的命令表")
 
     phantom = sorted(set(documented) - set(registered))
     if phantom:
-        report.bad(f"{ARCH} 里列出但并未注册的命令（文档腐烂）：")
+        report.bad(f"{ARCH} 命令表里列出但并未注册的命令（文档腐烂）：")
         for cmd in phantom:
             report.detail(cmd)
     else:
-        report.ok("架构文档没有虚构的命令")
+        report.ok(f"{ARCH} 命令表里没有虚构的命令")
 
     unused = sorted(set(registered) - set(used))
     if unused:
@@ -444,11 +511,10 @@ def main() -> int:
 
     # ── 1b. 命令**参数**契约 ────────────────────────────────────
     # 命令名对得上、参数名写错，同样只会在运行期炸；三处（后端形参 /
-    # 前端 invoke 字段 / 文档命令表）必须能互相转成同一组 snake_case 名字。
+    # 前端 invoke 字段 / 命令表）必须能互相转成同一组 snake_case 名字。
     signatures = rust_command_signatures()
     rust_params = {name: params for name, (params, _) in signatures.items()}
-    js_args = js_invoke_args(api_ts)
-    doc_table = doc_command_table(arch)
+    doc_table = doc_command_table(readme)
     doc_params = {name: params for name, (params, _) in doc_table.items()}
 
     if not rust_params:
@@ -501,11 +567,11 @@ def main() -> int:
                     f"{command}: 后端返回 {rust_ret}，文档命令表写的是 {doc_ret or '（空）'}"
                 )
         if return_problems:
-            report.bad("命令返回类型与架构文档命令表不一致：")
+            report.bad(f"命令返回类型与 {ARCH} 命令表不一致：")
             for problem in return_problems:
                 report.detail(problem)
         else:
-            report.ok(f"{len(registered)} 个命令的返回类型与架构文档命令表一致")
+            report.ok(f"{len(registered)} 个命令的返回类型与 {ARCH} 命令表一致")
 
     # ── 3. 枚举契约 ─────────────────────────────────────────────
     types_rs = read(TYPES_RS)

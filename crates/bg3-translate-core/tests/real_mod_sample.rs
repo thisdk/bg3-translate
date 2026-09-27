@@ -622,3 +622,84 @@ fn real_mod_survives_translate_write_repack_roundtrip() {
         "英文原文文件应保留"
     );
 }
+
+/// 真实样本里还带着两个 `.loca`（BG3 实际使用的二进制本地化格式），
+/// 在此之前**没有任何用例碰过它们** —— 合成样本里的 `.loca` 全是工具自己写的，
+/// 「读真实文件 → 写回」这条路上真实二进制布局（索引表 / 文本区偏移 / 真实 UTF-8
+/// 文本）从来没被验证过。
+///
+/// 三条断言：
+/// 1. 读出来的条数与同名的 XML 版一致（同一批 contentuid）；
+/// 2. **零译文写回逐字节不变** —— 写回是「整体重建索引表 + 文本区」，
+///    顺序或偏移写歪了就是另一份文件；
+/// 3. 带译文写回后能读回中文，且 contentuid / version 一字不变（句柄不能动）。
+#[test]
+fn real_loca_files_survive_a_write_back_roundtrip() {
+    let zip = sample_zip();
+    let tmp = tempfile::tempdir().unwrap();
+    let work_root = tmp.path().join("work");
+    fs::create_dir_all(&work_root).unwrap();
+    let (work_dir, files) = pak::open_and_extract_in(zip.to_str().unwrap(), &work_root).unwrap();
+
+    let locas: Vec<_> = files
+        .iter()
+        .filter(|f| f.kind == PakFileKind::LocalizationLoca)
+        .collect();
+    assert!(
+        !locas.is_empty(),
+        "样本里应当有 .loca 文件，否则这条用例会静默变空: {files:#?}"
+    );
+
+    for file in locas {
+        let path = work_dir.join("unpacked").join(&file.name);
+        let before = fs::read(&path).unwrap();
+        let entries =
+            formats::read_entries(work_dir.to_str().unwrap(), &file.name, file.kind).unwrap();
+        assert_eq!(entries.len(), 10, "{} 的条目数", file.name);
+        assert!(
+            entries.iter().all(|e| !e.contentuid.is_empty()),
+            "真实 .loca 的 key 必须全部读出来: {entries:#?}"
+        );
+
+        // ② 零译文写回：逐字节不变
+        formats::write_entries(work_dir.to_str().unwrap(), &file.name, file.kind, &entries)
+            .unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "{} 零译文写回必须逐字节不变（布局/顺序/偏移都不能漂）",
+            file.name
+        );
+
+        // ③ 带译文写回
+        let translated: Vec<TranslationEntry> = entries
+            .iter()
+            .cloned()
+            .map(|mut entry| {
+                entry.mark_translated(format!("[译]{}", entry.source));
+                entry
+            })
+            .collect();
+        formats::write_entries(
+            work_dir.to_str().unwrap(),
+            &file.name,
+            file.kind,
+            &translated,
+        )
+        .unwrap();
+
+        let back =
+            formats::read_entries(work_dir.to_str().unwrap(), &file.name, file.kind).unwrap();
+        assert_eq!(
+            back.len(),
+            entries.len(),
+            "{} 写回后条目数不能变",
+            file.name
+        );
+        for (source, written) in entries.iter().zip(&back) {
+            assert_eq!(source.contentuid, written.contentuid, "句柄不能动");
+            assert_eq!(source.version, written.version, "version 不能动");
+            assert_eq!(written.source, format!("[译]{}", source.source));
+        }
+    }
+}

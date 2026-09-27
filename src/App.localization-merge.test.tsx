@@ -158,7 +158,12 @@ async function packNow(): Promise<void> {
 /** 写回 payload：contentuid + 最终落盘的文本（有译文用译文，否则用原文） */
 function writtenPayload(): [string, string, string][] {
   expect(tauri.writeFileEntries).toHaveBeenCalledTimes(1);
-  const [, fileName, entries] = tauri.writeFileEntries.mock.calls[0] as [
+  return payloadOfCall(0);
+}
+
+/** 第 n 次写回的 payload（contentuid + 最终落盘文本 + 状态） */
+function payloadOfCall(index: number): [string, string, string][] {
+  const [, fileName, entries] = tauri.writeFileEntries.mock.calls[index] as [
     string,
     string,
     TranslationEntry[],
@@ -330,6 +335,56 @@ describe("R-05 写回已存在的中文文件", () => {
     expect(writtenPayload()).toEqual([
       ["uid-1", "Fireball", "pending"],
       ["uid-2", "Ice", "pending"],
+    ]);
+  });
+
+  it("第二次写回必须用打开 MOD 时的底稿：上一次写回的结果不得把「还原」掉的译文复活", async () => {
+    // 真实磁盘行为：写回会把工作目录里的目标文件改成我们的产物，
+    // 下一次再读它读到的就是产物本身（读取时文本落在 source 上）。
+    tauri.writeFileEntries.mockImplementation(
+      async (_workDir: string, fileName: string, entries: TranslationEntry[]) => {
+        backend.byFile[fileName] = entries.map((e) => ({
+          ...e,
+          source: e.target.trim() !== "" && e.status !== "error" ? e.target : e.source,
+          target: "",
+          status: "pending" as const,
+        }));
+      },
+    );
+    useAppStore.getState().setSelectedFiles([pakFile(EN, "English")]);
+    await renderApp();
+
+    // 第一条翻出译文并写回
+    await act(async () => {
+      useAppStore.getState().updateEntry(`${EN}#uid-1`, {
+        target: "火球术",
+        status: "translated",
+      });
+    });
+    await packNow();
+    expect(payloadOfCall(0)).toEqual([
+      ["uid-1", "火球术", "translated"],
+      ["uid-2", "寒冰", "pending"],
+    ]);
+
+    // 回工作台继续编辑，用户把这条「还原」掉（不想用这个译法）
+    await act(async () => {
+      click(findButton(mounted.container, "返回继续编辑")!);
+    });
+    await waitMs(0);
+    await act(async () => {
+      useAppStore.getState().updateEntry(`${EN}#uid-1`, {
+        target: "",
+        status: "pending",
+      });
+    });
+    await packNow();
+
+    // 还原的条目必须回到「打开 MOD 时」的底稿（官方中文「火球」），
+    // 而不是上一次写回留下的模型译文「火球术」——那是自己合并自己。
+    expect(payloadOfCall(1)).toEqual([
+      ["uid-1", "火球", "pending"],
+      ["uid-2", "寒冰", "pending"],
     ]);
   });
 

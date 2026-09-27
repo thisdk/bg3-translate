@@ -1,5 +1,7 @@
 //! 流式翻译命令。
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use bg3_translate_core::config;
 use bg3_translate_core::glossary::Glossary;
 use bg3_translate_core::translation::{EventSink, RunOptions, TranslationEngine};
@@ -12,16 +14,50 @@ use crate::state::AppState;
 
 /// 把 core 的事件桥接到 Tauri Channel。
 ///
-/// 推送失败只记 debug 日志：前端窗口关掉之后 `send` 会失败，
-/// 但这不应该让翻译任务本身报错。
+/// 推送失败本身不该让翻译任务报错：前端窗口关掉之后 `send` 就会失败，而译文
+/// 仍然在引擎的返回值里。但**第一次**失败必须留下痕迹 —— release 构建的日志
+/// 级别是 Info，早先统一按 debug 记的写法会被过滤掉，于是一条已经断掉的通道
+/// 就是「翻译照跑、结果没人收」：用户白白花 API 额度，日志里一个字都没有。
+/// 第 2 次起降回 debug，避免一条死通道把日志刷满。
 struct ChannelSink {
     channel: Channel<TranslationEvent>,
+    /// 是否已经记录过一次推送失败（每个任务只报一次）
+    push_failed: AtomicBool,
+}
+
+impl ChannelSink {
+    fn new(channel: Channel<TranslationEvent>) -> Self {
+        Self {
+            channel,
+            push_failed: AtomicBool::new(false),
+        }
+    }
+
+    /// 记下一次推送失败，返回这次该用的日志级别。
+    ///
+    /// 抽成函数是为了能被单测直接钉住：`log` 的全局 logger 在测试进程里只能装
+    /// 一次（同模块的日志用例已经占用了），所以「第一次用 warn、之后降回 debug」
+    /// 这条决策必须在不依赖 logger 的前提下可断言。
+    fn note_push_failure(&self) -> log::Level {
+        if self.push_failed.swap(true, Ordering::Relaxed) {
+            log::Level::Debug
+        } else {
+            log::Level::Warn
+        }
+    }
 }
 
 impl EventSink for ChannelSink {
     fn emit(&self, event: TranslationEvent) {
         if let Err(err) = self.channel.send(event) {
-            log::debug!("翻译事件推送失败（前端可能已关闭）: {err}");
+            match self.note_push_failure() {
+                log::Level::Warn => {
+                    log::warn!(
+                        "翻译事件推送失败（前端可能已关闭），本轮后续同类失败只记 debug: {err}"
+                    );
+                }
+                _ => log::debug!("翻译事件推送失败（前端可能已关闭）: {err}"),
+            }
         }
     }
 }
@@ -57,7 +93,7 @@ pub async fn translate_entries(
     let matcher = glossary.matcher();
 
     state.cancel.reset();
-    let sink = ChannelSink { channel: on_event };
+    let sink = ChannelSink::new(on_event);
 
     let engine = TranslationEngine::with_settings(settings)?;
     let summary = engine
@@ -138,6 +174,37 @@ mod tests {
         }
 
         fn flush(&self) {}
+    }
+
+    /// 通道断掉（前端窗口已关闭 / 开发时热重载）时，**第一次**推送失败必须用
+    /// `warn` 级别记下来。
+    ///
+    /// 旧写法每次失败都按 debug 记，而 release 构建的日志级别是 Info
+    /// （见 `lib.rs::log_plugin`）：通道一断，翻译继续跑、事件全丢，日志里却
+    /// 什么都没有 —— 用户白白花掉 API 额度。这里钉住「第一次 warn、之后 debug」
+    /// 的决策；第 2 次起降级是为了不让一条死通道把日志刷满。
+    #[test]
+    fn channel_sink_reports_first_push_failure_at_warn_level() {
+        let channel = Channel::new(|_| Err(tauri::Error::AssetNotFound("前端已关闭".into())));
+        let sink = ChannelSink::new(channel);
+
+        assert_eq!(
+            sink.note_push_failure(),
+            log::Level::Warn,
+            "第一次推送失败必须用 warn（release 只打 Info 及以上，debug 会被静默过滤）"
+        );
+        assert_eq!(
+            sink.note_push_failure(),
+            log::Level::Debug,
+            "后续失败降回 debug，避免一条死通道刷满日志"
+        );
+
+        // 真实推送路径：通道失败被吞掉（不影响翻译任务本身），状态照样记录
+        sink.emit(TranslationEvent::AllDone {
+            total: 1,
+            failed: 0,
+        });
+        assert_eq!(sink.note_push_failure(), log::Level::Debug);
     }
 
     /// `work_dir` 里的换行必须在日志里被转义成可见形式，否则前端可以

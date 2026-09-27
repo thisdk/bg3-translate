@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createDeltaBatcher } from "@/lib/delta-batcher";
-import { buildRetryRequest, buildTranslationRequest } from "@/lib/entries";
+import {
+  buildRetryRequest,
+  buildTranslationRequest,
+  isTranslatableNow,
+} from "@/lib/entries";
 import { cancelTranslation, translateEntries } from "@/lib/tauri";
 import { useAppStore } from "@/store/app-store";
 import type { RunSummary } from "../constants";
@@ -113,8 +117,17 @@ export function useTranslationRun({
     [applyDeltas],
   );
 
-  // 卸载时把尚未提交的 delta 落地（组件已经不在，但 store 里的文本要完整）
-  useEffect(() => () => batcher.dispose(), [batcher]);
+  // 卸载时把尚未提交的 delta 落地（组件已经不在，但 store 里的文本要完整）。
+  //
+  // 必须与 `resume` 配对成「挂载 → 卸载」：StrictMode（`src/main.tsx` 就是）
+  // 会在同一次挂载里先跑一遍 cleanup 再重跑 effect，而 `useMemo` 的 batcher
+  // 实例不会重建 —— 只 dispose 不 resume 的话，重新挂载后的每一次 push 都会被
+  // dispose 的永久闩锁静默丢掉：开发模式下流式预览整个失效（译文只在 done
+  // 一跳出现），且控制台没有任何报错。
+  useEffect(() => {
+    batcher.resume();
+    return () => batcher.dispose();
+  }, [batcher]);
 
   // 卸载即本轮生命周期结束：停止接收事件、不再收尾回滚（StrictMode 会
   // 先卸载再挂载，所以这里在挂载时复位 alive）
@@ -126,10 +139,39 @@ export function useTranslationRun({
     };
   }, []);
 
+  /**
+   * 离开工作台（点「返回」回首页 / 换 MOD / 关窗口）时，本轮如果还在跑，必须
+   * 主动请求后端取消。
+   *
+   * 为什么不能只是「不再接收事件」：后端不会因为工作台没了就停下 —— 它会继续
+   * 调模型 API 把剩下的条目翻完。取消按钮随工作台一起消失，用户看不到进度、
+   * 也没有任何入口能停掉它（重新打开 MOD 只是新开一轮，旧任务照样在后台烧
+   * 额度）。所以卸载时替用户把这一轮掐掉。
+   *
+   * 结果不需要反馈（组件已经在销毁），但 rejection 必须自己吃掉，否则会变成
+   * 未捕获的 Promise rejection。
+   */
+  useEffect(
+    () => () => {
+      if (runningRef.current) cancelTranslation().catch(() => {});
+    },
+    [],
+  );
+
   /** 统一的一次翻译执行：事件回调 + 取消回滚 */
   const runTranslation = useCallback(
     async (request: TranslationEntry[]) => {
       if (!workDir || request.length === 0 || runningRef.current) return;
+      /**
+       * 本轮**真正会被后端翻译**的条目。
+       *
+       * payload 里可能带着「已有译文」的上下文条目（见 `buildTranslationRequest`）：
+       * core 只翻 `is_pending_translation()` 的那些（与这里的 `isTranslatableNow`
+       * 逐字同义），上下文条目不会有任何事件，也不在 `plan.total` 里。
+       * 收尾回滚必须只针对这一批 —— 否则会把上下文条目的 target 清成空字符串，
+       * 等于抹掉用户已有的译文（不可逆，正是写回守卫要防的那类损失）。
+       */
+      const runnable = request.filter(isTranslatableNow);
       runningRef.current = true;
       const runId = runSeqRef.current + 1;
       runSeqRef.current = runId;
@@ -249,8 +291,10 @@ export function useTranslationRun({
           // 工作台已卸载：条目不再属于这一轮，回滚只会误伤新 MOD 里同 id 的
           // 条目（取消回滚 / 未完成回滚都跳过）
         } else if (cancelRequestedRef.current) {
-          // 取消：未完成的条目回滚为待翻译（人工保存过的译文除外）
-          for (const entry of request) {
+          // 取消：未完成的条目回滚为待翻译（人工保存过的译文除外）。
+          // 只遍历 `runnable`：payload 里的上下文条目（已有译文、后端根本没翻）
+          // 不在本轮范围内，回滚它们等于把用户的译文清空。
+          for (const entry of runnable) {
             if (completedIdsRef.current.has(entry.id)) continue;
             if (getEntryById(entry.id)?.status === "edited") continue;
             updateEntry(entry.id, {

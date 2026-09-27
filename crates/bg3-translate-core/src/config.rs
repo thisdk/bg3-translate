@@ -269,23 +269,63 @@ pub fn save(settings: &LlmSettings) -> Result<()> {
 }
 
 /// 原子写入：先写临时文件再 rename，避免断电/崩溃留下半个文件。
+///
+/// **所有失败路径都必须清掉临时文件**：它与目标同目录，写失败留下的半截文件会
+/// 被下一步打包当成 MOD 内容（实测：磁盘写满时 `english.tmp<pid>.<n>` 残留，
+/// repack 把 `Localization/English/*.tmp*` 一起打进产物 PAK）。
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let tmp = temp_path_for(path);
+    // 用守卫而不是在每个 `?` 后面手写清理：写失败、rename 失败都要走同一条
+    // 清理逻辑，漏掉一条分支就会留下半截文件（旧实现只在 rename 失败时清理）。
+    let mut cleanup = TempFileCleanup {
+        path: &tmp,
+        handed_over: false,
+    };
     std::fs::write(&tmp, bytes)?;
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(AppError::Io(err))
+    std::fs::rename(&tmp, path).map_err(AppError::Io)?;
+    // rename 成功：临时文件已经被移走，不需要再删
+    cleanup.handed_over = true;
+    Ok(())
+}
+
+/// 临时文件的清理守卫：没成功「交接」（rename）出去就删掉它。
+struct TempFileCleanup<'a> {
+    path: &'a Path,
+    handed_over: bool,
+}
+
+impl Drop for TempFileCleanup<'_> {
+    fn drop(&mut self) {
+        if self.handed_over {
+            return;
+        }
+        // 删不掉只记日志：这里已经在错误路径上，清理失败不能顶掉原始错误
+        match std::fs::remove_file(self.path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                log::debug!("清理原子写临时文件失败（{}）: {err}", self.path.display());
+            }
         }
     }
 }
 
 /// 进程内递增序号，保证每次原子写入都拿到**不同的**临时文件名。
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// 原子写临时文件扩展名的固定中缀。
+///
+/// **写入端（[`temp_path_for`]）与判定端（[`is_atomic_temp_name`]）共用这一处格式**：
+/// 打包侧要靠判定端挡住陈旧的临时文件，两边各写一份规则的话，命名一改就会悄悄失效。
+const TEMP_INFIX: &str = "tmp";
+
+/// 组装临时文件扩展名：`tmp<pid>.<序号>`。
+fn temp_extension(pid: u32, sequence: u64) -> String {
+    format!("{TEMP_INFIX}{pid}.{sequence}")
+}
 
 /// 原子写的临时文件路径：与目标同目录（跨目录 `rename` 不是原子操作，还可能跨设备失败）、
 /// 保留主名便于排查残留。
@@ -297,7 +337,33 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// 另一方 `rename` 直接 ENOENT 报错。
 fn temp_path_for(path: &Path) -> PathBuf {
     let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    path.with_extension(format!("tmp{}.{sequence}", std::process::id()))
+    path.with_extension(temp_extension(std::process::id(), sequence))
+}
+
+/// 文件名是否是原子写留下的临时文件（`<主名>.tmp<pid>.<序号>`）。
+///
+/// 给打包侧用：正常失败路径由 [`TempFileCleanup`] 清掉，但进程被杀 / 掉电时
+/// `unpacked/` 里可能留着上一次的临时文件，它不该被当成 MOD 内容打进产物 PAK。
+///
+/// 判定只认**完整形状**（最后一段全是数字、`tmp` 前必须紧跟 `.`、`tmp` 后全是数字），
+/// 免得把正常文件误判成临时文件而**静默丢掉用户的内容**：`english.xml`、`a.tmp`、
+/// `notes.tmp123.txt` 都不是。
+pub fn is_atomic_temp_name(name: &str) -> bool {
+    let Some((rest, sequence)) = name.rsplit_once('.') else {
+        return false;
+    };
+    if !is_ascii_digits(sequence) {
+        return false;
+    }
+    let Some((stem, pid)) = rest.rsplit_once(TEMP_INFIX) else {
+        return false;
+    };
+    is_ascii_digits(pid) && stem.ends_with('.')
+}
+
+/// 非空且全是 ASCII 数字。
+fn is_ascii_digits(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 #[cfg(test)]
@@ -576,6 +642,224 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains("tmp"))
             .collect();
         assert!(leftovers.is_empty(), "不应残留临时文件: {leftovers:?}");
+    }
+
+    /// 「连临时文件都建不出来」时的边界覆盖 —— **不是**能区分 R5-01 修复前后的回归。
+    ///
+    /// `/proc` 不支持新建文件（`dir_writable` 的既有用例也靠这一点），
+    /// `fs::write` 在 `File::create` 这一步就返回 `NotFound`，**临时文件从未被创建**：
+    /// 修复前的实现在这条路径上同样不会留下任何东西，所以 `leftovers.is_empty()`
+    /// 恒真、用它做变异实验恒绿。它只钉住「这种失败不能把错误类型吞掉」。
+    /// 真正能区分修复前后的是
+    /// [`real_write_failure_after_the_temp_file_exists_leaves_no_residue`]
+    /// （临时文件**已写出**、随后写失败）。
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn write_failure_leaves_no_temp_file() {
+        let err = write_atomic(Path::new("/proc/self/residue-check.json"), b"payload").unwrap_err();
+        assert_eq!(err.code(), "io", "写失败必须原样报 Io: {err}");
+
+        let leftovers: Vec<String> = fs::read_dir("/proc/self")
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| is_atomic_temp_name(name))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "失败路径残留了临时文件: {leftovers:?}"
+        );
+    }
+
+    /// 原子写失败后目录里不许残留临时文件（rename 失败分支）。
+    ///
+    /// 残留物与目标同目录，会被下一步打包当成 MOD 内容（实测 EFBIG 之后
+    /// `english.tmp<pid>.<n>` 被 repack 打进 PAK）。这里用「目标是个目录」
+    /// 让 rename 必然失败：临时文件那时**已经写出来了**，正是需要清理的形态。
+    ///
+    /// 注意它**不是**能区分 R5-01 修复前后的回归：修复前实现在 rename 失败分支里
+    /// 本来就有 `remove_file`，所以这条在变异实验下恒绿。补它是为了钉住那条分支的
+    /// 既有行为；真正区分前后的是
+    /// [`real_write_failure_after_the_temp_file_exists_leaves_no_residue`]。
+    #[test]
+    fn failed_atomic_write_leaves_no_temp_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("english.xml");
+        fs::create_dir(&target).unwrap();
+
+        let err = write_atomic(&target, b"payload").unwrap_err();
+        assert_eq!(err.code(), "io", "rename 失败必须原样报 Io: {err}");
+
+        let leftovers: Vec<String> = fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| is_atomic_temp_name(name))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "失败路径必须清掉临时文件，实际残留: {leftovers:?}"
+        );
+        // 目标目录本身不该被动过
+        assert!(target.is_dir());
+    }
+
+    /// R5-01 的真回归：临时文件**已经写出**、随后写失败（磁盘满 / RLIMIT_FSIZE）。
+    ///
+    /// 这是唯一能区分修复前后的形态。修复前 `fs::write(&tmp, bytes)?` 直接早退、
+    /// **不清理**，半截 `<主名>.tmp<pid>.<n>` 留在与目标同目录的位置，下一步 repack
+    /// 就会把它打进产物 PAK（验证者的 `pakjunk` 探针实测产物里出现
+    /// `Localization/English/*.tmp63760.*`）。
+    ///
+    /// 为什么不用 `/proc` 或「目标是目录」：那两条一个在 `File::create` 就失败
+    /// （临时文件从未创建）、一个走 rename 分支（修复前本来就清理），撤掉修复后
+    /// 依然全绿 —— 等于没测。这里用**真实 EFBIG**（`ulimit -f`）触发：临时文件被
+    /// `File::create` 真正建出来、`write_all` 写到上限时失败，形状与真实磁盘写满完全
+    /// 一致；**修复前实现下它会因为残留而变红**。
+    ///
+    /// 为什么要 re-exec 自己：`ulimit -f` 只能设在**子进程**（设在父进程会污染其他
+    /// 用例，而且默认的 SIGXFSZ 会直接杀掉进程），所以这里用 `sh` 起一个子进程、
+    /// 只跑这一条用例（`--exact`）。`trap '' XFSZ` 让内核把超限变成 `write` 返回
+    /// EFBIG 而不是投递致命信号；被忽略的信号处置会跨 `exec` 保留。
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn real_write_failure_after_the_temp_file_exists_leaves_no_residue() {
+        const CHILD_ENV: &str = "BG3_TRANSLATE_A2_EFBIG_CHILD";
+        const TEST_NAME: &str =
+            "config::tests::real_write_failure_after_the_temp_file_exists_leaves_no_residue";
+        /// 8 个 512 字节块 = 4 KiB（`ulimit -f` 的单位是 512 字节）。
+        const CHILD_FILE_LIMIT_BLOCKS: usize = 8;
+
+        // ── 子进程分支：在 RLIMIT_FSIZE 下真正跑一次 write_atomic ──
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("english.xml");
+            // 远大于 4 KiB：确保 write_all 写到一半才失败（临时文件已存在）
+            let payload = vec![b'x'; 64 * 1024];
+
+            let err = write_atomic(&target, &payload).expect_err("EFBIG 下写入必须失败");
+            assert_eq!(err.code(), "io", "失败必须原样报 Io: {err}");
+            assert!(!target.exists(), "失败时不该产出目标文件");
+
+            // 修复前实现会在这里留下 `english.tmp<pid>.<n>`（残留本身就是
+            // 「临时文件确实被创建过」的证据）；修复后目录必须是干净的。
+            let leftovers: Vec<String> = fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| is_atomic_temp_name(name))
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "写失败后残留了临时文件: {leftovers:?}"
+            );
+            return;
+        }
+
+        // ── 父进程分支：设好限制后只重跑上面那条用例 ──
+        let exe = std::env::current_exe().expect("能取到当前测试二进制路径");
+        let script = format!(
+            "trap '' XFSZ; ulimit -f {CHILD_FILE_LIMIT_BLOCKS}; exec '{}' --exact '{TEST_NAME}' --quiet",
+            exe.display()
+        );
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("能在受限子进程里重跑测试二进制");
+        assert!(
+            output.status.success(),
+            "子进程（ulimit -f {CHILD_FILE_LIMIT_BLOCKS}）里的用例失败: status={:?}\nstdout={}\nstderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    /// 清理守卫自身的契约：没「交接」出去的文件必须删掉，交接出去的不许动。
+    ///
+    /// 与上一条双保险：上一条盯「真实失败路径真的被清理」，这条盯「守卫实现本身
+    /// 没写反」（例如 handed_over 判断反了会把刚 rename 好的目标删掉）。
+    #[test]
+    fn temp_file_cleanup_guard_deletes_only_unhanded_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("english.tmp1234.0");
+
+        // 没交接：Drop 时删除
+        fs::write(&tmp, b"partial").unwrap();
+        {
+            let _cleanup = TempFileCleanup {
+                path: &tmp,
+                handed_over: false,
+            };
+        }
+        assert!(!tmp.exists(), "未交接的临时文件必须被 Drop 清掉");
+
+        // 已交接（rename 已成功）：不许删，那已经是目标文件了
+        fs::write(&tmp, b"done").unwrap();
+        {
+            let _cleanup = TempFileCleanup {
+                path: &tmp,
+                handed_over: true,
+            };
+        }
+        assert!(tmp.exists(), "已交接的文件不能被 Drop 删掉");
+        assert_eq!(fs::read(&tmp).unwrap(), b"done");
+    }
+
+    /// 判定函数只认**完整**的临时文件形状。
+    ///
+    /// 打包侧要用它挡陈旧临时文件，误判的代价是把用户真实内容静默丢掉，
+    /// 所以三个反例（正常文件 / 半截名字 / 主名里带 tmp）必须判否。
+    #[test]
+    fn atomic_temp_name_predicate_only_accepts_the_real_shape() {
+        for name in [
+            "english.tmp63760.0",
+            "a.tmp63760.1",
+            "notes.tmp1.23",
+            ".hidden.tmp9.0",
+            "mytmp.tmp12.7",
+        ] {
+            assert!(is_atomic_temp_name(name), "{name} 应判为临时文件");
+        }
+        for name in [
+            "english.xml",
+            "a.tmp",
+            "notes.tmp123.txt",
+            "a.loca",
+            "tmp63760.0",      // 没有主名
+            "xtmp123.4",       // `tmp` 前没有 `.`
+            "english.tmp.0",   // pid 缺失
+            "english.tmp123.", // 序号缺失
+            "english.xml.tmp123",
+            "",
+            "tmp",
+            ".",
+        ] {
+            assert!(!is_atomic_temp_name(name), "{name} 不应判为临时文件");
+        }
+    }
+
+    /// 判定函数与写入端共用同一份形状：写入端生成的每个名字都必须是判定的正例。
+    ///
+    /// 这条把两端钉在一起 —— 谁单方面改了命名格式（Round-4 的并发唯一性依赖它），
+    /// 打包侧的拦截规则就会跟着失效，这里会立刻变红。
+    #[test]
+    fn generated_temp_names_are_recognized_by_the_predicate() {
+        for target in [
+            "/data/settings.json",
+            "/data/a.loca",
+            "/data/a",
+            "/data/x.y.xml",
+        ] {
+            let temp = temp_path_for(Path::new(target));
+            let name = temp.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(
+                is_atomic_temp_name(&name),
+                "写入端生成的名字必须能被判定函数认出来: {name}"
+            );
+        }
     }
 
     /// 临时文件名必须**每次调用都不同**。

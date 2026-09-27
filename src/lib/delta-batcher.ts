@@ -17,6 +17,10 @@
  *   - `done` / `error` 携带权威文本，此时该条目在同一帧内尚未提交的 delta
  *     必须用 `discard(id)` 丢掉，不能落后于权威文本再追加；
  *   - 取消或收尾回滚时用 `discardAll()` 丢掉整批未提交内容。
+ *
+ * 生命周期：`dispose()`（落地并停止）与 `resume()`（重新开始）必须成对使用 ——
+ * React StrictMode 会把 effect 重放一遍，而 `useMemo` 里这个实例不会重建，
+ * 只 dispose 不 resume 就等于让流式文本永久静默丢失（见 `resume` 的说明）。
  */
 
 /** 一次 flush 里提交的一条合并结果 */
@@ -46,6 +50,17 @@ export interface DeltaBatcher {
   discard: (id: string) => void;
   /** 丢弃全部尚未提交的 delta（取消 / 回滚收尾） */
   discardAll: () => void;
+  /**
+   * 恢复接受 `push`（与 [`DeltaBatcher.dispose`] 配对）。
+   *
+   * 为什么需要它：React StrictMode（`src/main.tsx` 就是）会在同一次挂载里先跑
+   * 一遍 effect cleanup 再重跑 effect，而挂在 `useMemo` 上的 batcher 实例
+   * **不会重建** —— 只 dispose 不 resume 的话，重新挂载后每一次 `push` 都被
+   * dispose 的永久闩锁静默丢掉：开发模式下流式预览整个失效（译文只在 `done`
+   * 一跳出现），而且没有任何报错。所以「dispose（落地并停止）+ resume（重新
+   * 开始）」必须成对出现，无论生命周期怎么重放都不会卡在停止态。
+   */
+  resume: () => void;
   /** 组件卸载：先 flush 落地，之后不再接受 push */
   dispose: () => void;
   /** 待提交的条目数（测试/调试用） */
@@ -122,6 +137,9 @@ export function createDeltaBatcher({
     flush,
     discard,
     discardAll,
+    resume: () => {
+      disposed = false;
+    },
     dispose: () => {
       if (disposed) return;
       disposed = true;

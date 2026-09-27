@@ -138,13 +138,18 @@
 
 按下面的顺序决定，日志里会写明实际用了哪个：
 
-1. 环境变量 `BG3_TRANSLATE_HOME`
+1. 环境变量 `BG3_TRANSLATE_HOME`（相对路径按进程当前目录解析，建议写绝对路径）
 2. **便携模式**：exe 同级目录的 `config/`（能写就用它）
-3. **系统模式**：`%APPDATA%\bg3-translate`
+3. **系统模式**：`%APPDATA%\bg3-translate\config`（Windows）、`~/.config/bg3-translate`（Linux）、
+   `~/Library/Application Support/bg3-translate`（macOS）
 
 第 3 步是必要的：装到 `C:\Program Files` 时 exe 同级目录通常不可写。
 配置文件是 `settings.json`（大模型连接信息）和 `glossary.json`（术语表），
-写入采用「先写临时文件再改名」的原子方式，断电不会留下半个损坏文件。
+写入采用「先写临时文件再改名」的原子方式，断电不会留下半个损坏文件；
+**文件损坏时（JSON 语法坏了、被编辑器存成了非 UTF-8）不会静默丢掉你的数据** ——
+原文件会被改名成 `settings.json.corrupt` / `glossary.json.corrupt` 留在原位旁边，
+应用回退到默认设置/官方种子，之后你也可以手工把 API Key 或术语捞回来。
+「设置」面板里的「配置目录」就是实际生效的那个路径。
 
 ---
 
@@ -193,6 +198,9 @@ docs/VERIFICATION-ROUND2.md    # 第二轮独立验证：对第一轮修复的�
 docs/REVIEW-ROUND3.md          # 第三轮全面审查：结论摘要、修复清单、已知取舍
 docs/VERIFICATION-ROUND3.md    # 第三轮独立验证：逐条复核 + 变异测试
 docs/review-r3/                # 第三轮四位审计者的原始报告 + 独立红队基线发现
+docs/REVIEW-ROUND4.md          # 第四轮全面审查：结论摘要、修复清单、已知取舍
+docs/VERIFICATION-ROUND4.md    # 第四轮独立验证：逐条复核 + 变异矩阵 + 被证伪的怀疑点
+docs/review-r4/                # 第四轮四位审计者的原始报告
 scripts/check_ipc_contract.py  # 跨层契约检查（CI meta job 调用）
 scripts/verify.sh              # 一键跑完全部门禁（CI 的 core / web job 也走它）
 ```
@@ -302,7 +310,10 @@ python3 scripts/check_ipc_contract.py
 只依赖 Python 标准库，几秒出结果，核对：前端 `invoke` 的命令 ⊆ 后端注册的命令、
 后端注册的命令 == `docs/ARCHITECTURE.md` 命令表、**每条命令的参数名**在
 「后端形参 / 前端 `invoke` 字段 / 文档命令表」三处一致（命令名对了但参数名写错，
-运行期一样报错），`TranslationEvent` / `TranslationStatus` / `PakFileKind` 三组枚举的
+运行期一样报错）、**命令层写了 `#[tauri::command]` 的函数都真的注册进了
+`generate_handler!`**（漏注册的命令前端一调就报「命令不存在」，而只从注册表出发的
+检查看不见它）、**命令的返回类型与文档命令表的返回列一致**，
+`TranslationEvent` / `TranslationStatus` / `PakFileKind` 三组枚举的
 serde 名称与前端联合类型一致，以及版本号在 `package.json` / `tauri.conf.json` /
 `Cargo.toml` / `Cargo.lock` 四处一致（版本改了却忘了更新 lock，`--locked` 构建会失败）。
 装了 GUI 系统库时能真编 `src-tauri`，没装的机器上编不了——这个脚本就是补上的那道防线。
@@ -315,16 +326,20 @@ serde 名称与前端联合类型一致，以及版本号在 `package.json` / `t
   - `meta`：版本号一致（`package.json` / `Cargo.toml` / `tauri.conf.json`，
     并断言两个 crate 都用 `version.workspace = true` 继承，不留第四处版本号；
     `Cargo.lock` 由契约脚本一并核对）、
-    跨层 IPC 契约检查（命令名 + 参数名 + 枚举 + 版本号），以及
-    「`scripts/verify.sh` 的六道门禁没被删改」的一致性断言
-    （`--list` 毫秒级、不需要工具链）。几秒出结果，不需要 cargo / bun。
+    跨层 IPC 契约检查（命令名 + 参数名 + 返回类型 + 注册完整性 + 枚举 + 版本号），以及
+    「`scripts/verify.sh` 的门禁没被删改」的一致性断言：默认清单逐字符比对，
+    `--core-only --no-ipc` 与 `--web-only --no-ipc` 两个**模式**的清单也各自断言
+    （只钉默认清单的话，给某道门禁加个 `if` 就能让某个 CI job 静默少跑一步）。
+    几秒出结果，不需要 cargo / bun。
   - `core` / `web`：直接调用 `scripts/verify.sh --core-only --no-ipc` /
     `--web-only --no-ipc`，所以 CI 和本地跑的是同一串命令，不会各写一份慢慢漂移。
-  - `tauri-shell`：Windows 上复用 `web` 的 `dist` 制品做 `cargo check` + `clippy`。
+  - `tauri-shell`：Windows 上复用 `web` 的 `dist` 制品做 `cargo check` + `clippy`，
+    并**真正执行**命令层单元测试（`cargo test -p bg3-translate --lib`；
+    `--all-targets` 只编译不执行，少了这一步，路径逃逸防线的回归测试等于静默失效）。
 - `.github/workflows/release.yml`：只用 `windows-latest` 构建 NSIS + MSI + 便携版，
   整理成 4 个文件上传到 Actions 制品；打 tag 时同时创建 GitHub Release。
   手动触发时留空 `tag_name` 就只构建、不发布。发布链路上的闸门：
-  - 构建前校验标签与 `tauri.conf.json` 版本一致（`v1.1.5` ⇔ 版本 `1.1.5`）；
+  - 构建前校验标签与 `tauri.conf.json` 版本一致（`v1.2.0` ⇔ 版本 `1.2.0`）；
   - 整理产物时按类型分别断言 `*-Portable.zip` / `*.msi` / `*-Setup.exe` /
     `SHA256SUMS.txt` 各 ≥1（只看文件总数会漏掉「少打了一个安装包」），
     并拒绝 0 字节产物；

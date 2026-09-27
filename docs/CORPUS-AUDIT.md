@@ -64,7 +64,7 @@ $ git status --short
 | D5 | 提示词「`&lt;` 游戏不认，会显示成字面标签」 | **无法验证**（游戏侧行为在仓库内无证据） | — |
 | D6 | 「真元素形态其实也被游戏接受」 | **无法验证**；且即使游戏两种都认，写回翻转文件格式本身仍是缺陷，不构成不修的理由 | — |
 | D7 | 三处文案精度问题（"降级成纯文本"的机制归属、ARCHITECTURE 用非白名单标签举例、legacy 测试复现的不是完整修复前行为） | 非缺陷（建议顺手订正） | 极低 |
-| D8 | `content_list::write` 忽略 `parsed.error`：磁盘文件解析残缺时会把整份文件重写成残缺集合（实测被写成空 `<contentList/>`） | 低危观察（**当前不可达**：`read` 会先返回 Err） | 低 |
+| D8 | `content_list::write` 忽略 `parsed.error`：磁盘文件解析残缺时会把整份文件重写成残缺集合（实测被写成空 `<contentList/>`） | **第四轮订正：可达且会造成静默丢条目**（写回目标不一定是刚读过的文件；App 层探针显示底稿读失败后仍会继续写回）。已在第四轮修掉（`write` 遇 `parsed.error` 直接报错、不落盘），见 `docs/review-r4/formats.md` F-R4-04 | 中 |
 
 ---
 
@@ -205,7 +205,7 @@ $ git check-ignore -v samples/english.xml      # 也不是被 .gitignore 挡了
 
 ---
 
-### D8 低危观察：`content_list::write` 忽略 `parsed.error`（当前不可达）
+### D8 低危观察：`content_list::write` 忽略 `parsed.error`（**第四轮订正：可达，已修**）
 
 实测：对一个解析失败的磁盘文件调 `write(&path, &parsed.entries)`（`parsed.error = Some(...)`、`entries` 为空），文件被重写成：
 
@@ -215,13 +215,32 @@ $ git check-ignore -v samples/english.xml      # 也不是被 .gitignore 挡了
 
 即"解析到哪算哪"的残缺条目集合会覆盖整份文件（`merge_missing_entries` 拿到的 `on_disk` 也是残缺的）。
 
-**当前不可达**：`read`（以及 `formats::read_entries*`）在 `parsed.error.is_some()` 时返回 Err，实测报文清晰：
+**~~当前不可达~~（第四轮订正）**：原文的判断「`read` 会先返回 Err，所以 UI 拿不到条目、不会走到 `write`」只覆盖了
+「同一个文件先读后写」这一条路径。第四轮的两条证据推翻了它：
 
-```
-read_entries_from_path -> Err(Xml("t.xml 解析失败，已中止读取以避免写回时丢失条目: ill-formed document: expected `</br>`, but `</content>` was found"))
+1. **写回目标不一定是刚读过的那个文件**：写回是「把条目写进目标路径」，`write` 自己会去读目标路径
+   （`Localization/Chinese/…` 可能是本次根本没读过的文件，也可能是被别的程序改过的文件）。
+   目标一旦残缺，`write` 用残缺底稿 merge 后整体重写，**出错点之后的条目被永久删除且返回 `Ok`**。
+2. **App 层探针**（verifier 阶段 A）显示 HEAD 上 `mergeWithShippedTarget` 遇到底稿读失败只
+   `console.warn` 就继续调用 `writeFileEntries`（调用 1 次、`stage=done`、`error=null`），
+   即前端不会因为底稿读失败而中止写回。
+
+复现（`docs/review-r4/formats.md` F-R4-04 的原始输出）：
+
+```console
+## corrupt[raw_amp]: parse_error=Some("ill-formed document: entity or character reference not closed …")
+   parsed_ids=["h1"]            write=Ok(())      ← 修复前：返回 Ok
 ```
 
-所以 UI 拿不到条目、不会走到 `write`。属于**纵深防御缺口**（`write` 自己不复核 `parsed.error`），本轮不必修，但值得记一笔。
+`h2`/`h3` 里**完全合法**的条目在写回后消失。
+
+**第四轮的修法**：`write` 在 `parsed.error.is_some()` 时直接返回 `Xml` 错误并**不落盘**
+（与 `read` 的既有政策一致：「宁可让用户看到一条明确的错误，也不能悄悄产出内容缺失的 PAK」）。
+回归测试 `formats::content_list::tests::write_refuses_when_the_target_is_only_partially_parsable`，
+变异实验见 `docs/review-r4/formats.md`（M4：去掉该检查 → 用例立刻变红）。
+
+另：同一函数把「目标存在但读不出来」（EACCES / Windows 共享冲突…）当成「新文件」处理，同样是
+静默删条目 + 返回 `Ok`，第四轮一并收口（F-R4-03）。
 
 ---
 

@@ -19,6 +19,7 @@ import { SettingsPanel } from "@/components/SettingsPanel";
 import { TranslationTable } from "@/components/TranslationTable";
 import { useAppStore } from "@/store/app-store";
 import {
+  findShippedFile,
   mergeWithExistingTarget,
   planLocalizationWrites,
   type LocalizationWritePlan,
@@ -69,15 +70,19 @@ function FilesPage() {
       const plans = planLocalizationWrites(selectedFiles, entriesByFile);
       // MOD 自带的目标文件（例如 Localization/Chinese/x.xml）要当底稿：英文
       // 文件里未翻译的条目否则会退回英文原文，把文件里已有的中文覆盖掉（R-05）。
-      const shippedFiles = new Set(files.map((f) => f.name));
+      // 判定按「分隔符归一 + 大小写不敏感」（见 `findShippedFile`）：
+      // MOD 里写的是 `Localization/CHINESE/` 时同样必须合并。
       for (const plan of plans) {
-        const entries = shippedFiles.has(plan.fileName)
-          ? await mergeWithShippedTarget(workDir, plan)
+        const shipped = findShippedFile(files, plan.fileName);
+        const entries = shipped
+          ? await mergeWithShippedTarget(workDir, plan, shipped)
           : plan.entries;
         await writeFileEntries(workDir, plan.fileName, entries);
       }
     } catch (e) {
-      setError(String(e));
+      // Error 对象去掉 "Error: " 前缀，读起来更像给用户看的话；IPC reject 的
+      // 字符串（Tauri invoke 的拒绝值）保持原样
+      setError(e instanceof Error ? e.message : String(e));
       return;
     }
     setStage("done");
@@ -85,19 +90,29 @@ function FilesPage() {
 
   /**
    * 取 MOD 自带目标文件的现有内容作为写回底稿。
-   * 读不到底稿时**不阻断写回**（退回「直接用计划条目」的既有行为），
-   * 只在控制台留痕，避免把一次可恢复的读取失败变成打包失败。
+   *
+   * `shippedName` 是 `files` 里实际存在的那个路径（可能与写回目标只有大小写
+   * 不同，例如 `Localization/CHINESE/x.xml`）：读它、写回目标路径。
+   *
+   * 读不到底稿时**必须中止这次写回**：合并的前提就是「拿到这个文件里已有的
+   * 内容」，拿不到还照常写回，等于用计划条目（英文原文）整体覆盖它 ——
+   * 未翻译条目退回原文、底稿独有的 contentuid 丢失，正是 R-05 要防的那次
+   * 数据损失。宁可让用户重试一次，也不能把一次可恢复的读取失败变成不可逆的
+   * 覆盖（用户重试或取消勾选映射到它的文件都能继续）。
    */
   const mergeWithShippedTarget = async (
     dir: string,
     plan: LocalizationWritePlan,
+    shippedName: string,
   ): Promise<TranslationEntry[]> => {
     try {
-      const existing = await readFileEntries(dir, plan.fileName);
+      const existing = await readFileEntries(dir, shippedName);
       return mergeWithExistingTarget(plan.entries, existing);
     } catch (e) {
-      console.warn(`[写回] 读取底稿失败，按原样写回 ${plan.fileName}:`, e);
-      return plan.entries;
+      throw new Error(
+        `读取 ${shippedName} 的已有内容失败，已中止写回以免整体覆盖它：${String(e)}。` +
+          "请重试；若该文件确实无法读取，可在左侧取消勾选映射到它的文件后再打包。",
+      );
     }
   };
 

@@ -5,9 +5,10 @@
 //! 当归档路径校验，之后才能交给 core 读写。缺任何一条都能让前端写到
 //! 工作目录之外——见本文件底部的回归测试。
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
-use bg3_translate_core::types::{PakFileKind, TranslationEntry};
+use bg3_translate_core::types::{PakFileKind, TranslationEntry, TranslationStatus};
 use bg3_translate_core::{AppError, Result, formats, pak};
 use tauri::State;
 
@@ -77,7 +78,47 @@ fn write_entries_checked(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    formats::write_entries_to_path(&path, kind, entries)
+    let writable = writable_entries(entries);
+    formats::write_entries_to_path(&path, kind, &writable)
+}
+
+/// 写回前的最后一道闸门：把「还没有权威结果」的条目退回原文。
+///
+/// `status == translating` 的条目身上是**半截流式文本**，而 core 的
+/// `TranslationEntry::has_writable_target()` 只在 `status == error` 时退回原文，
+/// 所以它会被当成真译文写进 PAK。前端 `lib/entries.ts::toWritableEntry` 已经拦过
+/// 一次，但命令层是**信任边界**：前端有 bug、或者调用方是旧版本前端时，
+/// 半截译文就会静默进 PAK。这里按与前端**逐字段一致**的语义再拦一次：
+/// 清空 `target`、状态退回 `pending`、清掉 `error` 信息。
+///
+/// 为什么是净化而不是报错：`translating` 的文本从来不是权威结果，
+/// 「退回原文」与翻译失败时的处置一致，不会让用户的写回操作失败。
+fn writable_entries(entries: &[TranslationEntry]) -> Cow<'_, [TranslationEntry]> {
+    let unfinished = entries
+        .iter()
+        .filter(|entry| entry.status == TranslationStatus::Translating)
+        .count();
+    if unfinished == 0 {
+        return Cow::Borrowed(entries);
+    }
+    log::warn!(
+        "写回请求里有 {unfinished} 条条目仍在翻译中（status=translating），\
+         已退回原文，避免半截译文进 PAK"
+    );
+    Cow::Owned(entries.iter().map(writable_entry).collect())
+}
+
+/// 单条净化：与前端 `toWritableEntry` 语义一致（非 `translating` 原样返回）。
+fn writable_entry(entry: &TranslationEntry) -> TranslationEntry {
+    if entry.status != TranslationStatus::Translating {
+        return entry.clone();
+    }
+    TranslationEntry {
+        target: String::new(),
+        status: TranslationStatus::Pending,
+        error: None,
+        ..entry.clone()
+    }
 }
 
 #[cfg(test)]
@@ -322,5 +363,37 @@ mod tests {
             let result = write_checked(Some(Path::new(&work)), &work, file_name, &entries);
             assert!(result.is_err(), "{file_name} 应被拒绝，实际: {result:?}");
         }
+    }
+
+    /// `translating` 的条目带着**半截流式文本**，绝不能写进 PAK。
+    ///
+    /// core 的 `has_writable_target()` 只在 `status == error` 时退回原文，
+    /// 所以 `translating` + 非空 target 会被原样写成译文。前端
+    /// `toWritableEntry` 已经拦过一次，但命令层是信任边界：前端有 bug、
+    /// 或者调用方是旧版本前端时，半截译文就会静默进 PAK。这里在命令层
+    /// 再拦一次（纵深防御），处置与前端逐字段一致（清空 target + 退回 pending），
+    /// 也就是「宁可退回原文，也不要把半截文本写进产物」。
+    #[test]
+    fn write_back_downgrades_entries_still_translating() {
+        let (_tmp, work) = work_dir("translating-gate");
+        let file_name = "Mods/x/Localization/Chinese/english.xml";
+
+        let mut streaming = TranslationEntry::new(file_name, "c1", "1", "Hello");
+        streaming.target = "半截译文".to_string();
+        streaming.status = TranslationStatus::Translating;
+        streaming.error = Some("上一轮的错误信息".to_string());
+
+        let mut done = TranslationEntry::new(file_name, "c2", "1", "World");
+        done.target = "世界".to_string();
+        done.status = TranslationStatus::Translated;
+
+        write_checked(Some(Path::new(&work)), &work, file_name, &[streaming, done])
+            .expect("写回本身应成功（净化而不是报错）");
+
+        let written = Path::new(&work).join("unpacked").join(file_name);
+        let xml = std::fs::read_to_string(&written).expect("读回写出的 XML");
+        assert!(!xml.contains("半截译文"), "半截流式文本不得写进产物: {xml}");
+        assert!(xml.contains("Hello"), "未完成的条目必须退回原文: {xml}");
+        assert!(xml.contains("世界"), "已完成条目照常写回: {xml}");
     }
 }

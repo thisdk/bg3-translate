@@ -25,9 +25,23 @@ export function FileDropZone({ className }: { className?: string }) {
     dir: string;
     count: number;
   } | null>(null);
+  /**
+   * 是否已经有一次「打开 MOD」在跑。
+   *
+   * 点击路径被 busy 挡住了，但拖放路径（Tauri webview 事件 / HTML5 drop）没有：
+   * 解包途中再拖一个文件进来会并发发起两次 `open_mod`，而后端打开新 MOD 时会
+   * 删掉上一个工作目录 —— 最后落地的 store 状态可能指向一个已被删除的目录，
+   * 之后所有 `read_file_entries` 都会因为 work_dir 校验失败而被拒绝。
+   */
+  const openingRef = useRef(false);
 
   const handleOpen = useCallback(
     async (filePath: string) => {
+      if (openingRef.current) {
+        setError("正在打开上一个 MOD，请等它完成后再试");
+        return;
+      }
+      openingRef.current = true;
       setLoading(true);
       setError(null);
       setExtractResult(null);
@@ -37,6 +51,7 @@ export function FileDropZone({ className }: { className?: string }) {
       } catch (e) {
         setError(String(e));
       } finally {
+        openingRef.current = false;
         setLoading(false);
       }
     },

@@ -99,6 +99,24 @@ function chineseEntry(contentuid: string, text: string): TranslationEntry {
   };
 }
 
+/** 指定文件名的条目（大小写变体用例用） */
+function entryIn(
+  fileName: string,
+  contentuid: string,
+  text: string,
+): TranslationEntry {
+  return {
+    id: `${fileName}#${contentuid}`,
+    sourceFile: fileName,
+    source: text,
+    target: "",
+    contentuid,
+    version: "1",
+    status: "pending",
+    error: null,
+  };
+}
+
 let mounted: Mounted;
 
 beforeEach(() => {
@@ -246,7 +264,76 @@ describe("R-05 写回已存在的中文文件", () => {
     ]);
   });
 
-  it("底稿读取失败不阻断写回（退回原行为，只留痕）", async () => {
+  it("MOD 自带的目录大小写不同（Localization/CHINESE）时同样走合并", async () => {
+    const UPPER_ZH = "Localization/CHINESE/x.xml";
+    backend.byFile = {
+      [EN]: [sourceEntry("uid-1", "Fireball"), sourceEntry("uid-2", "Ice")],
+      [UPPER_ZH]: [
+        entryIn(UPPER_ZH, "uid-1", "火球"),
+        entryIn(UPPER_ZH, "uid-2", "寒冰"),
+      ],
+    };
+    const api = useAppStore.getState();
+    api.setModOpened("/tmp/upper.pak", "/tmp/work3", [
+      pakFile(EN, "English"),
+      pakFile(UPPER_ZH, "Chinese"),
+    ]);
+    api.setSelectedFiles([pakFile(EN, "English")]);
+    await renderApp();
+    await packNow();
+
+    // 逐字节比较 `shippedFiles.has(plan.fileName)` 会判定落空 → 不读底稿 →
+    // payload 退化成英文原文；在大小写不敏感的文件系统（Windows/macOS）上
+    // 这就是把 MOD 自带的中文覆盖成英文。
+    expect(writtenPayload()).toEqual([
+      ["uid-1", "火球", "pending"],
+      ["uid-2", "寒冰", "pending"],
+    ]);
+  });
+
+  it("同名文件以两种大小写同时存在时，底稿取精确匹配的那个", async () => {
+    const UPPER_ZH = "Localization/CHINESE/x.xml";
+    backend.byFile = {
+      [EN]: [sourceEntry("uid-1", "Fireball")],
+      [ZH]: [entryIn(ZH, "uid-1", "精确匹配的中文")],
+      [UPPER_ZH]: [entryIn(UPPER_ZH, "uid-1", "大写目录里的中文")],
+    };
+    const api = useAppStore.getState();
+    api.setModOpened("/tmp/both.pak", "/tmp/work4", [
+      pakFile(EN, "English"),
+      pakFile(UPPER_ZH, "Chinese"),
+      pakFile(ZH, "Chinese"),
+    ]);
+    api.setSelectedFiles([pakFile(EN, "English")]);
+    await renderApp();
+    await packNow();
+
+    expect(writtenPayload()).toEqual([["uid-1", "精确匹配的中文", "pending"]]);
+  });
+
+  it("MOD 没列出目标文件时不去读它（不把用户新建/上次写回的文件当成自带底稿）", async () => {
+    // MOD 只有英文；`Localization/Chinese/x.xml` 是上一次写回在工作目录里造出来的，
+    // 它不在 open_mod 的文件列表里 —— 判定必须只认文件列表，不能凭「磁盘上存在」
+    // 就把它当底稿读进来（否则会把别的文件的内容合并进写回 payload）。
+    const api = useAppStore.getState();
+    api.setModOpened("/tmp/en-only2.pak", "/tmp/work5", [pakFile(EN, "English")]);
+    api.setSelectedFiles([pakFile(EN, "English")]);
+    await renderApp();
+
+    const { readFileEntries } = await import("@/lib/tauri");
+    vi.mocked(readFileEntries).mockClear();
+    await packNow();
+
+    expect(
+      vi.mocked(readFileEntries).mock.calls.map((call) => String(call[1])),
+    ).not.toContain(ZH);
+    expect(writtenPayload()).toEqual([
+      ["uid-1", "Fireball", "pending"],
+      ["uid-2", "Ice", "pending"],
+    ]);
+  });
+
+  it("底稿读取失败必须中止写回（否则已有的中文会被英文原文整体覆盖）", async () => {
     useAppStore.getState().setSelectedFiles([pakFile(EN, "English")]);
     await renderApp();
 
@@ -257,20 +344,16 @@ describe("R-05 写回已存在的中文文件", () => {
         return backend.byFile[fileName] ?? [];
       },
     );
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
-    try {
-      await packNow();
+    await packNow();
 
-      // 读取底稿失败 ≠ 打包失败：仍然写回，并用计划条目（英文原文）
-      expect(writtenPayload()).toEqual([
-        ["uid-1", "Fireball", "pending"],
-        ["uid-2", "Ice", "pending"],
-      ]);
-      expect(useAppStore.getState().stage).toBe("done");
-      expect(warn).toHaveBeenCalled();
-    } finally {
-      warn.mockRestore();
-    }
+    // 读不到底稿 = 合并无法进行。此时「退回计划条目继续写回」等于用英文原文
+    // 整体覆盖这个文件：未翻译条目退回原文、底稿独有的 contentuid 丢失 ——
+    // 正是 R-05 要防的那次数据损失，所以必须中止并把原因交给用户。
+    expect(tauri.writeFileEntries).not.toHaveBeenCalled();
+    expect(useAppStore.getState().stage).toBe("files");
+    const banner = mounted.container.textContent ?? "";
+    expect(banner).toContain("读取失败：文件被占用");
+    expect(banner).toContain(ZH);
   });
 });

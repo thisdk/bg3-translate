@@ -196,6 +196,42 @@ describe("手工编辑与流式翻译并发", () => {
     });
   });
 
+  it("重试开始（progress 重发）不得清掉用户已经保存的译文", async () => {
+    await renderTable();
+    const send = await startTranslation();
+    await streamBoth(send);
+    await editRow(0, "用户手工译文");
+    expect(storedEntry("e-0")).toMatchObject({
+      target: "用户手工译文",
+      status: "edited",
+    });
+
+    // 网络退避 / 结构纠错重试：后端对同一条目再发一次 progress(translating)。
+    // 这个信号对「正在流式的条目」是清空旧文本，但对人工成果不适用 ——
+    // 清掉之后状态会变回 translating，后续 delta 与 done 都能再覆盖它。
+    await act(async () => {
+      send({ type: "progress", entryId: "e-0", status: "translating" });
+      await Promise.resolve();
+    });
+
+    expect(storedEntry("e-0")).toMatchObject({
+      target: "用户手工译文",
+      status: "edited",
+    });
+
+    // 重试轮的 delta 也不得落到人工译文上（用 e-1 的 progress 同步 flush）
+    await act(async () => {
+      send({ type: "delta", entryId: "e-0", text: "模型重试文本" });
+      send({ type: "progress", entryId: "e-1", status: "translating" });
+      await Promise.resolve();
+    });
+
+    expect(storedEntry("e-0")).toMatchObject({
+      target: "用户手工译文",
+      status: "edited",
+    });
+  });
+
   it("取消收尾回滚不得清掉用户已经保存的译文", async () => {
     await renderTable();
     const send = await startTranslation();

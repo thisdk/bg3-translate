@@ -790,6 +790,48 @@ async fn series_with_placeholder_suffixes_passes_and_composes() {
     );
 }
 
+/// 端到端：只差句末标点的两条原文必须各自拿到「自己那句」的译文。
+///
+/// 分组改用一致性 key 时，`Delete this save?` 与 `Delete this save!` 会共享
+/// 一次请求（请求原文取第一条），后一条的 `done` 里就是前一条的译文。结构校验
+/// 拦不住（占位符 / 标签一模一样），所以这条盯的是 `done` 事件里的文本。
+#[tokio::test]
+async fn punctuation_variants_each_get_their_own_translation() {
+    let fake = Arc::new(FakeTranslator::default()); // 回显 `译:{source}`
+    let engine = engine_with(fake.clone(), 2);
+    let sink = CollectingSink::new();
+    let cancel = CancelToken::new();
+    let entries = vec![
+        entry("Delete this save?", "u1"),
+        entry("Delete this save!", "u2"),
+    ];
+
+    let summary = engine
+        .run(&entries, &matcher(&[]), run_options(&sink, &cancel, ""))
+        .await
+        .unwrap();
+
+    assert_eq!(summary.translated, 2);
+    assert_eq!(summary.failed, 0);
+    let mut done = done_events(&sink.events());
+    done.sort();
+    assert_eq!(
+        done,
+        vec![
+            (
+                "test.loca#u1".to_string(),
+                "译:Delete this save?".to_string()
+            ),
+            (
+                "test.loca#u2".to_string(),
+                "译:Delete this save!".to_string()
+            ),
+        ],
+        "每条必须拿到自己那句的译文"
+    );
+    assert_eq!(fake.calls().len(), 2, "原文不同 → 两次请求");
+}
+
 // ─────────────────────────────────────────────────────────────
 // 尝试边界：每次新尝试开始都重发 progress（F-09 契约）
 // ─────────────────────────────────────────────────────────────

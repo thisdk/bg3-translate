@@ -170,12 +170,17 @@ export function useTranslationRun({
               // 其余条目的待提交内容先落地，保持「先文本后状态」的事件顺序
               batcher.flush();
               if (retrying) {
-                updateEntry(event.entryId, {
-                  target: "",
-                  status: "translating",
-                  // 清掉上一轮的错误文案，否则行内仍显示旧错误而不是新流式文本
-                  error: null,
-                });
+                // 人工成果优先：用户已经保存过译文（edited）时，重试不得把它清空
+                // —— 清空后状态会变回 translating，后续 delta / done 都能再覆盖它
+                // （与 delta / done / error 三个分支同一条规则）。
+                if (getEntryById(event.entryId)?.status !== "edited") {
+                  updateEntry(event.entryId, {
+                    target: "",
+                    status: "translating",
+                    // 清掉上一轮的错误文案，否则行内仍显示旧错误而不是新流式文本
+                    error: null,
+                  });
+                }
               } else {
                 setEntryStatus(event.entryId, event.status);
               }

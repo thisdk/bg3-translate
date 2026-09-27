@@ -172,7 +172,17 @@ where
         };
         let events = match next {
             Some(Ok(bytes)) => decoder.push_checked(bytes.as_ref())?,
-            Some(Err(err)) => return Err(AppError::Llm(format!("流读取失败: {err}"))),
+            // 两个成因在客户端不可区分，但都要让用户看到：连接真的断了，或者这次
+            // 流式响应撞上了总超时（reqwest 的 timeout 覆盖到响应体读完，慢模型 /
+            // 长条目会在这里稳定失败）。只写 `{err}` 的话用户看到的是一句英文的
+            // "error decoding response body"，既不知道发生了什么，也不知道下一步。
+            Some(Err(err)) => {
+                return Err(AppError::Llm(format!(
+                    "流读取失败（连接中断，或流式响应超过 {} 秒总超时）: {err}；\
+                     可减小单条文本长度或换用更快的模型后重试",
+                    REQUEST_TIMEOUT.as_secs()
+                )));
+            }
             None => {
                 let tail = decoder.finish_checked()?;
                 if tail.is_empty() {
@@ -192,6 +202,17 @@ where
                     let Some(chunk) = parse_chat_chunk_parts(&payload) else {
                         continue;
                     };
+                    // 服务端明说这条流没做完：绝不能当心跳跳过。网关在上游超时 /
+                    // 限流时会在流中间插一条错误对象，随后照常发 `[DONE]`（很多
+                    // 代理的 `[DONE]` 是在 finally 里发的）—— 跳过它，`[DONE]`
+                    // 就成了「输出完整」的假证据，半截译文会被当成成功译文写进 PAK。
+                    if let Some(message) = chunk.error {
+                        return Err(AppError::Llm(format!(
+                            "流式响应被服务端中断（{}），已丢弃这次半截译文；可重试，\
+                             或换用更稳定的网关",
+                            truncate_chars(&message, ERROR_BODY_LIMIT)
+                        )));
+                    }
                     saw_finish_reason |= chunk.finish_reason.is_some();
                     if let Some(reason) = chunk.truncation_reason() {
                         truncation = Some(reason.to_string());
@@ -606,6 +627,16 @@ mod tests {
         };
         let err = consume_chat_stream(stream, &request).await.unwrap_err();
         assert!(err.to_string().contains("流读取失败"), "实际: {err}");
+        // 必须把两个成因都写出来：只给英文的底层错误，用户不知道下一步做什么
+        assert!(
+            err.to_string().contains("连接中断") && err.to_string().contains("总超时"),
+            "实际: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains(&REQUEST_TIMEOUT.as_secs().to_string()),
+            "要写出真实的超时秒数: {err}"
+        );
     }
 
     /// 被长度上限截断的响应不能当成功：半截译文会一路写进 PAK。
@@ -675,6 +706,45 @@ mod tests {
             let err = result.expect_err("错误体不能被当成空译文成功");
             assert_eq!(err.code(), "llm");
             assert!(deltas.is_empty());
+        }
+    }
+
+    /// 流中错误载荷：半截译文 + `{"error":{...}}` + `[DONE]` 不能当成功。
+    ///
+    /// 网关在上游超时 / 限流时会在流中间插一条错误对象，随后照常发 `[DONE]`
+    /// （很多代理的 `[DONE]` 在 finally 里发）。旧实现把这条载荷当「解析不出来的
+    /// 心跳」跳过，于是 `[DONE]` 成了「输出完整」的证据，半截译文一路成功。
+    #[tokio::test]
+    async fn mid_stream_error_payload_is_rejected_instead_of_returning_half_text() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"造成\"}}]}\n\n\
+                    data: {\"error\":{\"message\":\"upstream timeout\",\"type\":\"server_error\"}}\n\n\
+                    data: [DONE]\n\n";
+        let (result, deltas) = feed(vec![body.as_bytes().to_vec()], "Deals {1} damage").await;
+        assert_eq!(deltas, vec!["造成".to_string()], "增量照常推送");
+        let err = result.expect_err("流中错误载荷必须判失败，不能把半截译文当成功");
+        assert!(err.to_string().contains("upstream timeout"), "实际: {err}");
+    }
+
+    /// 同一个错误载荷换成 `finish_reason: stop` 收尾也一样。
+    #[tokio::test]
+    async fn mid_stream_error_payload_is_rejected_before_finish_reason() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"造成\"}}]}\n\n\
+                    data: {\"error\":{\"message\":\"rate limited\"}}\n\n\
+                    data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+        let (result, _) = feed(vec![body.as_bytes().to_vec()], "Deals {1} damage").await;
+        let err = result.expect_err("错误载荷必须判失败");
+        assert!(err.to_string().contains("rate limited"), "实际: {err}");
+    }
+
+    /// 正向对照：`"error": null` 是合法字段，不能因此误杀正常流。
+    #[tokio::test]
+    async fn a_null_error_field_does_not_break_a_normal_stream() {
+        for body in [
+            "data: {\"choices\":[{\"delta\":{\"content\":\"火球\"}}],\"error\":null}\n\ndata: [DONE]\n\n",
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"火球\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n",
+        ] {
+            let (result, _) = feed(vec![body.as_bytes().to_vec()], "Fireball").await;
+            assert_eq!(result.unwrap().as_deref(), Some("火球"), "body={body}");
         }
     }
 

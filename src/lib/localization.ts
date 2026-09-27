@@ -94,6 +94,64 @@ export function planLocalizationWrites(
 }
 
 /**
+ * 归一化 PAK 内路径，用于「这个目标路径是不是 MOD 自带的文件」的判定。
+ *
+ * 规则（**全平台统一，不做平台分支**）：
+ *   1. 反斜杠统一成 `/`（PAK 内路径由后端归一化过，这里兜底）；
+ *   2. 折叠重复分隔符、去掉空段与 `.` 段、去掉首尾分隔符；
+ *   3. 转小写 —— Windows / macOS 的文件系统大小写不敏感，`Localization/CHINESE/x.xml`
+ *      与 `Localization/Chinese/x.xml` 指向同一个文件。
+ *
+ * 为什么不在 Linux 上恢复大小写敏感：同一个 MOD 在三个平台上必须给出同一个
+ * 判定结果。若按平台分支，Linux 上「不合并底稿 → 写回英文原文」，而 Windows
+ * 上「合并」，用户看到的产物会随平台变化；更糟的是大小写敏感带来的差异恰好是
+ * 「有没有覆盖自带中文」这件不可逆的事。误判的代价是不对称的：
+ * 漏判（不合并）会丢已有中文，误判（多读一个文件当底稿）最多是多合并几个
+ * contentuid 条目，产物仍然是合法且可加载的本地化文件。
+ */
+export function normalizePakPath(fileName: string): string {
+  return fileName
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter((part) => part !== "" && part !== ".")
+    .join("/")
+    .toLowerCase();
+}
+
+/**
+ * 在 MOD 自带的文件列表里找出与目标写回路径对应的那个文件，返回它在 PAK 里的
+ * **原始路径**（没有则返回 `null`）。
+ *
+ * 为什么不能直接用 `files.some((f) => f.name === target)`：MOD 里的目录/文件名
+ * 大小写不一定和改写结果一致（`Localization/CHINESE/x.xml`），逐字节比较会判定
+ * 落空 —— 于是「MOD 自带的目标文件」被当成新文件：不读磁盘底稿、写回 payload
+ * 退化成英文原文，在大小写不敏感的文件系统（Windows / macOS）上就把自带的中文
+ * 覆盖掉了。
+ *
+ * 反向风险（把用户新建的文件误判成自带文件）：本函数**只遍历 `files`**（即
+ * `open_mod` 返回的文件列表），不会去探测磁盘上是否存在该路径。上一次写回在
+ * 工作目录里造出来的 `Localization/Chinese/x.xml` 不在列表里，因此永远不会被
+ * 当成底稿读进来。
+ *
+ * 精确匹配优先：两种大小写同时存在时，读用户实际选中的那一个（读用原始名，
+ * 写仍然用改写后的目标名）。
+ */
+export function findShippedFile(
+  files: readonly { name: string }[],
+  targetPath: string,
+): string | null {
+  let fallback: string | null = null;
+  const wanted = normalizePakPath(targetPath);
+  for (const file of files) {
+    if (file.name === targetPath) return file.name;
+    if (fallback === null && normalizePakPath(file.name) === wanted) {
+      fallback = file.name;
+    }
+  }
+  return fallback;
+}
+
+/**
  * 写回目标是「MOD 里已经存在的文件」时，用该文件现有的内容做底稿合并
  * （contentuid 级）。
  *

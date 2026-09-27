@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   TARGET_LANGUAGE,
+  findShippedFile,
   localizationWritePriority,
   mergeWithExistingTarget,
+  normalizePakPath,
   planLocalizationWrites,
   toTargetLocalizationPath,
 } from "./localization";
@@ -346,5 +348,54 @@ describe("planLocalizationWrites 写回闸门（半截译文不得进 PAK）", (
       // 若这里被改成 pending，被拒译文就会被写进 PAK。
       ["f-1", "被拒的半截文本", "error"],
     ]);
+  });
+});
+
+describe("normalizePakPath / findShippedFile（自带目标文件的判定）", () => {
+  it("归一化：分隔符、重复斜杠、点段与大小写", () => {
+    expect(normalizePakPath("Localization/Chinese/x.xml")).toBe(
+      "localization/chinese/x.xml",
+    );
+    expect(normalizePakPath("Localization/CHINESE/x.xml")).toBe(
+      "localization/chinese/x.xml",
+    );
+    expect(normalizePakPath("\\Localization\\\\Chinese\\x.xml")).toBe(
+      "localization/chinese/x.xml",
+    );
+    expect(normalizePakPath("./Localization/./Chinese/x.xml/")).toBe(
+      "localization/chinese/x.xml",
+    );
+  });
+
+  it("大小写不同也算 MOD 自带的文件（Windows/macOS 语义）", () => {
+    const files = [
+      { name: "Localization/English/x.xml" },
+      { name: "Localization/CHINESE/x.xml" },
+    ];
+    expect(findShippedFile(files, "Localization/Chinese/x.xml")).toBe(
+      "Localization/CHINESE/x.xml",
+    );
+  });
+
+  it("精确匹配优先于大小写匹配", () => {
+    const files = [
+      { name: "Localization/CHINESE/x.xml" },
+      { name: "Localization/Chinese/x.xml" },
+    ];
+    expect(findShippedFile(files, "Localization/Chinese/x.xml")).toBe(
+      "Localization/Chinese/x.xml",
+    );
+  });
+
+  it("MOD 没列出该路径时返回 null（不去猜磁盘上存不存在）", () => {
+    const files = [{ name: "Localization/English/x.xml" }];
+    expect(findShippedFile(files, "Localization/Chinese/x.xml")).toBeNull();
+    // 只差文件名也不能命中
+    expect(findShippedFile(files, "Localization/English/y.xml")).toBeNull();
+  });
+
+  it("不同目录下的同名文件不会互相命中", () => {
+    const files = [{ name: "Mods/A/Localization/Chinese/x.xml" }];
+    expect(findShippedFile(files, "Mods/B/Localization/Chinese/x.xml")).toBeNull();
   });
 });

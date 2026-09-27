@@ -44,6 +44,33 @@ function newEmptyEntry(): GlossaryEntry {
   };
 }
 
+/**
+ * 每一行的稳定定位键：`source#组内序号`（第几次出现）。
+ *
+ * 为什么不能只用 `source`：术语表里**真的有重复 source** —— 官方样本
+ * `samples/bg3-official-glossary.json` 清洗后就有 6 组（`'Jaheira'` 与 `Jaheira`
+ * 这类「带引号 / 不带引号」变体去掉引号后同名，组内译文相同），Rust 侧
+ * `real_glossary_already_contains_duplicate_sources` 把它钉住了；用户导入带重复的
+ * JSON、或把某条的 source 改成已有的 source（后端 `update` 只替换第一条）同样会产生。
+ * 用 `source` 当 React key 会触发 React 的重复 key 警告，并在列表增删时复用错行。
+ *
+ * 序号在**整个术语表**范围内计算，与搜索 / 过滤 / 「加载更多」无关：过滤只缩小
+ * 可见子集，不改变任何一行的序号取值，所以键不会在过滤前后错位。
+ *
+ * 为什么不用「稳定 id」：`GlossaryEntry` 没有 id 字段，加它要动 IPC 契约
+ * （`src/lib/types.ts` + Rust 结构体 + check_ipc_contract.py），本轮不做，已列 backlog。
+ */
+function buildRowKeys(terms: GlossaryEntry[]): Map<GlossaryEntry, string> {
+  const seen = new Map<string, number>();
+  const keys = new Map<GlossaryEntry, string>();
+  for (const term of terms) {
+    const ordinal = seen.get(term.source) ?? 0;
+    seen.set(term.source, ordinal + 1);
+    keys.set(term, `${term.source}#${ordinal}`);
+  }
+  return keys;
+}
+
 export function GlossaryPanel({
   onClose,
   embedded = false,
@@ -59,7 +86,13 @@ export function GlossaryPanel({
   const [editOriginal, setEditOriginal] = useState<string | null>(null);
   const [limit, setLimit] = useState(200);
   const [saving, setSaving] = useState(false);
-  const [busySource, setBusySource] = useState<string | null>(null);
+  /**
+   * 正在删除的那一行的**行键**（不是 source）。
+   *
+   * 术语表里存在重复 source（官方样本清洗后就有 6 组，见 `buildRowKeys`），
+   * 按 source 置忙会让重复的两行同时转圈，而且用户根本分不清点中了哪一行。
+   */
+  const [busyRow, setBusyRow] = useState<string | null>(null);
 
   useEffect(() => {
     refresh();
@@ -90,6 +123,12 @@ export function GlossaryPanel({
     );
   }, [glossary, search]);
 
+  /** 行键索引：条目对象 → 稳定行键（同一份 glossary 内对象引用唯一） */
+  const rowKeys = useMemo(
+    () => buildRowKeys(glossary?.terms ?? []),
+    [glossary],
+  );
+
   const onSave = async () => {
     if (!editing || saving) return;
     if (!editing.source.trim() || !editing.target.trim()) {
@@ -115,16 +154,20 @@ export function GlossaryPanel({
     }
   };
 
-  const onDelete = async (source: string) => {
+  /**
+   * 删除一行。`rowKey` 用来定位「是哪一行在转圈」，`source` 才是发给后端的主键
+   * （后端按 source 命中；重复 source 时它会删掉该 source 的全部条目，见报告）。
+   */
+  const onDelete = async (rowKey: string, source: string) => {
     setError(null);
-    setBusySource(source);
+    setBusyRow(rowKey);
     try {
       const g = await deleteGlossaryEntry(source);
       setGlossary(g);
     } catch (e) {
       setError(String(e));
     } finally {
-      setBusySource(null);
+      setBusyRow(null);
     }
   };
 
@@ -141,10 +184,18 @@ export function GlossaryPanel({
 
   const onImport = async () => {
     // 用 Tauri 原生对话框（浏览器 <input> 在 Tauri 沙箱里读不到真实文件内容）
-    const selected = await openDialog({
-      multiple: false,
-      filters: [{ name: "术语表 JSON", extensions: ["json"] }],
-    });
+    let selected: string | string[] | null = null;
+    try {
+      selected = await openDialog({
+        multiple: false,
+        filters: [{ name: "术语表 JSON", extensions: ["json"] }],
+      });
+    } catch (e) {
+      // 对话框 reject（IPC 不可用 / 权限问题）不能变成未捕获的 Promise rejection：
+      // 用户看不到任何反馈，控制台只剩一条 unhandled rejection
+      setError(String(e));
+      return;
+    }
     const filePath = typeof selected === "string" ? selected : null;
     if (!filePath) return;
 
@@ -285,50 +336,54 @@ export function GlossaryPanel({
               </tr>
             </thead>
             <tbody className="divide-y">
-              {visible.slice(0, limit).map((t) => (
-                <tr
-                  key={t.source}
-                  className={cn(
-                    "hover:bg-accent/50",
-                    !t.enabled &&
-                      "bg-muted/30 text-muted-foreground opacity-60 hover:bg-muted/40",
-                  )}
-                >
-                  <td className="max-w-[180px] truncate px-4 py-1.5 sm:max-w-[280px]" title={t.source}>
-                    {t.source}
-                  </td>
-                  <td className="max-w-[180px] truncate px-4 py-1.5 sm:max-w-[280px]" title={t.target}>
-                    {t.target}
-                  </td>
-                  <td className="px-4 py-1.5">
-                    <div className="flex gap-1">
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        className="h-6 px-1.5"
-                        onClick={() => startEdit(t)}
-                        aria-label={`编辑术语 ${t.source}`}
-                        title="编辑"
-                      >
-                        <Edit3 className="h-3 w-3" />
-                      </Button>
-                      {t.sourceKind !== "official" && (
+              {visible.slice(0, limit).map((t, index) => {
+                // 行键与「哪一行在转圈」都用它定位（重复 source 时 source 不唯一）
+                const rowKey = rowKeys.get(t) ?? `${t.source}#${index}`;
+                return (
+                  <tr
+                    key={rowKey}
+                    className={cn(
+                      "hover:bg-accent/50",
+                      !t.enabled &&
+                        "bg-muted/30 text-muted-foreground opacity-60 hover:bg-muted/40",
+                    )}
+                  >
+                    <td className="max-w-[180px] truncate px-4 py-1.5 sm:max-w-[280px]" title={t.source}>
+                      {t.source}
+                    </td>
+                    <td className="max-w-[180px] truncate px-4 py-1.5 sm:max-w-[280px]" title={t.target}>
+                      {t.target}
+                    </td>
+                    <td className="px-4 py-1.5">
+                      <div className="flex gap-1">
                         <Button
                           size="sm"
                           variant="ghost"
-                          className="h-6 px-1.5 text-destructive hover:text-destructive"
-                          onClick={() => onDelete(t.source)}
-                          loading={busySource === t.source}
-                          aria-label={`删除术语 ${t.source}`}
-                          title="删除"
+                          className="h-6 px-1.5"
+                          onClick={() => startEdit(t)}
+                          aria-label={`编辑术语 ${t.source}`}
+                          title="编辑"
                         >
-                          <Trash2 className="h-3 w-3" />
+                          <Edit3 className="h-3 w-3" />
                         </Button>
-                      )}
-                    </div>
-                  </td>
-                </tr>
-              ))}
+                        {t.sourceKind !== "official" && (
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-6 px-1.5 text-destructive hover:text-destructive"
+                            onClick={() => onDelete(rowKey, t.source)}
+                            loading={busyRow === rowKey}
+                            aria-label={`删除术语 ${t.source}`}
+                            title="删除"
+                          >
+                            <Trash2 className="h-3 w-3" />
+                          </Button>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         )}

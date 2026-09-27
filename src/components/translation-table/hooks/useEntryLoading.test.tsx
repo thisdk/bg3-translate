@@ -14,8 +14,14 @@
 import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useEntryLoading } from "./useEntryLoading";
+import { TranslationTable } from "@/components/TranslationTable";
 import { useAppStore } from "@/store/app-store";
-import { mountContainer, type Mounted } from "@/test-utils/dom";
+import {
+  findButton,
+  mountContainer,
+  stubVirtualScrollLayout,
+  type Mounted,
+} from "@/test-utils/dom";
 import type { PakFile, TranslationEntry } from "@/lib/types";
 
 const FILE_A = "Localization/English/a.xml";
@@ -27,6 +33,8 @@ const backend = vi.hoisted(() => ({
 
 vi.mock("@/lib/tauri", () => ({
   readFileEntries: backend.readFileEntries,
+  translateEntries: vi.fn(async () => undefined),
+  cancelTranslation: vi.fn(async () => undefined),
 }));
 
 function pakFile(name: string): PakFile {
@@ -53,6 +61,7 @@ function Probe() {
 }
 
 let mounted: Mounted;
+let restoreLayout: () => void;
 
 beforeEach(() => {
   backend.readFileEntries.mockReset();
@@ -64,11 +73,13 @@ beforeEach(() => {
   api.reset();
   api.setModOpened("/tmp/a.pak", "/tmp/work", [pakFile(FILE_A), pakFile(FILE_B)]);
 
+  restoreLayout = stubVirtualScrollLayout();
   mounted = mountContainer();
 });
 
 afterEach(() => {
   mounted.unmount();
+  restoreLayout();
 });
 
 /** 让 mock 的 Promise 链 + React 状态更新跑完 */
@@ -151,5 +162,85 @@ describe("useEntryLoading 增量加载", () => {
     await flush();
 
     expect(useAppStore.getState().entriesByFile[FILE_A]).toHaveLength(1);
+  });
+
+  it("取消勾选正在读取的文件后 loading 必须收掉（否则界面永久卡在「加载中」）", async () => {
+    let resolveB: ((entries: TranslationEntry[]) => void) | null = null;
+    backend.readFileEntries.mockImplementation((_workDir: string, name: string) => {
+      if (name === FILE_B) {
+        return new Promise<TranslationEntry[]>((resolve) => {
+          resolveB = resolve;
+        });
+      }
+      return Promise.resolve([entry("a-1", name)]);
+    });
+
+    useAppStore.getState().setSelectedFiles([pakFile(FILE_A)]);
+    await mounted.render(<Probe />);
+    await flush();
+    expect(mounted.container.textContent).toBe("idle");
+
+    // 勾上 B：它的读取还挂着 → loading
+    await act(async () => {
+      useAppStore.getState().setSelectedFiles([pakFile(FILE_A), pakFile(FILE_B)]);
+    });
+    await flush();
+    expect(mounted.container.textContent).toBe("loading");
+
+    // 取消勾选 B：A 已经加载完成，此刻没有任何待加载项。
+    // 上一轮请求被 cleanup 取消后不会再调用 setLoading(false)，所以这里必须
+    // 由「没有待加载项」这条分支收掉 loading，否则它会一直是 true。
+    await act(async () => {
+      useAppStore.getState().setSelectedFiles([pakFile(FILE_A)]);
+    });
+    await flush();
+    expect(mounted.container.textContent).toBe("idle");
+
+    // 被取消的 B 结果迟到时不得写进 store
+    await act(async () => {
+      resolveB?.([entry("b-1", FILE_B)]);
+    });
+    await flush();
+    expect(useAppStore.getState().entriesByFile[FILE_B]).toBeUndefined();
+  });
+
+  it("取消勾选后表格恢复可用：不再卡在「加载条目…」，翻译按钮可点", async () => {
+    let resolveB: ((entries: TranslationEntry[]) => void) | null = null;
+    backend.readFileEntries.mockImplementation((_workDir: string, name: string) => {
+      if (name === FILE_B) {
+        return new Promise<TranslationEntry[]>((resolve) => {
+          resolveB = resolve;
+        });
+      }
+      return Promise.resolve([entry("a-1", name)]);
+    });
+
+    useAppStore.getState().setSelectedFiles([pakFile(FILE_A)]);
+    await mounted.render(<TranslationTable />);
+    await flush();
+    expect(findButton(mounted.container, "翻译 ")!.disabled).toBe(false);
+
+    await act(async () => {
+      useAppStore.getState().setSelectedFiles([pakFile(FILE_A), pakFile(FILE_B)]);
+    });
+    await flush();
+    // B 还在读：表格显示加载态，翻译按钮禁用
+    expect(mounted.container.textContent).toContain("加载条目…");
+    expect(findButton(mounted.container, "翻译 ")!.disabled).toBe(true);
+
+    await act(async () => {
+      useAppStore.getState().setSelectedFiles([pakFile(FILE_A)]);
+    });
+    await flush();
+
+    // 关键：取消勾选后必须立刻回到可翻译状态，而不是永久卡在加载态
+    expect(mounted.container.textContent).not.toContain("加载条目…");
+    expect(findButton(mounted.container, "翻译 ")!.disabled).toBe(false);
+    expect(mounted.container.textContent).toContain("Source a-1");
+
+    await act(async () => {
+      resolveB?.([entry("b-1", FILE_B)]);
+    });
+    await flush();
   });
 });

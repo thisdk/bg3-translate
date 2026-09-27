@@ -99,6 +99,34 @@ jobs:
           echo "verify.sh 门禁清单一致（$(printf '%s\n' "$actual" | wc -l) 道）"
           printf '%s\n' "$actual" | sed 's/^/  - /'
 
+          # 上面只钉住了**默认**清单，而 core / web job 实际跑的是
+          # `--core-only --no-ipc` 与 `--web-only --no-ipc`：只断言默认清单的话，
+          # 把某个模式里的门禁删掉不会有任何信号。
+          # 例：给 `plan_add web-build` 套上 `if [ "$RUN_IPC" = 1 ]`，
+          # 默认清单逐字符不变，但 web job 从此不再构建前端。
+          # 防守线强度必须能被 CI 验证，所以每个模式单独断言。
+          check_mode() {
+            local label="$1" args="$2" want="$3" got
+            # shellcheck disable=SC2086  # 这里就是要按空格拆成多个参数
+            got="$(bash scripts/verify.sh $args --list | cut -f2)"
+            if [ "$got" != "$want" ]; then
+              echo "::error::scripts/verify.sh 在 $label 模式下的门禁清单与 CI 期望不一致"
+              diff <(printf '%s\n' "$want") <(printf '%s\n' "$got") || true
+              return 1
+            fi
+            echo "verify.sh $label 门禁清单一致（$(printf '%s\n' "$got" | wc -l) 道）"
+            printf '%s\n' "$got" | sed 's/^/  - /'
+          }
+          core_only_expected="$(printf '%s\n' \
+            'cargo fmt --all --check' \
+            'cargo clippy -p bg3-translate-core --all-targets -- -D warnings' \
+            'cargo test -p bg3-translate-core --all-targets')"
+          web_only_expected="$(printf '%s\n' \
+            'bun run test' \
+            'bun run build')"
+          check_mode "--core-only --no-ipc" "--core-only --no-ipc" "$core_only_expected"
+          check_mode "--web-only --no-ipc" "--web-only --no-ipc" "$web_only_expected"
+
   core:
     name: 核心库（fmt / clippy / test）
     runs-on: ubuntu-latest

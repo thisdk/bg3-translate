@@ -220,12 +220,27 @@ pub fn parse(xml: &str, file_name: &str) -> ParsedContentList {
 /// 磁盘上已有、但这次没提交的条目会被**原样保留**（见 [`merge_missing_entries`]）：
 /// 写回是「用条目列表重建整个文档」，如果只提交了其中一部分，其余条目会被
 /// 静默删掉——游戏里对应文本就变成原始 contentuid 句柄了。
+///
+/// 反过来，**底稿不可信时绝不整体重写**，两种情况都中止并报错：
+/// - 文件在磁盘上、但读不出来（EACCES / EISDIR / Windows 共享冲突……）：
+///   只有 `NotFound` 才是「新建文件」语义，其它 IO 错误一旦当成新文件处理，
+///   磁盘上没提交的条目会被静默删掉；
+/// - 文件读得出来、但 `parse` 中途出错（[`ParsedContentList::error`]）：
+///   拿到的是**残缺**条目列表，用它做合并会把出错点之后的条目永久删除。
+///   `read` 早就在同样的理由下拒绝返回残缺列表（见 [`read`] 的文档），
+///   写回这条路径必须一致。
 pub fn write(path: &Path, entries: &[TranslationEntry]) -> Result<()> {
     let (bom, root_attributes, style, on_disk) = match std::fs::read(path) {
         Ok(bytes) => {
             let bom = bytes.starts_with(BOM);
             let xml = decode_utf8(&bytes, "本地化 XML")?;
             let parsed = parse(&xml, "");
+            if let Some(error) = parsed.error {
+                return Err(AppError::xml(format!(
+                    "写回目标 {} 解析失败，已中止写回以免丢失条目（请先修好这个文件，或删掉它重新生成）: {error}",
+                    path.display()
+                )));
+            }
             (
                 bom,
                 parsed.root_attributes,
@@ -233,9 +248,22 @@ pub fn write(path: &Path, entries: &[TranslationEntry]) -> Result<()> {
                 parsed.entries,
             )
         }
-        // 文件还不存在（例如把英文条目写进 `Localization/Chinese/`）：没有源文件
-        // 可参考，用默认风格 —— 真实语料的转义形态，见 [`MarkupStyle::Escaped`]。
-        Err(_) => (false, Vec::new(), MarkupStyle::default(), Vec::new()),
+        // 只有「文件不存在」才是新文件语义（例如把英文条目写进
+        // `Localization/Chinese/`）：没有源文件可参考，用默认风格 ——
+        // 真实语料的转义形态，见 [`MarkupStyle::Escaped`]。
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            (false, Vec::new(), MarkupStyle::default(), Vec::new())
+        }
+        // 文件在磁盘上、只是我们读不出来：按新文件处理＝静默删掉没提交的条目
+        Err(err) => {
+            return Err(AppError::Io(std::io::Error::new(
+                err.kind(),
+                format!(
+                    "写回目标存在但读不出来（{err}），已中止写回以免覆盖磁盘上的条目: {}",
+                    path.display()
+                ),
+            )));
+        }
     };
 
     let merged = merge_missing_entries(entries, &on_disk);
@@ -721,6 +749,10 @@ fn repair_tag_attributes(tag: &str) -> Option<String> {
     let mut values = Vec::with_capacity(attributes.len());
     for (key, value) in attributes {
         let decoded = decode_entities(&value);
+        // `&#1;` / `&#xFFFF;` 这类**非法字符引用**的解码规则只拒绝「解析不出来」的
+        // 引用，不判 XML 1.0 的 `Char` 产生式；不在这里丢非法字符，裸控制字符就会
+        // 顺着属性值落盘（F-07 在标签属性这条路径上重新出现）。
+        let decoded = sanitize_xml_chars(&decoded);
         let escaped = escape_attribute_value(&decoded);
         if escaped != value {
             repaired = true;
@@ -843,18 +875,34 @@ pub fn scan_tag_end(text: &str, start: usize) -> Option<usize> {
     None
 }
 
-/// 用 quick-xml 判断这段文本是不是**恰好一个**合法 XML 标签，是则返回标签名。
+/// 用 **XML 1.0 文法**判断这段文本是不是**恰好一个**合法 XML 标签，是则返回标签名。
 ///
-/// 这是「原样写出去」的唯一门槛：产物必须永远是合法 XML，所以宁可在这里多解析
-/// 一次，也不能靠「`<` 后面第一个词是不是白名单名字」去猜——`< br >`
+/// 这是「原样写出去」的唯一门槛：产物必须永远是合法 XML，所以宁可在这里自己
+/// 走一遍文法，也不能靠「`<` 后面第一个词是不是白名单名字」去猜——`< br >`
 /// （源文件里是 `&lt; br &gt;`）就是被这么猜错的。
 ///
-/// 两个坑：
+/// # 为什么不能只靠 quick-xml
+///
+/// quick-xml 在**属性语法**上比 XML 1.0 宽松：`<LSTag a="1"b="2">`（属性之间
+/// 缺空白）它照样解析成功，而严格解析器（游戏侧、python expat）会拒绝
+/// **整份文档**。旧实现把这个标签原样写进产物，等于把用户的本地化文件变成
+/// 非法文件（`docs/review-r4/formats.md` F-R4-01）。所以这里自己校验：
+///
+/// - `STag ::= '<' Name (S Attribute)* S? '>'`（属性之间**必须**有空白）
+/// - `EmptyElemTag ::= '<' Name (S Attribute)* S? '/>'`
+/// - `ETag ::= '</' Name S? '>'`
+/// - `Attribute ::= Name Eq AttValue`：值必须带引号，同名属性只能出现一次
+///
+/// 只**拒绝非法**，不额外收紧：属性之间的空白可以是空格 / 制表 / 换行，
+/// 引号单双皆可，`=` 两侧允许空白，值里的 `>` 与实体照旧原样保留。
+///
+/// 顺带解掉的两个坑：
 /// - 结束标签单独解析时 quick-xml 会报「没有匹配的开始标签」，只能自己校验名字语法；
-/// - 属性是**惰性解析**的，必须逐个过一遍 `attributes()`，否则
-///   `<LSTag Tooltip="a" garbage>` 这种畸形开始标签会被当成合法标签原样写出去。
+/// - 属性是**惰性解析**的，必须逐个过一遍，否则 `<LSTag Tooltip="a" garbage>`
+///   这种畸形开始标签会被当成合法标签原样写出去。
 fn parse_single_tag(tag: &str) -> Option<String> {
     let body = tag.strip_prefix('<')?.strip_suffix('>')?;
+    // 结束标签：`</` 与名字之间不能有空白（`</ b>` 不是 XML）
     if let Some(name) = body.strip_prefix('/') {
         let name = name.trim_end();
         if !is_xml_name(name) {
@@ -863,29 +911,128 @@ fn parse_single_tag(tag: &str) -> Option<String> {
         return Some(name.to_string());
     }
 
-    let mut reader = Reader::from_str(tag);
-    reader.config_mut().trim_text(false);
-    let mut buf = Vec::new();
-    let name = match reader.read_event_into(&mut buf) {
-        Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-            for attr in e.attributes() {
-                if attr.is_err() {
-                    return None;
-                }
-            }
-            e.name().as_ref().to_string()
-        }
-        _ => return None,
-    };
+    let bytes = body.as_bytes();
+    let name_end = scan_xml_name(body, 0)?;
+    let name = body.get(..name_end)?;
+    // `< br >` 会被解析成「名字为空 / 名字为空格的标签」，直接拒绝
     if name.is_empty() {
-        // `< br >` 会被 quick-xml 解析成「名字为空」的开始标签
         return None;
     }
-    Some(name)
+
+    let mut attributes: Vec<&str> = Vec::new();
+    let mut i = name_end;
+    loop {
+        // `S?`：`>` 与 `/>` 之前允许空白
+        let before_ws = i;
+        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\r' | b'\n') {
+            i += 1;
+        }
+        let had_whitespace = i > before_ws;
+
+        // 标签末尾：`>` 已被 strip_suffix 去掉，`/>` 只剩下最后的 `/`
+        if i == bytes.len() {
+            return Some(name.to_string());
+        }
+        if bytes[i] == b'/' && i + 1 == bytes.len() {
+            return Some(name.to_string());
+        }
+
+        // 属性：**必须**有空白分隔。`<LSTag a="1"b="2">` 在这里被拒。
+        if !had_whitespace {
+            return None;
+        }
+        let key_end = scan_xml_name(body, i)?;
+        let key = body.get(i..key_end)?;
+        if attributes.contains(&key) {
+            // 重名属性在 XML 1.0 里同样是良构性错误
+            return None;
+        }
+        attributes.push(key);
+        i = key_end;
+        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\r' | b'\n') {
+            i += 1;
+        }
+        if bytes.get(i) != Some(&b'=') {
+            return None;
+        }
+        i += 1;
+        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\r' | b'\n') {
+            i += 1;
+        }
+        let quote = *bytes.get(i)?;
+        if quote != b'"' && quote != b'\'' {
+            return None;
+        }
+        i += 1;
+        // 属性值内部逐字节找到配对的引号即可。注意**不在这里**拒绝裸 `<`：
+        // 那是 [`repair_tag_attributes`] 的职责（它会重建标签并把裸 `&`/`<`
+        // 规范成 `escape(decode(v))`），在这里拒绝会让「模型把标签整条转义、
+        // 属性值里带裸 `<`」这条已经被修好的路径退回成纯文本。
+        //
+        // ⚠️ 循环必须带 `i < bytes.len()` 边界：`is_allowed_inline_tag` 是公开 API，
+        // 调用方可以传进引号未闭合的候选串（如 `<LSTag a="x>`）。写成
+        // `while bytes.get(i) != Some(&quote)` 的话，越过末尾后 `get` 恒为 `None`，
+        // 循环永不退出（`unterminated_tag_attribute_is_not_a_tag` 钉住这条）。
+        while i < bytes.len() && bytes[i] != quote {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            // 引号没闭合 → 不是合法标签
+            return None;
+        }
+        i += 1;
+    }
 }
 
-/// 是否是合法的 XML 名字（`NameStartChar` + `NameChar`，这里只接受 ASCII 形态，
-/// 本地化文本里的富文本标签名不可能出现别的字符）。
+/// 从 `text[at..]` 起扫描一个 XML `Name`，返回结束下标（字节）。
+///
+/// 用的是 XML 1.0 的 `NameStartChar` / `NameChar` 全集（含非 ASCII 区间），
+/// 所以 `<LSTag 类型="x">` 这种带非 ASCII 属性名的合法标签**不会**被误伤。
+fn scan_xml_name(text: &str, at: usize) -> Option<usize> {
+    let mut cursor = at;
+    let first = text.get(at..)?.chars().next()?;
+    if !is_xml_name_start_char(first) {
+        return None;
+    }
+    cursor += first.len_utf8();
+    while let Some(ch) = text.get(cursor..).and_then(|rest| rest.chars().next()) {
+        if !is_xml_name_char(ch) {
+            break;
+        }
+        cursor += ch.len_utf8();
+    }
+    Some(cursor)
+}
+
+/// XML 1.0 `NameStartChar`。
+fn is_xml_name_start_char(ch: char) -> bool {
+    matches!(ch,
+        ':' | '_'
+        | 'A'..='Z'
+        | 'a'..='z'
+        | '\u{C0}'..='\u{D6}'
+        | '\u{D8}'..='\u{F6}'
+        | '\u{F8}'..='\u{2FF}'
+        | '\u{370}'..='\u{37D}'
+        | '\u{37F}'..='\u{1FFF}'
+        | '\u{200C}'..='\u{200D}'
+        | '\u{2070}'..='\u{218F}'
+        | '\u{2C00}'..='\u{2FEF}'
+        | '\u{3001}'..='\u{D7FF}'
+        | '\u{F900}'..='\u{FDCF}'
+        | '\u{FDF0}'..='\u{FFFD}'
+        | '\u{10000}'..='\u{EFFFF}')
+}
+
+/// XML 1.0 `NameChar`（`NameStartChar` 之外还允许数字、`-`、`.`、`·` 与组合字符）。
+fn is_xml_name_char(ch: char) -> bool {
+    is_xml_name_start_char(ch)
+        || matches!(ch,
+            '-' | '.' | '0'..='9' | '\u{B7}' | '\u{0300}'..='\u{036F}' | '\u{203F}'..='\u{2040}')
+}
+
+/// 是否是合法的 XML 名字（这里只接受 ASCII 形态，本地化文本里的**标签名**
+/// 不可能出现别的字符；非 ASCII 名字由白名单直接挡掉）。
 fn is_xml_name(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
@@ -2158,5 +2305,199 @@ mod tests {
             let out = render_with_style(&[entry], &[], MarkupStyle::Markup).unwrap();
             assert!(out.contains(open), "{open:?} 不该被重写: {out}");
         }
+    }
+
+    /// 属性之间**必须有空白**（XML 1.0 `STag ::= '<' Name (S Attribute)* S? '>'`）。
+    ///
+    /// quick-xml 在这里是宽松的：`<LSTag a="1"b="2">` 能被它解析成「两个属性」，
+    /// 于是旧实现把它判成合法标签、**原样写进产物**。严格解析器（游戏侧，
+    /// 以及 python expat）直接拒绝整份文档 —— 丢的是整份本地化文件。
+    ///
+    /// 复现（修复前）：
+    /// ```text
+    /// $ python3 -c "import xml.dom.minidom,sys; xml.dom.minidom.parse('markup_attr_no_space.xml')"
+    /// xml.parsers.expat.ExpatError: not well-formed (invalid token): line 1, column 100
+    /// ```
+    #[test]
+    fn tag_without_whitespace_between_attributes_is_never_written_as_markup() {
+        let mut entry = TranslationEntry::new("t.xml", "h1", "1", "src");
+        entry.mark_translated(r#"<LSTag a="1"b="2">x</LSTag>"#);
+
+        let out = render_with_style(&[entry], &[], MarkupStyle::Markup).unwrap();
+
+        assert!(
+            !out.contains(r#"<LSTag a="1"b="2">"#),
+            "缺空白的属性不能被当成合法标签写出去: {out}"
+        );
+        assert!(
+            out.contains(r#"&lt;LSTag a="1"b="2"&gt;x&lt;/LSTag&gt;"#),
+            "整条应降级成正文（内容不丢，只是不再当标签）: {out}"
+        );
+        assert!(parse(&out, "t.xml").error.is_none(), "产物必须合法: {out}");
+
+        // 正向对照：空白/引号/换行合乎文法的写法必须继续原样保留为标签
+        for (text, expected) in [
+            (r#"<LSTag a="1" b="2">x</LSTag>"#, r#"<LSTag a="1" b="2">"#),
+            (r#"<LSTag a='1' b="2">x</LSTag>"#, r#"<LSTag a='1' b="2">"#),
+            (
+                "<LSTag a=\"1\"\n  b=\"2\">x</LSTag>",
+                "<LSTag a=\"1\"\n  b=\"2\">",
+            ),
+            (r#"<LSTag a = "1">x</LSTag>"#, r#"<LSTag a = "1">"#),
+        ] {
+            let mut entry = TranslationEntry::new("t.xml", "h1", "1", "src");
+            entry.mark_translated(text);
+            let out = render_with_style(&[entry], &[], MarkupStyle::Markup).unwrap();
+            assert!(
+                out.contains(expected),
+                "{text:?} 是合法 XML，不该被降级: {out}"
+            );
+        }
+    }
+
+    /// 属性值里的字符引用如果解出来是 XML 非法字符，**不能落盘**。
+    ///
+    /// `&#1;` 本身就不是合法的字符引用（XML 1.0 的 `Char` 不含 0x01），
+    /// 但 `repair_tag_attributes` 会把它解码成裸 0x01 再原样写进属性值 ——
+    /// 产物对严格解析器同样非法（F-07 那条「非法控制字符落盘」的新路径）。
+    ///
+    /// 复现（修复前）：python expat 报 `not well-formed (invalid token)`，
+    /// 且产物字节里真的出现 `0x01`。
+    #[test]
+    fn illegal_char_reference_in_tag_attribute_never_reaches_the_file() {
+        let mut entry = TranslationEntry::new("t.xml", "h1", "1", "src");
+        entry.mark_translated(r#"<LSTag a="&#1;">x</LSTag>"#);
+
+        let out = render_with_style(&[entry], &[], MarkupStyle::Markup).unwrap();
+
+        assert!(
+            !out.contains('\u{1}'),
+            "解出来的非法控制字符不能出现在产物里: {out:?}"
+        );
+        assert!(parse(&out, "t.xml").error.is_none(), "产物必须合法: {out}");
+    }
+
+    /// 引号未闭合的候选串**不是标签**，而且判定过程必须立刻返回（不能死循环）。
+    ///
+    /// `is_allowed_inline_tag` 是公开 API：`<LSTag a="x>` 这种串（带 `>` 但引号没闭合）
+    /// 会走进属性值扫描。第一版严格文法实现的循环写成
+    /// `while bytes.get(i) != Some(&quote)`，越过末尾后 `get` 恒为 `None`，
+    /// 于是**永不退出**——`/tmp/fa-probe` 的标签探针跑到这一条直接超时 900s 才暴露。
+    ///
+    /// 这条用例同时是「不许再引入无界扫描」的守卫：一旦退回无界循环，测试会挂死
+    /// （cargo 会报超时/不返回），而不是悄悄放过。
+    #[test]
+    fn unterminated_tag_attribute_is_not_a_tag() {
+        for candidate in [r#"<LSTag a="x>"#, r#"<LSTag a="x"#, r#"<LSTag a='"#] {
+            // 这里只要求「不是标签」，重点是不能挂
+            let allowed = is_allowed_inline_tag(candidate);
+            assert!(!allowed, "{candidate:?} 不是合法 XML 标签，不能当标签写出");
+        }
+
+        // 正向对照：空属性值、双引号里的单引号都是合法属性值（不能跟着一起误伤）
+        assert!(is_allowed_inline_tag(r#"<LSTag a="">"#));
+        assert!(is_allowed_inline_tag(r#"<LSTag a="x'">"#));
+
+        // 整条文本（模型可能吐出来的形态）必须退化成纯文本，产物仍然合法
+        let mut entry = TranslationEntry::new("t.xml", "h1", "1", "src");
+        entry.mark_translated(r#"a <LSTag a="x> b"#);
+        let out = render_with_style(&[entry], &[], MarkupStyle::Markup).unwrap();
+        assert!(
+            !out.contains(r#"<LSTag a="x>"#),
+            "引号没闭合的候选串不能被当成标签: {out}"
+        );
+        assert!(parse(&out, "t.xml").error.is_none(), "产物必须合法: {out}");
+    }
+
+    /// 目标文件**存在但读不出来**时绝不能当成「新文件」整体覆盖。
+    ///
+    /// rename 只要目录写权限，读文件要文件读权限 —— 两者可以分离（Windows 上
+    /// 文件被占用 / 杀软扫描 / ACL 同样如此）。此时若按「新文件」处理，
+    /// 磁盘上没提交的条目会被静默删掉，而且 `write` 返回 `Ok`。
+    ///
+    /// 复现（修复前）：165 字节的文件被改写成 118 字节，h2 消失，返回 `Ok(())`。
+    #[cfg(unix)]
+    #[test]
+    fn write_refuses_when_the_target_exists_but_cannot_be_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Chinese.xml");
+        let mut h1 = TranslationEntry::new("English.xml", "h1", "1", "One");
+        h1.mark_translated("一");
+        let mut h2 = TranslationEntry::new("English.xml", "h2", "1", "Two");
+        h2.mark_translated("二");
+        write(&path, &[h1.clone(), h2]).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(before.len() > 150, "前置样本太小: {}", before.len());
+
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&path, perms).unwrap();
+        // 前提自检：本进程确实读不出来（以 root 运行时会话下前置不成立）
+        if std::fs::File::open(&path).is_ok() {
+            eprintln!("跳过：当前用户仍可读 chmod 000 的文件（可能以 root 运行）");
+            return;
+        }
+
+        let err = write(&path, &[h1]).unwrap_err();
+        assert_eq!(err.code(), "io", "读不出来必须报错: {err}");
+        assert!(
+            err.to_string().contains("中止写回"),
+            "错误信息要说清为什么中止: {err}"
+        );
+
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&path, perms).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "拒绝写回时原文件必须逐字节不变"
+        );
+    }
+
+    /// 目标文件能打开、但解析**中途出错**（残缺列表）时同样不能拿它当底稿。
+    ///
+    /// 复现（修复前）：`B & C` 这种裸 `&` 让解析停在 h2，h3 是完全合法的条目，
+    /// 却因为写回用的是残缺底稿而被永久删掉，`write` 返回 `Ok(())`。
+    #[test]
+    fn write_refuses_when_the_target_is_only_partially_parsable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Broken.xml");
+        let broken = r#"<contentList><content contentuid="h1" version="1">A</content><content contentuid="h2" version="1">B & C</content><content contentuid="h3" version="1">D</content></contentList>"#;
+        std::fs::write(&path, broken).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let mut h1 = TranslationEntry::new("English.xml", "h1", "1", "A");
+        h1.mark_translated("甲");
+        let err = write(&path, &[h1]).unwrap_err();
+
+        assert_eq!(err.code(), "xml", "解析中断必须报错: {err}");
+        assert!(
+            err.to_string().contains("已中止写回"),
+            "错误信息要说清为什么中止: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "拒绝写回时原文件必须逐字节不变"
+        );
+    }
+
+    /// 正向对照：目标文件**真的不存在**时仍按「新建」处理（区分 NotFound
+    /// 与其它 IO 错误的修复不能把新建路径一起挡掉）。
+    #[test]
+    fn write_still_creates_a_target_that_does_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Chinese/New.xml");
+        let mut h1 = TranslationEntry::new("English.xml", "h1", "1", "One");
+        h1.mark_translated("一");
+
+        write(&path, &[h1]).unwrap();
+
+        let back = read(&path, "Chinese/New.xml").unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].source, "一");
     }
 }

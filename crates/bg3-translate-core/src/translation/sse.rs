@@ -210,14 +210,17 @@ pub fn parse_chat_chunk(data: &str) -> Option<String> {
 
 /// 一条流式 chunk 的完整解析结果。
 ///
-/// 比 [`parse_chat_chunk`] 多带一个 `finish_reason`：调用方要能区分
-/// 「模型正常收尾」与「撞上长度上限被截断」，后者绝不能当成成功译文。
+/// 比 [`parse_chat_chunk`] 多带两个信号：调用方要能区分「模型正常收尾」与
+/// 「撞上长度上限被截断」，后者绝不能当成成功译文；也要能看见**流中错误载荷**
+/// （`data: {"error": …}`），那是服务端明说自己没能把这次响应做完。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ChatStreamChunk {
     /// `choices[0].delta.content`
     pub(crate) content: Option<String>,
     /// `choices[0].finish_reason`，保留线上字符串形态（`stop` / `length` / …）
     pub(crate) finish_reason: Option<String>,
+    /// 流中错误载荷里的一句话（服务端自己的错误描述）。
+    pub(crate) error: Option<String>,
 }
 
 impl ChatStreamChunk {
@@ -234,24 +237,53 @@ impl ChatStreamChunk {
     }
 }
 
-/// [`parse_chat_chunk`] 的完整版：同时给出增量文本与结束原因。
+/// [`parse_chat_chunk`] 的完整版：同时给出增量文本、结束原因与流中错误载荷。
 ///
 /// 判定边界与旧行为逐字一致 —— 标准结构解析成功就用它（`choices` 为空 → `None`），
-/// 失败才退回宽松结构，两条路径都不再额外放宽。
+/// 失败才退回宽松结构，两条路径都不再额外放宽。**唯一的补充**是宽松结构里的
+/// `error` 字段：带错误载荷的响应返回 `content: None` + `error: Some(…)`，
+/// 公开的 [`parse_chat_chunk`] 因此仍然返回 `None`（行为不变）。
 pub(crate) fn parse_chat_chunk_parts(data: &str) -> Option<ChatStreamChunk> {
     if let Ok(chunk) = serde_json::from_str::<CreateChatCompletionStreamResponse>(data) {
         let choice = chunk.choices.into_iter().next()?;
         return Some(ChatStreamChunk {
             content: choice.delta.content,
             finish_reason: choice.finish_reason.map(finish_reason_text),
+            error: None,
         });
     }
     let chunk: LenientChunk = serde_json::from_str(data).ok()?;
+    // 错误载荷必须先判：它通常**不带** choices，先取 `choices[0]` 会直接
+    // `None` 掉、把服务端的报错当成一条解析不出来的心跳丢掉。
+    if let Some(error) = chunk.error {
+        return Some(ChatStreamChunk {
+            error: Some(lenient_error_message(&error)),
+            ..ChatStreamChunk::default()
+        });
+    }
     let choice = chunk.choices.into_iter().next()?;
     Some(ChatStreamChunk {
         content: choice.delta.content,
         finish_reason: choice.finish_reason,
+        error: None,
     })
+}
+
+/// 从错误载荷里取一句人话。
+///
+/// 线上形状不止一种：`{"error": {"message": "…", "type": "…"}}`（OpenAI / 多数网关）、
+/// `{"error": "…"}`（简写）。取不到 `message` 时退回整段 JSON，宁可多给一点上下文，
+/// 也不要让用户只看到「没有任何文本」。长度由调用方截断。
+fn lenient_error_message(error: &serde_json::Value) -> String {
+    let message = match error {
+        serde_json::Value::String(text) => Some(text.as_str()),
+        serde_json::Value::Object(map) => map.get("message").and_then(|value| value.as_str()),
+        _ => None,
+    };
+    match message.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(message) => message.to_string(),
+        None => error.to_string(),
+    }
 }
 
 /// 协议枚举 → 线上字符串（与 serde 的 `snake_case` 表示一致）。
@@ -269,11 +301,18 @@ fn finish_reason_text(reason: FinishReason) -> String {
 /// 宽松兜底结构：字段全可选，只为兼容「字段不全」的第三方网关。
 ///
 /// 它不再是主解析路径，只是标准结构解析失败后的第二次机会，所以刻意做得最小：
-/// 只关心 `choices[0].delta.content` 与 `choices[0].finish_reason`。
+/// 只关心 `choices[0].delta.content`、`choices[0].finish_reason` 与流中错误载荷。
 #[derive(Debug, Deserialize)]
 struct LenientChunk {
     #[serde(default)]
     choices: Vec<LenientChoice>,
+    /// 流中错误载荷（`{"error": …}`）。
+    ///
+    /// 用 `serde_json::Value` 接住而不是派生一个具体结构：线上形状五花八门
+    /// （字符串 / 对象 / 带 `code` 的嵌套对象），一个想不通的 `error` 形状
+    /// 若让整条 chunk 反序列化失败，会把同一条载荷里的 delta 一起丢掉。
+    #[serde(default)]
+    error: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -592,6 +631,48 @@ mod tests {
         }
         let err = err.expect("事件累积超过上限必须报错");
         assert!(err.to_string().contains("单个事件"), "实际: {err}");
+    }
+
+    // ── 流中错误载荷 ──
+
+    /// 两种线上形状都要能带出错误；`null` / 缺失不是错误。
+    ///
+    /// 公开的 [`parse_chat_chunk`] **行为不变**（`content` 仍是 `None`）：
+    /// 错误只在 `pub(crate)` 的完整版里可见，调用方自己决定怎么处置。
+    #[test]
+    fn error_payloads_are_exposed_without_changing_the_public_api() {
+        for (payload, expected) in [
+            (
+                r#"{"error":{"message":"upstream timeout","type":"server_error"}}"#,
+                "upstream timeout",
+            ),
+            (r#"{"error":"boom"}"#, "boom"),
+            // 带上 `choices: []` 也一样：错误判定必须在取 choices 之前
+            (
+                r#"{"choices":[],"error":{"message":"rate limited"}}"#,
+                "rate limited",
+            ),
+            // 取不到 message 时退回整段 JSON，不要空手而归
+            (r#"{"error":{"code":12345}}"#, r#"{"code":12345}"#),
+        ] {
+            let chunk = parse_chat_chunk_parts(payload).expect("错误载荷本身应能解析");
+            assert_eq!(chunk.error.as_deref(), Some(expected), "payload={payload}");
+            assert_eq!(chunk.content, None);
+            assert_eq!(
+                parse_chat_chunk(payload),
+                None,
+                "公开 API 的行为必须逐字不变: {payload}"
+            );
+        }
+        // `"error": null` 与缺失都不是错误
+        for payload in [
+            r#"{"choices":[{"delta":{"content":"火球"}}],"error":null}"#,
+            r#"{"choices":[{"delta":{"content":"火球"}}]}"#,
+        ] {
+            let chunk = parse_chat_chunk_parts(payload).unwrap();
+            assert_eq!(chunk.error, None, "payload={payload}");
+            assert_eq!(chunk.content.as_deref(), Some("火球"));
+        }
     }
 
     #[test]

@@ -47,7 +47,10 @@ impl Glossary {
 
     /// 从指定目录加载（测试用）。
     ///
-    /// 文件损坏时回退到种子并告警：术语表坏掉不该让整个应用起不来。
+    /// 文件损坏（JSON 语法坏了 / 不是合法 UTF-8 / 读不出来）时回退到种子并告警：
+    /// 术语表坏掉不该让整个应用起不来。回退前**先把损坏文件隔离备份**
+    /// （`glossary.json.corrupt`）：命令层的流程是「load → 改 → save」，
+    /// 不备份的话紧接着的保存就会用 102 条种子覆盖掉用户导入的两万条术语。
     pub fn load_from(dir: &Path) -> Result<Self> {
         let path = glossary_path_in(dir);
         if !path.exists() {
@@ -55,11 +58,22 @@ impl Glossary {
             glossary.save_to(dir)?;
             return Ok(glossary);
         }
-        let content = std::fs::read_to_string(&path)?;
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(err) => {
+                log::warn!(
+                    "术语表无法读取（{}），已回退官方种子: {err}",
+                    path.display()
+                );
+                crate::config::quarantine_corrupt_file(&path);
+                return Ok(Self::seeded());
+            }
+        };
         match serde_json::from_str::<Glossary>(&content) {
             Ok(glossary) => Ok(glossary),
             Err(err) => {
                 log::warn!("术语表损坏（{}），已回退官方种子: {err}", path.display());
+                crate::config::quarantine_corrupt_file(&path);
                 Ok(Self::seeded())
             }
         }
@@ -144,18 +158,33 @@ impl Glossary {
     }
 
     /// 删除指定 `source` 的条目；官方术语只能禁用/覆盖，不能删。
+    ///
+    /// 同 source 出现多条时（真实官方术语表里本来就有 6 组，`update` 也允许把
+    /// source 改成已存在的那个），语义必须与 [`Self::update`] 的 first-match 一致：
+    ///
+    /// 1. **任意**一条同 source 的条目是 official 就拒绝。只看 `find()` 的第一条
+    ///    会被绕过：用户条目在前、official 在后时（`add` 是原地覆盖第一条，
+    ///    见 `duplicate_source_state_is_reachable_through_public_api`），
+    ///    检查放行之后 `retain` 会把 official 一起删掉；
+    /// 2. 只移除**第一条**匹配的非 official 条目 —— 旧实现用 `retain` 删掉全部同 source，
+    ///    界面上只显示删了一行，实际「点一次少两条」。
     pub fn delete(&mut self, source: &str) -> Result<()> {
-        let entry = self
-            .terms
-            .iter()
-            .find(|e| e.source == source)
-            .ok_or_else(|| AppError::Config("找不到要删除的术语".into()))?;
-        if entry.source_kind == "official" {
-            return Err(AppError::Config(
-                "官方术语不可删除（可禁用或编辑覆盖）".into(),
-            ));
+        let mut target = None;
+        for (index, entry) in self.terms.iter().enumerate() {
+            if entry.source != source {
+                continue;
+            }
+            if entry.source_kind == "official" {
+                return Err(AppError::Config(
+                    "官方术语不可删除（可禁用或编辑覆盖）".into(),
+                ));
+            }
+            if target.is_none() {
+                target = Some(index);
+            }
         }
-        self.terms.retain(|e| e.source != source);
+        let index = target.ok_or_else(|| AppError::Config("找不到要删除的术语".into()))?;
+        self.terms.remove(index);
         Ok(())
     }
 
@@ -174,6 +203,15 @@ mod tests {
         GlossaryEntry {
             source: source.to_string(),
             target: target.to_string(),
+            ..GlossaryEntry::default()
+        }
+    }
+
+    fn official_entry(source: &str, target: &str) -> GlossaryEntry {
+        GlossaryEntry {
+            source: source.to_string(),
+            target: target.to_string(),
+            source_kind: "official".to_string(),
             ..GlossaryEntry::default()
         }
     }
@@ -251,6 +289,53 @@ mod tests {
         fs::write(glossary_path_in(dir.path()), b"{ not json").unwrap();
         let loaded = Glossary::load_from(dir.path()).unwrap();
         assert_eq!(loaded, Glossary::seeded());
+    }
+
+    /// 损坏的术语表必须留备份：它可能是用户导入的**两万条官方术语**，
+    /// 而命令层 `mutate` 的流程是「load → 改 → save」——回退成种子之后
+    /// 紧接着就会把种子写回去，用户的数据被静默清空。
+    #[test]
+    fn corrupted_file_is_quarantined_before_seed_takes_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = glossary_path_in(dir.path());
+        let damaged = r#"{"terms":[{"source":"Jaheira","target":"贾希拉"},]}"#.as_bytes();
+        fs::write(&path, damaged).unwrap();
+
+        let loaded = Glossary::load_from(dir.path()).unwrap();
+        assert_eq!(loaded, Glossary::seeded());
+
+        let backup = dir.path().join("glossary.json.corrupt");
+        assert!(backup.is_file(), "应备份到 {}", backup.display());
+        assert_eq!(fs::read(&backup).unwrap(), damaged, "备份必须是原始字节");
+
+        // 后续保存不再覆盖用户数据（原文件已被挪走）
+        let mut glossary = loaded;
+        glossary.add(user_entry("My Term", "我的术语")).unwrap();
+        glossary.save_to(dir.path()).unwrap();
+        assert_eq!(
+            fs::read(&backup).unwrap(),
+            damaged,
+            "保存新术语表不得动到备份"
+        );
+    }
+
+    /// 非 UTF-8 的术语表（GBK 编辑器保存）与 JSON 语法坏了是同一类损坏。
+    #[test]
+    fn non_utf8_glossary_falls_back_to_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        // GBK 编码的「贾希拉」= 0xBC 0xD6 0xCF 0xA3 0xC0 0xAD
+        fs::write(
+            glossary_path_in(dir.path()),
+            b"{\"terms\":[{\"source\":\"Jaheira\",\"target\":\"\xbc\xd6\xcf\xa3\xc0\xad\"}]}",
+        )
+        .unwrap();
+
+        let loaded = Glossary::load_from(dir.path()).expect("非 UTF-8 不应让术语表加载失败");
+        assert_eq!(loaded, Glossary::seeded());
+        assert!(
+            dir.path().join("glossary.json.corrupt").is_file(),
+            "非 UTF-8 的原文件也要留备份"
+        );
     }
 
     #[test]
@@ -343,6 +428,82 @@ mod tests {
         assert!(glossary.delete("Not There").is_err());
     }
 
+    /// 两条同 source 的**用户**术语：删一次只应少一条。
+    ///
+    /// 旧实现用 `retain(|e| e.source != source)` 把同 source 的全删掉，
+    /// 而界面上只显示删了一行 —— 「点一次删除，两条都没了」。
+    /// 与 `update` 的 first-match 语义对齐后：删的是第一条。
+    #[test]
+    fn delete_removes_only_one_of_two_duplicate_user_entries() {
+        let mut glossary = Glossary {
+            terms: vec![user_entry("Gale", "盖尔"), user_entry("Gale", "大风")],
+        };
+        glossary.delete("Gale").unwrap();
+        assert_eq!(
+            glossary.terms.len(),
+            1,
+            "删一次只能少一条: {:?}",
+            glossary.terms
+        );
+        assert_eq!(
+            glossary.terms[0].target, "大风",
+            "删的必须是**第一条**匹配（与 update 一致）"
+        );
+    }
+
+    /// 「官方术语不可删除」必须是**任意一条同 source 是 official 就拒绝**。
+    ///
+    /// 旧实现只检查 `find()` 的第一条：当用户条目在前、official 在后时，
+    /// 检查放行，紧接着的 `retain` 会把 official 一起删掉 —— 不变量被绕过。
+    #[test]
+    fn delete_refuses_when_a_later_duplicate_is_official() {
+        let mut glossary = Glossary {
+            terms: vec![
+                user_entry("Jaheira", "我的贾希拉"),
+                official_entry("Jaheira", "贾希拉"),
+            ],
+        };
+        let err = glossary
+            .delete("Jaheira")
+            .expect_err("同 source 里有官方条目必须拒绝");
+        assert_eq!(err.code(), "config");
+        assert!(err.to_string().contains("官方术语不可删除"), "{err}");
+        assert_eq!(
+            glossary.terms.len(),
+            2,
+            "两条都必须还在: {:?}",
+            glossary.terms
+        );
+        assert!(
+            glossary.terms.iter().any(|e| e.source_kind == "official"),
+            "官方条目不能被连带删除"
+        );
+    }
+
+    /// 上面那个「user 在前、official 在后」的状态**用公开 API 就能造出来**，
+    /// 不是假想：官方表里本来就有 6 组同 source（见
+    /// [`Glossary`] 的 `real_glossary_already_contains_duplicate_sources`），
+    /// 用户在「新增术语」里填一个同名 source 时，`add` 是**原地覆盖第一条**
+    /// （保留位置、把 kind 换成 user），于是第一条变成 user、后面那条仍是 official。
+    #[test]
+    fn duplicate_source_state_is_reachable_through_public_api() {
+        let mut glossary = Glossary {
+            terms: vec![
+                official_entry("Jaheira", "贾希拉"),
+                official_entry("Jaheira", "贾希拉"),
+            ],
+        };
+        glossary.add(user_entry("Jaheira", "我的贾希拉")).unwrap();
+        assert_eq!(glossary.terms[0].source_kind, "user", "add 原地覆盖第一条");
+        assert_eq!(glossary.terms[1].source_kind, "official", "第二条仍是官方");
+
+        let err = glossary
+            .delete("Jaheira")
+            .expect_err("即使第一条是用户条目，官方条目也不能被连带删除");
+        assert!(err.to_string().contains("官方术语不可删除"), "{err}");
+        assert_eq!(glossary.terms.len(), 2);
+    }
+
     /// 真实 20K 官方术语表（`samples/`）内容。
     ///
     /// 样本随仓库提交且非 Git LFS，缺失 = checkout 不完整：这里**直接失败**
@@ -360,6 +521,47 @@ mod tests {
                 path.display()
             )
         })
+    }
+
+    /// 真实官方术语表导入后**本来就有重复 `source`**：6 组，每组两条、译文完全相同。
+    ///
+    /// 这条用例存在的意义是**给一个取舍留证据**：`Glossary::update` 允许把某条的
+    /// `source` 改成已存在的另一个 `source`，会造出重复条目 —— 但「source 全局唯一」
+    /// 从来不是本项目的真实不变量（`matcher::tests::duplicates_are_reported_once_per_entry`
+    /// 也明确把重复条目当作既定行为），真实数据里就已经有 6 组。
+    /// 因此**不**给 `update` 加「拒绝重名」的限制：那会让这 6 组真实条目无法编辑。
+    /// 真正的补救方向是把 `update` / `delete` 从「按 source 定位」改成按稳定 id 定位
+    /// （要动 IPC 契约），列入 backlog。
+    #[test]
+    fn real_glossary_already_contains_duplicate_sources() {
+        let cleaned = Glossary::from_json(&real_glossary_json()).unwrap();
+        let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for entry in &cleaned.terms {
+            *counts.entry(entry.source.as_str()).or_insert(0) += 1;
+        }
+        let duplicates: Vec<(&str, usize)> = counts
+            .iter()
+            .filter(|(_, count)| **count > 1)
+            .map(|(source, count)| (*source, *count))
+            .collect();
+        assert_eq!(
+            duplicates.len(),
+            6,
+            "真实术语表里的重复 source 组数变了，需要重新评估 update 的唯一性策略: {duplicates:?}"
+        );
+        for (source, count) in &duplicates {
+            assert_eq!(*count, 2, "{source} 的重复条数变了");
+            let targets: Vec<&str> = cleaned
+                .terms
+                .iter()
+                .filter(|entry| entry.source == *source)
+                .map(|entry| entry.target.as_str())
+                .collect();
+            assert!(
+                targets.windows(2).all(|pair| pair[0] == pair[1]),
+                "重复 source {source} 的译文不一致（会同时命中共存两种译法）: {targets:?}"
+            );
+        }
     }
 
     #[test]

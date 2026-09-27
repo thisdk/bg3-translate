@@ -50,12 +50,25 @@ src-tauri/                    # 薄壳：Tauri 命令 + Channel 事件桥
 
 优先级（见 `config::resolve_data_dir`）：
 
-1. `BG3_TRANSLATE_HOME` 环境变量
+1. `BG3_TRANSLATE_HOME` 环境变量（原样使用：相对路径按进程当前目录解析，不强制绝对路径——见下）
 2. **便携模式**：exe 同级 `config/`，可写就用（解压即用、方便备份）
-3. **系统模式**：`%APPDATA%\bg3-translate`、`~/.config/bg3-translate`
+3. **系统模式**：`%APPDATA%\bg3-translate\config`（Windows）、`~/.config/bg3-translate`（Linux）、
+   `~/Library/Application Support/bg3-translate`（macOS）
 4. 兜底：系统临时目录
 
 第 3 步是必须的：MSI/NSIS 安装到 `C:\Program Files` 时 exe 同级目录只读。
+Windows 的具体路径由 `directories` 决定：`ProjectDirs::config_dir()` 在 Windows 上
+会在 `%APPDATA%\<应用名>` 之后**再拼一层 `config`**（v6 的文档与 `src/win.rs` 一致），
+所以别照抄「`%APPDATA%\bg3-translate`」去找 `settings.json`。
+`config::tests::system_data_dir_shape_matches_documented_paths` 把两个平台的形状都钉住了。
+环境变量里的相对路径**刻意原样接受**（不为它偷偷改落点）；`ensure_dir` 创建失败时会
+退回临时目录并打日志，所以「写到了奇怪的 CWD」最坏也只是多一个不用的目录。
+
+**损坏文件的恢复策略**（`config::load_from` / `Glossary::load_from`）：
+JSON 语法坏了、不是合法 UTF-8、读不出来，三种情况一律「告警 + 把原文件**改名**
+成 `<文件名>.corrupt`（已存在则 `.corrupt.2`…）+ 回退默认值/官方种子」。
+不备份的话，用户重填一次设置、或随便改一条术语触发 `save`，原文件就被静默覆盖了
+（术语表可能是导入的两万条官方术语）；备份是改名而不是删除，用户能手工捞回来。
 
 ## 冻结的 IPC 契约
 
@@ -408,9 +421,13 @@ pub trait TextTranslator {
 - 人工编辑过的条目状态是 `edited`，照常写回；`error` 条目被用户手工救回后也会变成
   `edited`，所以「翻译失败 → 手动改好 → 打包」这条路仍然通。
 - 设计取舍：`error` 状态是「这条译文不可信」的唯一信号，不引入新的字段
-  （IPC 契约不变）；代价是 `translating`（取消后残留的半截译文）仍会被写回 ——
+  （IPC 契约不变）；代价是 `translating`（取消后残留的半截译文）仍会被 core 写回 ——
   该路径由前端把关：`useTranslationRun.ts` 在取消 / 收尾时把未完成条目回滚成
-  `pending` + 空 `target`。
+  `pending` + 空 `target`，`lib/entries.ts::toWritableEntry` 在写回请求里再降级一次。
+  **命令层还有第二道闸门**（`src-tauri/src/commands/entries.rs::writable_entries`）：
+  `status == translating` 的条目在写回前被清空 `target`、退回 `pending`（与
+  `toWritableEntry` 逐字段一致）并打一条 warn 日志。前端有 bug、或调用方是旧版本前端时，
+  半截流式文本也不会静默进 PAK（`write_back_downgrades_entries_still_translating`）。
 
 ## `glossary` 模块的公开 API
 
@@ -460,9 +477,12 @@ pub struct MatchedTerm { pub source: String, pub target: String }
   「解包 → 识别类型 → 读条目 → 翻译 → 写回 → 重打包 → 再解包」的完整闭环。
 - 前端：`vitest` 测纯逻辑（路径改写、store reducer、过滤统计、虚拟滚动）。
 - **跨层契约**：`scripts/check_ipc_contract.py`（Python 标准库，秒级）核对
-  命令注册 / 前端 `invoke` / 本文件命令表三处集合相等，并核对
+  命令注册 / 前端 `invoke` / 本文件命令表三处集合相等、命令参数名三处一致、
+  **命令层写了 `#[tauri::command]` 的函数都必须在 `generate_handler!` 里注册**、
+  **命令返回类型与本文命令表的返回列一致**（`Result<Vec<PakFile>>` 归一成
+  `PakFile[]`、`Result<()>` 归一成 `void`），并核对
   `TranslationEvent`、`TranslationStatus`、`PakFileKind` 三组枚举的 serde 名称
-  与 `src/lib/types.ts` 的联合类型一致。它在 CI 的 `meta` job 里跑。
+  与 `src/lib/types.ts` 的联合类型一致、版本号四处一致。它在 CI 的 `meta` job 里跑。
 - `src-tauri` 没有独立目录的集成测试，但**命令层有单元测试**：
   `cargo test -p bg3-translate --lib` 覆盖 `work_dir` / `file_name` 的越权校验
   （见下节）与纯逻辑；壳层刻意做得很薄（只做参数转发与事件桥接）。
@@ -488,6 +508,24 @@ pub struct MatchedTerm { pub source: String, pub target: String }
 
 用户通过系统对话框选出来的路径（`extract_mod` 的 `outputDir`、`repack_mod` 的
 `outputPath`）合法地可以指向任意位置，**不**做限制。
+
+另外两条命令层的并发/边界不变量：
+
+- **写回前的 `translating` 净化**：见上面「写回不变量」最后一节
+  （`writable_entries`，纵深防御）。
+- **术语表写命令串行化**：`add` / `update` / `delete` / `reset` / `import` 都是
+  「读盘 → 改 → 写盘」，前端只在「保存」这条路径上有 `saving` 守卫（删除按钮只按行
+  置忙、`reset`/`import` 完全没有守卫），并发调用会互相覆盖（后保存的把先保存的改动
+  静默丢掉）。命令层用一把进程内 `Mutex` 把整段读改写锁住
+  （`terminology.rs::glossary_write_guard`），回归测试
+  `concurrent_mutations_are_serialized_and_lose_nothing` 用两个真线程 + 50ms 临界区
+  验证「不会同时在临界区」且「两条改动都还在」。
+- **原子写的临时文件名每次调用都不同**（`config::temp_path_for`：主名 + pid + 进程内
+  递增序号）。只用 `tmp<pid>` 时，同一进程里两次并发写会算出同一个临时文件
+  （`a.xml` / `a.loca` / `a` 这类同主名不同扩展名的目标也会撞名）：两个写者互相截断，
+  先改名走的一方还会让另一方的 `rename` 直接 ENOENT。回归测试
+  `atomic_write_temp_path_is_unique_per_call` 与
+  `concurrent_atomic_writes_all_succeed_with_whole_content`。
 
 ## 运行
 

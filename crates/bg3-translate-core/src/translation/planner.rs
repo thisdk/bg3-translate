@@ -168,10 +168,21 @@ pub fn plan_jobs(
             skipped += 1;
             continue;
         }
-        if !exact_groups.contains_key(&key) {
-            exact_order.push(key.clone());
+        // 分组键是**原文本身**，不是一致性 key。
+        //
+        // 一致性 key 会折掉大小写与首尾 ASCII 标点，用它分组会把
+        // `Delete this save?` 与 `Delete this save!` 并成一次请求、共享同一份
+        // 译文 —— 后者的译文就是前者那一句，疑问句被静默写成陈述句。结构校验
+        // 拦不住这种改写（占位符 / 标签完全一致），所以只能在分组这里不让它发生。
+        // 「完全相同的原文才共享一份译文」也是模块文档写明的契约。
+        //
+        // 一致性 key 继续用在**已确定译名复用**上（那是它的设计用途：同一 MOD
+        // 内已翻过的名字 / 专名，`Silver Hair` 与 `silver hair` 视为同一个）。
+        let group_key = entry.source.clone();
+        if !exact_groups.contains_key(&group_key) {
+            exact_order.push(group_key.clone());
         }
-        exact_groups.entry(key).or_default().push(entry);
+        exact_groups.entry(group_key).or_default().push(entry);
     }
 
     for key in exact_order {
@@ -296,6 +307,48 @@ mod tests {
             }
         );
         assert_eq!(planned_entry_count(&jobs), 3);
+    }
+
+    /// 只差句末标点的两条原文**不能**共享一份译文。
+    ///
+    /// 「相同原文合并」原本用的是**一致性 key**（折空白 / 去首尾 ASCII 标点 /
+    /// 转小写），它比「同一段原文」宽：`…save?` 与 `…save!` 会归到一组，于是
+    /// 后者的译文就是前者那一句 —— 疑问句被静默写成陈述句。结构校验拦不住
+    /// （占位符 / 标签一模一样），玩家看到的是「标点与语气被改掉」。
+    #[test]
+    fn punctuation_only_differences_do_not_share_one_translation() {
+        let sink = CollectingSink::new();
+        let entries = vec![
+            entry("Are you sure you want to delete this save?", "u1"),
+            entry("Are you sure you want to delete this save!", "u2"),
+            // 大小写也只是「看起来像」：不能拿一份译文贴到另一条上
+            entry("DELETE SAVE", "u3"),
+            entry("Delete save", "u4"),
+        ];
+        let (jobs, plan) = plan_jobs(&entries, &empty_matcher(), &sink);
+        assert_eq!(plan.total, 4);
+        assert_eq!(plan.jobs, 4, "原文不同的条目必须各自成 job: {jobs:?}");
+        assert_eq!(planned_entry_count(&jobs), 4, "覆盖数不能少");
+        for job in &jobs {
+            assert!(
+                matches!(job.output, TranslationOutput::Single { .. }),
+                "不该再出现跨原文的 ExactGroup: {job:?}"
+            );
+        }
+        // 逐字相同的两条仍然合并（既有行为不许退化）
+        let sink = CollectingSink::new();
+        let (jobs, plan) = plan_jobs(
+            &[entry("Delete save", "u1"), entry("Delete save", "u2")],
+            &empty_matcher(),
+            &sink,
+        );
+        assert_eq!(plan.jobs, 1);
+        assert_eq!(
+            jobs[0].output,
+            TranslationOutput::ExactGroup {
+                entry_ids: vec!["test.loca#u1".into(), "test.loca#u2".into()]
+            }
+        );
     }
 
     #[test]

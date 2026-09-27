@@ -42,7 +42,7 @@ pub async fn translate_entries(
     // 工作目录目前只在日志里用：条目自带 source_file，翻译不需要读盘。
     // 保留这个参数是为了跟前端的既有调用保持一致（Tauri 的形参名必须能
     // 从 JS 的 camelCase 反查回来，所以不能写成 `_work_dir`）。
-    log::debug!("翻译请求：work_dir={work_dir}，条目 {} 条", entries.len());
+    log_translate_request(&work_dir, entries.len());
 
     let settings = resolve_settings(&state).await?;
     if !settings.is_configured() {
@@ -84,6 +84,16 @@ pub async fn translate_entries(
     Ok(())
 }
 
+/// 记录一条「翻译请求」日志。
+///
+/// 抽成函数是为了能被单测直接驱动：`work_dir` 是**前端可控字符串**，
+/// 日志同时写控制台与日志文件，排查问题时会被当成证据 —— 一个
+/// `work_dir = "…\n[INFO] 翻译结束：成功 999 条"` 就能在日志里插进一条
+/// 不存在的记录。所以这里必须用 Debug（`{:?}`）转义换行与不可见字符。
+fn log_translate_request(work_dir: &str, entry_count: usize) {
+    log::debug!("翻译请求：work_dir={work_dir:?}，条目 {entry_count} 条");
+}
+
 /// 请求取消当前翻译任务。
 #[tauri::command]
 pub async fn cancel_translation(state: State<'_, AppState>) -> Result<()> {
@@ -102,4 +112,68 @@ async fn resolve_settings(state: &State<'_, AppState>) -> Result<LlmSettings> {
         .map_err(|err| AppError::other(format!("读取设置任务异常终止: {err}")))??;
     *state.settings_guard().map_err(AppError::config)? = Some(loaded.clone());
     Ok(loaded)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    /// 捕获日志记录的测试 logger。
+    ///
+    /// 只服务于「前端可控字符串不得伪造日志行」这条防线：日志是排查问题的
+    /// 依据，而 `work_dir` 完全由前端控制，所以这条防线必须能被自动验证。
+    struct CaptureLogger(Arc<Mutex<Vec<String>>>);
+
+    impl log::Log for CaptureLogger {
+        fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if let Ok(mut records) = self.0.lock() {
+                records.push(record.args().to_string());
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    /// `work_dir` 里的换行必须在日志里被转义成可见形式，否则前端可以
+    /// 用 `"…\n[INFO] 翻译结束：成功 999 条"` 在日志里伪造一整行记录。
+    ///
+    /// 断言只针对「含 `work_dir=` 的那条记录」，这样同进程里并行跑的其它
+    /// 用例打出来的日志不会让这条断言变脆。
+    #[test]
+    fn translate_request_log_cannot_be_forged_with_newlines() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        // 测试二进制里只有这一个安装者；装不上说明有人抢先了，直接报出来。
+        log::set_boxed_logger(Box::new(CaptureLogger(captured.clone())))
+            .expect("测试 logger 必须能装上");
+        log::set_max_level(log::LevelFilter::Trace);
+
+        let forged =
+            "C:\\mods\\x\n[INFO] 翻译结束：待翻译 0 条，成功 999 条，失败 0 条，取消=false";
+        log_translate_request(forged, 3);
+
+        let records: Vec<String> = captured
+            .lock()
+            .expect("日志缓冲锁")
+            .iter()
+            .filter(|record| record.contains("work_dir="))
+            .cloned()
+            .collect();
+        assert_eq!(records.len(), 1, "应恰好记录一条翻译请求日志: {records:?}");
+        let record = &records[0];
+        assert!(record.contains("条目 3 条"), "条目数应照常记录: {record}");
+        assert!(
+            !record.contains('\n') && !record.contains('\r'),
+            "前端可控字符串不得在日志里引入换行（可伪造日志行）: {record:?}"
+        );
+        assert!(
+            record.contains("\\n"),
+            "换行应被转义成可见的 `\\n`: {record:?}"
+        );
+    }
 }

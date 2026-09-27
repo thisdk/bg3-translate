@@ -92,7 +92,29 @@ function ThemeSwitcher() {
   );
 }
 
+/**
+ * 跑一个 Tauri 窗口动作并把失败交给顶部错误横幅。
+ *
+ * 为什么不能直接 `void win.minimize()`：`void` 只丢弃返回值，**不处理
+ * rejection**。Tauri 的 window API 在 IPC 不可用 / 权限问题时会 reject，
+ * 于是变成未捕获的 Promise rejection（与第三轮 F-26 的对话框同型）——
+ * 用户看到的是「点了没反应」，控制台只剩一条 unhandled rejection。
+ */
+function runWindowAction(
+  setError: (message: string) => void,
+  label: string,
+  action: () => Promise<void>,
+) {
+  try {
+    action().catch((e) => setError(`${label}失败：${String(e)}`));
+  } catch (e) {
+    // 某些环境里 window API 可能同步抛（例如没有 Tauri runtime）
+    setError(`${label}失败：${String(e)}`);
+  }
+}
+
 function WindowControls() {
+  const setError = useAppStore((s) => s.setError);
   const win = getCurrentWindow();
   const baseClass =
     "flex h-[54px] w-11 items-center justify-center text-muted-foreground transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring";
@@ -102,7 +124,9 @@ function WindowControls() {
       <button
         type="button"
         className={`${baseClass} hover:bg-accent hover:text-accent-foreground`}
-        onClick={() => void win.minimize()}
+        onClick={() =>
+          runWindowAction(setError, "最小化窗口", () => win.minimize())
+        }
         title="最小化"
         aria-label="最小化"
       >
@@ -111,7 +135,9 @@ function WindowControls() {
       <button
         type="button"
         className={`${baseClass} hover:bg-accent hover:text-accent-foreground`}
-        onClick={() => void win.toggleMaximize()}
+        onClick={() =>
+          runWindowAction(setError, "最大化窗口", () => win.toggleMaximize())
+        }
         title="最大化"
         aria-label="最大化"
       >
@@ -120,7 +146,7 @@ function WindowControls() {
       <button
         type="button"
         className={`${baseClass} hover:bg-destructive hover:text-destructive-foreground`}
-        onClick={() => void win.close()}
+        onClick={() => runWindowAction(setError, "关闭窗口", () => win.close())}
         title="关闭窗口"
         aria-label="关闭窗口"
       >
@@ -148,15 +174,16 @@ export function AppTopBar({
   actions?: React.ReactNode;
 }) {
   const configured = useAppStore((s) => s.settings.apiKey.length > 0);
+  const setError = useAppStore((s) => s.setError);
   const win = getCurrentWindow();
 
   const startDragging = (event: React.MouseEvent) => {
     if (event.button !== 0) return;
-    void win.startDragging();
+    runWindowAction(setError, "拖动窗口", () => win.startDragging());
   };
 
   const toggleMaximize = () => {
-    void win.toggleMaximize();
+    runWindowAction(setError, "最大化窗口", () => win.toggleMaximize());
   };
 
   return (

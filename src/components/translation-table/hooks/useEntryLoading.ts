@@ -72,6 +72,12 @@ export function useEntryLoading(): { loading: boolean } {
       toLoad.forEach((f) => {
         if (!settled.has(f.name)) loadedRef.current.delete(f.name);
       });
+      // 这一轮请求已经被取消（换勾选 / 切 MOD / 卸载），它的 finally 不会再
+      // 调用 setLoading(false)。这里必须补上，否则本 hook 的 loading 会一直
+      // 留在 true：条目行不渲染（显示「加载条目…」）、翻译按钮永久禁用，
+      // 直到用户再勾选一个尚未加载的文件才会恢复。
+      // （卸载时这个 setState 是空操作，React 会忽略。）
+      setLoading(false);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workDir, selectedKey]);

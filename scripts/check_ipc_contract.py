@@ -19,9 +19,13 @@
    `State` / `AppHandle` / `Window` 等不算）/ 前端 `invoke` 的对象字段
    （camelCase，经 Tauri 转 snake_case）/ 文档命令表的参数列。
    只查命令名会漏掉「`workDir` 写成 `workdir`」这类只有在运行期才炸的错误。
-5. `TranslationEvent` / `TranslationStatus` / `PakFileKind` 三组枚举的
+5. 命令层写了 `#[tauri::command]` 的每个函数都必须在 `generate_handler!` 里注册
+   （只从注册表出发的检查看不见「定义了但没注册」的命令）
+6. 命令的**返回类型**与文档命令表的返回列一致（`Result<Vec<PakFile>>` 归一成
+   `PakFile[]`、`Result<()>` 归一成 `void` 再比对）
+7. `TranslationEvent` / `TranslationStatus` / `PakFileKind` 三组枚举的
    serde 名称与前端 TypeScript 联合类型必须一致
-6. 版本号一致：`package.json` / `src-tauri/tauri.conf.json` /
+8. 版本号一致：`package.json` / `src-tauri/tauri.conf.json` /
    `Cargo.toml [workspace.package]` / `Cargo.lock` 里两个工作区 crate
 
 退出码：0 全部通过，1 存在不一致。
@@ -120,9 +124,14 @@ def matching_paren(source: str, open_index: int) -> int:
     return -1
 
 
-def rust_command_params() -> dict[str, list[str]]:
-    """`{命令名: [形参名]}`（不含 Tauri 注入的形参），扫 `src-tauri/src/commands/*.rs`。"""
-    commands: dict[str, list[str]] = {}
+def rust_command_signatures() -> dict[str, tuple[list[str], str]]:
+    """`{命令名: (形参名, 返回类型原文)}`，扫 `src-tauri/src/commands/*.rs`。
+
+    形参不含 Tauri 注入的 `State` / `AppHandle` / `Window` 等；返回类型是
+    `->` 后面那一段原文（例如 `Result<Vec<TranslationEntry>>`），
+    归一化交给 [`normalize_return_type`]。
+    """
+    commands: dict[str, tuple[list[str], str]] = {}
     for path in sorted((ROOT / COMMANDS_DIR).glob("*.rs")):
         source = path.read_text(encoding="utf-8")
         for hit in re.finditer(
@@ -148,8 +157,32 @@ def rust_command_params() -> dict[str, list[str]]:
                 if type_name in INJECTED_PARAM_TYPES:
                     continue
                 params.append(param)
-            commands[name] = params
+            after = source[end + 1 :]
+            returns = re.match(r"\s*->\s*([^{]+)\{", after, re.S)
+            commands[name] = (params, returns.group(1).strip() if returns else "()")
     return commands
+
+
+def normalize_return_type(text: str) -> str:
+    """把 Rust 返回类型与文档写法归一成同一种表示。
+
+    `Result<Vec<PakFile>>` → `PakFile[]`；`Result<()>` → `void`；
+    `Result<Glossary>` → `Glossary`；文档里的 `\\`PakFile[]\\`` → `PakFile[]`。
+    """
+    clean = text.strip().strip("`").strip()
+    result = re.fullmatch(r"Result\s*<\s*(.*?)\s*>", clean, re.S)
+    if result:
+        clean = result.group(1).strip()
+    if clean in ("", "()"):
+        return "void"
+    vector = re.fullmatch(r"Vec\s*<\s*(.*?)\s*>", clean, re.S)
+    if vector:
+        return f"{normalize_type_name(vector.group(1))}[]"
+    return normalize_type_name(clean)
+
+
+def normalize_type_name(text: str) -> str:
+    return text.strip().split("::")[-1].replace(" ", "")
 
 
 def object_keys(body: str) -> list[str]:
@@ -194,17 +227,18 @@ def js_invoke_args(source: str) -> dict[str, list[str]]:
     return calls
 
 
-def doc_command_params(arch: str) -> dict[str, list[str]]:
-    """`{命令名: [文档命令表里的字段名]}`（camelCase）。"""
+def doc_command_table(arch: str) -> dict[str, tuple[list[str], str]]:
+    """`{命令名: (参数列字段, 返回列原文)}`，来自 `docs/ARCHITECTURE.md` 的命令表。"""
     section = re.search(r"### Tauri 命令(.*?)(?:\n### |\Z)", arch, re.S)
     if not section:
         return {}
-    params: dict[str, list[str]] = {}
+    table: dict[str, tuple[list[str], str]] = {}
     for row in re.finditer(
         r"^\| `([a-z_]+)` \| (.*?) \| (.*?) \|\s*$", section.group(1), re.M
     ):
-        params[row.group(1)] = re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", row.group(2))
-    return params
+        params = re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", row.group(2))
+        table[row.group(1)] = (params, row.group(3).strip())
+    return table
 
 
 # ── 结构体字段契约的配对表：(Rust 文件, Rust 类型名, TypeScript 接口名) ──
@@ -411,9 +445,11 @@ def main() -> int:
     # ── 1b. 命令**参数**契约 ────────────────────────────────────
     # 命令名对得上、参数名写错，同样只会在运行期炸；三处（后端形参 /
     # 前端 invoke 字段 / 文档命令表）必须能互相转成同一组 snake_case 名字。
-    rust_params = rust_command_params()
+    signatures = rust_command_signatures()
+    rust_params = {name: params for name, (params, _) in signatures.items()}
     js_args = js_invoke_args(api_ts)
-    doc_params = doc_command_params(arch)
+    doc_table = doc_command_table(arch)
+    doc_params = {name: params for name, (params, _) in doc_table.items()}
 
     if not rust_params:
         report.bad(
@@ -438,6 +474,38 @@ def main() -> int:
                 report.detail(problem)
         else:
             report.ok(f"{len(registered)} 个命令的参数名在后端 / 前端 invoke / 文档命令表三处一致")
+
+    # ── 1c. **定义了但没注册**的命令 ────────────────────────────
+    # 写了 `#[tauri::command]` 却忘了加进 `generate_handler!`：前端一 invoke
+    # 就是「命令不存在」，而只从注册表出发的检查完全看不见它
+    # （未注册 → 不在 registered 里 → 既不查文档也不查前端）。
+    if rust_params:
+        orphans = sorted(set(rust_params) - set(registered))
+        if orphans:
+            report.bad(f"命令层定义了但没在 {LIB_RS} 的 generate_handler! 里注册的命令：")
+            for command in orphans:
+                report.detail(command)
+        else:
+            report.ok(f"{len(rust_params)} 个 #[tauri::command] 全部已在后端注册")
+
+    # ── 1d. 命令**返回类型**契约 ────────────────────────────────
+    # 返回类型写错（文档说 `void`、实现返回结构体，或反过来）不会编译报错，
+    # 只会让文档腐烂、让按文档写调用方的人拿到 undefined。
+    if rust_params:
+        return_problems: list[str] = []
+        for command in registered:
+            rust_ret = normalize_return_type(signatures.get(command, ([], "()"))[1])
+            doc_ret = normalize_return_type(doc_table.get(command, ([], ""))[1])
+            if rust_ret != doc_ret:
+                return_problems.append(
+                    f"{command}: 后端返回 {rust_ret}，文档命令表写的是 {doc_ret or '（空）'}"
+                )
+        if return_problems:
+            report.bad("命令返回类型与架构文档命令表不一致：")
+            for problem in return_problems:
+                report.detail(problem)
+        else:
+            report.ok(f"{len(registered)} 个命令的返回类型与架构文档命令表一致")
 
     # ── 3. 枚举契约 ─────────────────────────────────────────────
     types_rs = read(TYPES_RS)

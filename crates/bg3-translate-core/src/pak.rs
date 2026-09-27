@@ -48,11 +48,39 @@ pub fn normalize_entry_name(name: &str) -> String {
     name.replace('\\', "/")
 }
 
+/// 本工具写回中文时使用的目录名（与前端 `src/lib/localization.ts` 的
+/// `TARGET_LANGUAGE` 一致）。
+const CHINESE_LANGUAGE_DIR: &str = "Chinese";
+
+/// PAK 内路径 → 已知语言名。
+///
+/// 先走上游的 `detect_language_from_path`（BG3 官方的 14 个语言名），再补一条
+/// **本工具自己的约定**：`Localization/Chinese/<file>`。
+///
+/// 为什么必须补：上游那份清单里只有 `ChineseSimplified` / `ChineseTraditional`，
+/// **没有 `Chinese`**；而本工具写回中文用的正是 `Localization/Chinese/`
+/// （前端 `TARGET_LANGUAGE = "Chinese"`）。不补的话，上一轮产出的中文文件在下一轮
+/// 会被算成「未知语言」，前端 `localizationWritePriority` 里
+/// `CHINESE_LANGUAGE_ALIASES` 的 `"Chinese"` 分支永远是死代码，
+/// 同一目标路径上英文（优先级 3）会压过中文（本应是 2）。
+fn detect_language(name: &str) -> Option<String> {
+    if let Some(language) = detect_language_from_path(name) {
+        return Some(language.to_string());
+    }
+    let normalized = normalize_entry_name(name);
+    let parts: Vec<&str> = normalized.split('/').collect();
+    parts.windows(2).find_map(|window| {
+        let is_localization = window[0].eq_ignore_ascii_case("Localization");
+        let is_chinese = window[1].eq_ignore_ascii_case(CHINESE_LANGUAGE_DIR);
+        (is_localization && is_chinese).then(|| CHINESE_LANGUAGE_DIR.to_string())
+    })
+}
+
 fn to_pak_file(file: &PackagedFile) -> PakFile {
     let name = normalize_entry_name(file.name());
     PakFile {
         kind: classify_file(&name),
-        language: detect_language_from_path(&name).map(String::from),
+        language: detect_language(&name),
         name,
         size: file.size(),
     }
@@ -416,13 +444,27 @@ fn extract_zip_to_find_pak_limited(
         }
         let mut output = std::fs::File::create(&output_path)?;
 
-        // ② 再按**实际写入**字节数兜底：声明大小是可以撒谎的
-        let budget = limits.max_total_bytes - written_total;
+        // ② 再按**实际写入**字节数兜底：声明大小是可以撒谎的。
+        // 预算取「剩余总量」与「单文件上限」的较小值 —— 只看总量的话，
+        // 一个声明 1 字节的条目能把整份总量预算（默认 16 GiB）写进同一个文件，
+        // 单文件上限（默认 6 GiB）形同虚设。
+        let total_budget = limits.max_total_bytes.saturating_sub(written_total);
+        let entry_budget = limits.max_entry_bytes;
+        let budget = total_budget.min(entry_budget);
         let mut limited = std::io::Read::take(&mut entry, budget.saturating_add(1));
         let copied = std::io::copy(&mut limited, &mut output)?;
         drop(output);
-        if copied > budget {
-            // 及时收尾：失败时不要在工作目录里留下一个已经写了几个 GB 的文件
+        if copied > entry_budget {
+            // 及时收尾：失败时不要在工作目录里留下一个已经写了几 GB 的文件
+            let _ = std::fs::remove_file(&output_path);
+            return Err(AppError::pak(format!(
+                "zip 条目 {} 实际解压超过单文件上限 {} 字节，已中止解压（声明大小与内容不符）",
+                entry.name(),
+                limits.max_entry_bytes
+            )));
+        }
+        if copied > total_budget {
+            // 及时收尾：失败时不要在工作目录里留下一个已经写了几 GB 的文件
             let _ = std::fs::remove_file(&output_path);
             return Err(AppError::pak(format!(
                 "zip 条目 {} 解压超过总量上限 {} 字节，已中止解压（疑似压缩炸弹）",
@@ -565,11 +607,46 @@ pub fn repack(work_dir: &str, output_path: &str) -> Result<()> {
         .priority(priority)
         .add_directory(&unpacked)
         .map_err(|e| AppError::pak(format!("读取待打包目录失败: {e}")))?;
-    builder
-        .build(output)
-        .map_err(|e| AppError::pak(format!("打包失败: {e}")))?;
+
+    // 先打到**同目录**下的临时文件，成功后再 rename 覆盖目标。
+    //
+    // `PackageBuilder::build` 的第一步就是 `File::create(output)`（截断），之后才逐个
+    // 打开源文件：任何一步失败（源文件读不出来 / 磁盘写满）都会把用户原来放在
+    // `output_path` 上的产物清成 0 字节或半截 pak，而「导出覆盖上一次的结果」
+    // 是最常见的用法。rename 在同一目录内是原子的；临时文件与目标同目录，
+    // 所以不会跨文件系统（跨文件系统 rename 会退化成失败）。
+    let tmp = repack_temp_path(output);
+    let _ = std::fs::remove_file(&tmp);
+    if let Err(err) = builder.build(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(AppError::pak(format!("打包失败: {err}")));
+    }
+    if let Err(err) = std::fs::rename(&tmp, output) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(AppError::pak(format!(
+            "写入 {} 失败: {err}",
+            output.display()
+        )));
+    }
 
     Ok(())
+}
+
+/// 重打包用的临时文件名（与目标同目录，`rename` 才能原子生效）。
+///
+/// 带进程内自增序号：并发打包同一目标时两次运行不会共用一个临时文件。
+/// 前缀是 `.`（隐藏文件），即使进程被强杀留下残骸也不容易被误当成产物。
+fn repack_temp_path(output: &Path) -> PathBuf {
+    static REPACK_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = REPACK_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let name = output
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    output.with_file_name(format!(
+        ".{name}.bg3-translate-{}-{seq}.tmp",
+        std::process::id()
+    ))
 }
 
 #[cfg(test)]
@@ -606,6 +683,67 @@ mod tests {
         assert_eq!(
             normalize_entry_name(r"Localization\English\a.xml"),
             "Localization/English/a.xml"
+        );
+    }
+
+    /// `Localization/Chinese/` 必须被认成中文。
+    ///
+    /// 前端写回中文用的目录名就是 `Chinese`（`TARGET_LANGUAGE`），而上游的
+    /// `detect_language_from_path` 只认 BG3 官方 14 个名字、**不含 `Chinese`** ——
+    /// 不补这条，上一轮产出的中文文件在下一轮会掉进「未知语言」，
+    /// 同一目标路径上英文会压过中文（`localizationWritePriority`）。
+    #[test]
+    fn chinese_target_directory_is_recognized_as_chinese() {
+        for name in [
+            "Localization/Chinese/x.xml",
+            "localization/chinese/x.xml",
+            r"Mods\MyMod\Localization\Chinese\x.loca",
+        ] {
+            assert_eq!(
+                detect_language(name).as_deref(),
+                Some("Chinese"),
+                "{name} 必须被认成中文"
+            );
+        }
+        // 官方语言名照旧
+        assert_eq!(
+            detect_language("Localization/Polish/a.xml").as_deref(),
+            Some("Polish")
+        );
+        assert_eq!(
+            detect_language("Localization/ChineseSimplified/a.xml").as_deref(),
+            Some("ChineseSimplified")
+        );
+        // 不误伤：只有紧跟在 Localization 后面的那一段才是语言目录
+        assert_eq!(
+            detect_language("Localization/English/Chinese/x.xml").as_deref(),
+            Some("English")
+        );
+        assert_eq!(detect_language("Mods/Chinese/x.xml"), None);
+    }
+
+    /// 端到端：`build_pak_files` 出来的文件列表里，中文目录的语言字段必须是
+    /// `Chinese`（变异：把 `to_pak_file` 改回只调上游函数，这条立刻变红）。
+    #[test]
+    fn build_pak_files_reports_chinese_for_our_target_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("src");
+        std::fs::create_dir_all(source.join("Localization/Chinese")).unwrap();
+        std::fs::write(source.join("Localization/Chinese/x.xml"), b"<contentList/>").unwrap();
+        let pak = tmp.path().join("zh.pak");
+        PackageBuilder::new()
+            .add_directory(&source)
+            .unwrap()
+            .build(&pak)
+            .unwrap();
+
+        let pkg = Package::open(&pak).unwrap();
+        let files = build_pak_files(&pkg);
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].language.as_deref(),
+            Some("Chinese"),
+            "文件列表里的语言字段: {files:?}"
         );
     }
 
@@ -843,6 +981,90 @@ mod tests {
         assert_eq!(err.code(), "config");
     }
 
+    /// 打包**失败**时不能摧毁 `output_path` 上已有的文件，也不能留下半个 pak。
+    ///
+    /// `PackageBuilder::build` 的第一步就是 `File::create(output)`（截断），之后才逐个
+    /// `File::open` 源文件：任何一个源文件读不出来（磁盘满、权限、文件被中途删掉），
+    /// 用户原先放在那个路径上的产物就已经被清空了 —— 而导出覆盖上一次的产物
+    /// 恰恰是最常见的用法。
+    ///
+    /// 复现（修复前）：`EitherExisting.pak` 从 32 字节变成 0 字节，`repack` 返回 Err。
+    #[cfg(unix)]
+    #[test]
+    fn failed_repack_does_not_destroy_an_existing_output_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        let unpacked = work.join(UNPACKED_DIR);
+        std::fs::create_dir_all(unpacked.join("Localization/English")).unwrap();
+        std::fs::write(
+            unpacked.join("Localization/English/a.xml"),
+            b"<contentList/>",
+        )
+        .unwrap();
+        // 这个文件让 `build` 在中途失败（`add_directory` 只 stat，不打开）
+        let blocked = unpacked.join("Localization/English/b.xml");
+        std::fs::write(&blocked, b"<contentList/>").unwrap();
+        let mut perms = std::fs::metadata(&blocked).unwrap().permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&blocked, perms).unwrap();
+        if std::fs::File::open(&blocked).is_ok() {
+            eprintln!("跳过：当前用户仍可读 chmod 000 的文件（可能以 root 运行）");
+            return;
+        }
+
+        let output = tmp.path().join("Existing.pak");
+        let existing = b"USER EXISTING PAK CONTENT 0123456789";
+        std::fs::write(&output, existing).unwrap();
+
+        let err = repack(work.to_str().unwrap(), output.to_str().unwrap()).unwrap_err();
+        assert_eq!(err.code(), "pak", "必须报 pak 错误: {err}");
+        assert_eq!(
+            std::fs::read(&output).unwrap(),
+            existing,
+            "打包失败不能摧毁 output 路径上已有的文件"
+        );
+
+        // 临时文件必须被清理干净（失败路径）
+        let mut names: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["Existing.pak".to_string(), "work".to_string()],
+            "失败路径不能留下临时文件"
+        );
+
+        // 恢复权限后成功打包：产物存在且可再次打开（自洽性），也没有临时文件
+        let mut perms = std::fs::metadata(&blocked).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&blocked, perms).unwrap();
+        let ok_out = tmp.path().join("Out.pak");
+        repack(work.to_str().unwrap(), ok_out.to_str().unwrap()).unwrap();
+        assert!(ok_out.is_file(), "成功路径必须产出文件");
+        let pkg = Package::open(&ok_out).unwrap();
+        assert_eq!(build_pak_files(&pkg).len(), 2, "两个文件都要进包");
+        let mut names: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "Existing.pak".to_string(),
+                "Out.pak".to_string(),
+                "work".to_string()
+            ],
+            "成功路径同样不能留下临时文件"
+        );
+    }
+
     /// 压缩炸弹防线：65 KB 的 zip 能解出 64 MiB（≈1000×），必须在解压过程中
     /// 就被拦住，而且**不能**在工作目录里留下已经写出去的大文件。
     ///
@@ -1038,6 +1260,73 @@ mod tests {
             "超限时不该解压出任何文件: {:?}",
             walk_files(&work)
         );
+    }
+
+    /// 声明大小撒谎时，**单条目**实际写入同样不能突破单文件上限。
+    ///
+    /// 旧实现的第 ③ 层（实际写入兜底）只按「总量预算」`take`：一个声明 1 字节、
+    /// 实际 4 MiB 的条目在总量上限 16 GiB 下会被完整写出来，单文件上限形同虚设
+    /// （65 KB 的 zip 仍可写出 16 GiB）。
+    ///
+    /// 复现（修复前）：本用例解压「成功」（错误信息是「未找到 .pak」），
+    /// `bomb.bin` 留下 4 MiB —— 两个断言都红。
+    #[test]
+    fn zip_entry_that_lies_about_its_size_cannot_exceed_the_per_entry_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip_path = tmp.path().join("liar2.zip");
+        {
+            let file = std::fs::File::create(&zip_path).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            writer.start_file("bomb.bin", options).unwrap();
+            std::io::Write::write_all(&mut writer, &vec![0u8; 4 << 20]).unwrap();
+            writer.finish().unwrap();
+        }
+
+        // 把「解压后大小」篡改成 1 字节：两个声明层检查全部放行
+        let mut bytes = std::fs::read(&zip_path).unwrap();
+        let mut patched = 0usize;
+        for (signature, offset) in [
+            (b"PK\x03\x04".as_slice(), 22usize),
+            (b"PK\x01\x02".as_slice(), 24usize),
+        ] {
+            let mut i = 0usize;
+            while let Some(pos) = bytes[i..]
+                .windows(4)
+                .position(|window| window == signature)
+                .map(|p| i + p)
+            {
+                bytes[pos + offset..pos + offset + 4].copy_from_slice(&1u32.to_le_bytes());
+                patched += 1;
+                i = pos + 4;
+            }
+        }
+        assert!(patched >= 2, "应至少篡改本地头与中央目录各一处: {patched}");
+        std::fs::write(&zip_path, &bytes).unwrap();
+
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let limits = ZipLimits {
+            max_entry_bytes: 1 << 20,  // 1 MiB：实际 4 MiB 必须被拦
+            max_total_bytes: 64 << 20, // 总量宽松，只有单条目层能拦住
+            max_entries: 16,
+        };
+
+        let err = extract_zip_to_find_pak_limited(&zip_path, &work, limits).unwrap_err();
+        assert_eq!(err.code(), "pak", "实际写入超限必须报 pak 错误: {err}");
+        assert!(
+            err.to_string().contains("单文件上限"),
+            "必须是「单条目实际写入」这一层拦下来的（「未找到 .pak」不算数）: {err}"
+        );
+        for path in walk_files(&work) {
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            assert!(
+                size <= (1 << 20),
+                "{} 留下了 {size} 字节（超过单文件上限）",
+                path.display()
+            );
+        }
     }
 
     /// 真实体量的 zip 照常解压（上限不能误伤正常 MOD）。

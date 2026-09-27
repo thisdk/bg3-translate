@@ -254,4 +254,45 @@ describe("FileDropZone 拖放与打开", () => {
 
     expect(useAppStore.getState().error).toContain("对话框不可用");
   });
+
+  it("打开还在进行中时再拖入文件不会并发发起第二次 openMod", async () => {
+    // 第一次打开挂着（大 MOD 解包慢）
+    let finishFirst: ((v: { workDir: string; files: PakFile[] }) => void) | null = null;
+    tauri.openMod.mockImplementationOnce(
+      () =>
+        new Promise<{ workDir: string; files: PakFile[] }>((resolve) => {
+          finishFirst = resolve;
+        }),
+    );
+    await render();
+
+    await act(async () => {
+      emitDrop(["/tmp/first.pak"]);
+      await Promise.resolve();
+    });
+    expect(tauri.openMod).toHaveBeenCalledTimes(1);
+    expect(useAppStore.getState().loading).toBe(true);
+
+    // 拖放路径不看 busy（点击路径被 onClick={undefined} 挡住了）：再来一次
+    await act(async () => {
+      emitDrop(["/tmp/second.pak"]);
+      await Promise.resolve();
+    });
+    // 两个 open_mod 并发会互相删掉对方的工作目录，最后 store 里的
+    // workDir 与后端记录的不一致 → 所有 read_file_entries 都被拒绝
+    expect(tauri.openMod).toHaveBeenCalledTimes(1);
+    // 被忽略的那次要有反馈，不能静默
+    expect(useAppStore.getState().error).toContain("正在打开上一个 MOD");
+
+    await act(async () => {
+      finishFirst?.({ workDir: "/tmp/wa", files: [pak] });
+      await Promise.resolve();
+    });
+    await waitMs(0);
+
+    const state = useAppStore.getState();
+    expect(state.modFilePath).toBe("/tmp/first.pak");
+    expect(state.workDir).toBe("/tmp/wa");
+    expect(state.loading).toBe(false);
+  });
 });

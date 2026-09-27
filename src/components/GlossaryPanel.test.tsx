@@ -291,4 +291,88 @@ describe("GlossaryPanel 增删改", () => {
     expect(rows()).toHaveLength(1);
     expect(mounted.container.textContent).toContain("导入项");
   });
+
+  it("导入对话框 reject 时给出错误提示，而不是未捕获的 Promise rejection", async () => {
+    // 与 F-26（FileDropZone）同型：async onClick 里裸 await 对话框，reject 时
+    // 既没有用户反馈，又会变成 unhandled rejection。
+    await render();
+
+    dialog.open.mockRejectedValue(new Error("对话框不可用"));
+    click(findButton(mounted.container, "导入")!);
+    await waitMs(0);
+
+    expect(mounted.container.textContent).toContain("对话框不可用");
+    expect(tauri.importGlossary).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * 重复 source 的行定位。
+ *
+ * 既定事实：真实官方术语表（`samples/bg3-official-glossary.json`）清洗后本就有
+ * **6 组重复 source**（`'Jaheira'` 与 `Jaheira` 这类「带引号 / 不带引号」变体清洗后
+ * 同名，组内译文相同），Rust 侧 `real_glossary_already_contains_duplicate_sources`
+ * 把它钉住了。用户导入带重复的 JSON、或把某条术语的 source 改成已有的 source
+ * （后端 `update` 只替换第一条）同样会产生重复。
+ *
+ * 表格若用 `source` 当 React key / busy 定位键，两行会一起转圈、并触发
+ * React 的重复 key 警告（`Encountered two children with the same key`）。
+ */
+describe("重复 source 的术语行", () => {
+  const DUPLICATE: Glossary = {
+    terms: [
+      { ...USER, source: "Gith", target: "吉斯" },
+      { ...USER, source: "Gith", target: "吉斯人" },
+    ],
+  };
+
+  function deleteButtons(): HTMLButtonElement[] {
+    return [
+      ...mounted.container.querySelectorAll<HTMLButtonElement>(
+        '[aria-label^="删除术语"]',
+      ),
+    ];
+  }
+
+  it("同一 source 的两行都要渲染，且不产生 React 重复 key 警告", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      tauri.listGlossary.mockResolvedValue(DUPLICATE);
+      await render();
+
+      expect(rows()).toHaveLength(2);
+      const text = mounted.container.textContent ?? "";
+      expect(text).toContain("吉斯");
+      expect(text).toContain("吉斯人");
+
+      const duplicateKeyWarnings = errorSpy.mock.calls
+        .map((call) => String(call[0]))
+        .filter((message) => message.includes("same key"));
+      expect(duplicateKeyWarnings).toEqual([]);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("点第一行的删除：只有那一行转圈，重复的另一行不受影响", async () => {
+    // 删除请求挂住，让 loading 状态可观测
+    tauri.deleteGlossaryEntry.mockImplementation(
+      () => new Promise<Glossary>(() => {}),
+    );
+    tauri.listGlossary.mockResolvedValue(DUPLICATE);
+    await render();
+
+    const buttons = deleteButtons();
+    expect(buttons).toHaveLength(2);
+
+    click(buttons[0]);
+    await waitMs(0);
+
+    const after = deleteButtons();
+    expect(after).toHaveLength(2);
+    // 旧实现按 source 置忙 → 两行同时 aria-busy="true"
+    expect(after[0].getAttribute("aria-busy")).toBe("true");
+    expect(after[1].getAttribute("aria-busy")).toBeNull();
+    expect(tauri.deleteGlossaryEntry).toHaveBeenCalledWith("Gith");
+  });
 });

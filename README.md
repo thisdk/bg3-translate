@@ -1,5 +1,10 @@
 # BG3 MOD 汉化工具 ✨
 
+[![CI](https://github.com/thisdk/bg3-translate/actions/workflows/ci.yml/badge.svg)](https://github.com/thisdk/bg3-translate/actions/workflows/ci.yml)
+[![发布](https://github.com/thisdk/bg3-translate/actions/workflows/release.yml/badge.svg)](https://github.com/thisdk/bg3-translate/actions/workflows/release.yml)
+![平台](https://img.shields.io/badge/平台-Windows%20x64-0078d4)
+![许可](https://img.shields.io/badge/许可-MIT-green)
+
 一款专为《博德之门 3》（Baldur's Gate 3）打造的桌面端 MOD 汉化工具。无需命令行拆包与繁琐的 XML 手工编辑，只需 **打开 MOD → AI 翻译与校对 → 重新打包** 三步，即可直接生成可在游戏中加载的中文 `.pak` 模组文件。
 
 ---
@@ -51,8 +56,6 @@
 启动软件后，点击 **「打开并汉化 MOD」** 选择 `.pak` 或 `.zip` 文件，也可以直接将文件拖入窗口。
 > 如果你只想把 `.pak` 解包成普通文件夹查看内容，可以点击右侧的「仅解包到文件夹」。
 
-<img width="1800" height="1200" alt="选择 MOD 文件" src="https://github.com/user-attachments/assets/c9ebb1b8-dfad-4b1b-bb70-73dc7978b92f" />
-
 ### 2. 配置大模型接口
 点击右上角 **「设置」** 按钮，配置兼容 OpenAI 接口规范的大模型服务：
 
@@ -64,16 +67,11 @@
 | **并发数** | 同时翻译的请求数量（建议 `4` ~ `8`，视接口速率限制而定） |
 | **温度 (Temperature)** | 建议保持 `0.3` 左右，兼顾译文自然度与标签结构稳定性 |
 
-<img width="1800" height="1200" alt="配置大模型接口" src="https://github.com/user-attachments/assets/158aa36a-b31f-4736-98a0-d90273c21326" />
-
 ### 3. 选择语言文件并开始翻译
 1. 在左侧文件列表中**单选**需要翻译的源语言文件（通常直接选择排在第一位的 `English` 语言文件即可）。
-2. （可选）如果该 MOD 有特定的背景设定，可以在上方 **「本 MOD 语境」** 输入框中填写简短提示，模型会按该设定调整用词风格：
-   <img width="1800" height="322" alt="填写 MOD 语境提示" src="https://github.com/user-attachments/assets/d1755cc9-6345-4ee3-b74f-1f7ee831c842" />
+2. （可选）如果该 MOD 有特定的背景设定，可以在上方 **「本 MOD 语境」** 输入框中填写简短提示，模型会按该设定调整用词风格。
 3. （可选）点击右上角 **「术语表」** 可查看、添加固定译名或导入自定义 JSON 术语表。
 4. 点击 **「开始翻译」**（或「翻译剩余 N 条」），右侧表格会实时展示流式翻译进展。
-
-<img width="1800" height="1200" alt="选择文件并开始翻译" src="https://github.com/user-attachments/assets/08986436-d270-40fc-962e-677dd48a8fda" />
 
 ### 4. 检查与人工校对
 整轮翻译完成后：
@@ -83,8 +81,6 @@
 ### 5. 完成翻译并重新打包
 确认译文无误后，点击右下角 **「完成翻译，去打包」**，确认导出路径并点击 **「开始打包」**。
 软件会生成 `<原文件名>_zh.pak` 文件，将其放入游戏 MOD 目录并通过 BG3ModManager 或游戏内置模组管理器启用即可。
-
-<img width="1800" height="1200" alt="重新打包导出" src="https://github.com/user-attachments/assets/f37730ec-e661-47ea-bc21-174d9b0a13b9" />
 
 ---
 
@@ -96,8 +92,6 @@
   - `config/glossary.json`：术语表数据
 - 备份或迁移软件时，只需保留这个 `config/` 文件夹即可。
 - 若程序被安装在无写入权限的系统受保护目录（如 `C:\Program Files`），则会自动回退至系统用户目录 `%APPDATA%\com.bg3translate.app\`。你随时可以在右上角「设置」弹窗底部查看当前实际生效的存储路径。
-
-<img width="1800" height="1200" alt="配置文件目录" src="https://github.com/user-attachments/assets/db88d79d-bc31-4500-997e-c370a4ee90b6" />
 
 ---
 

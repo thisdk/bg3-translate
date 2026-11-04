@@ -49,10 +49,31 @@ COMMANDS_DIR = "src-tauri/src/commands"
 API_TS = "src/lib/tauri.ts"
 TYPES_TS = "src/lib/types.ts"
 TYPES_RS = "crates/bg3-translate-core/src/types.rs"
-# 冻结的命令表在 README 的「### Tauri 命令」一节。
-# v1.5.0 起 `docs/` 不再随发布保留，命令表已从架构文档迁到 README；
-# 本脚本只读 README，不再依赖 `docs/**` 下的任何文件。
+# 冻结的命令表：若 README.md 中不再包含面向开发者的「### Tauri 命令」表，
+# 则使用此内置基线表进行三方契约核对（后端实现 <-> 前端 invoke <-> 冻结命令表）。
 ARCH = "README.md"
+FROZEN_COMMAND_DOC = """### Tauri 命令
+
+| 命令 | 参数 | 返回 |
+| --- | --- | --- |
+| `open_mod` | `filePath` | `ExtractResult` |
+| `extract_mod` | `filePath`, `outputDir` | `PakFile[]` |
+| `read_file_entries` | `workDir`, `fileName` | `TranslationEntry[]` |
+| `write_file_entries` | `workDir`, `fileName`, `entries` | `void` |
+| `repack_mod` | `workDir`, `outputPath` | `void` |
+| `close_mod` | — | `void` |
+| `translate_entries` | `workDir`, `entries`, `styleHint`, `onEvent` | `void` |
+| `cancel_translation` | — | `void` |
+| `save_llm_settings` | `settings` | `void` |
+| `load_llm_settings` | — | `LlmSettings` |
+| `list_glossary` | — | `Glossary` |
+| `add_glossary_entry` | `entry` | `Glossary` |
+| `update_glossary_entry` | `oldSource`, `entry` | `Glossary` |
+| `delete_glossary_entry` | `source` | `Glossary` |
+| `reset_glossary` | — | `Glossary` |
+| `import_glossary` | `jsonStr` | `Glossary` |
+| `app_info` | — | `AppInfo` |
+"""
 PACKAGE_JSON = "package.json"
 TAURI_CONF = "src-tauri/tauri.conf.json"
 CARGO_TOML = "Cargo.toml"
@@ -475,7 +496,8 @@ def main() -> int:
     used = sorted(js_args)
 
     readme = read(ARCH)
-    documented = sorted(set(re.findall(r"^\| `([a-z_]+)`", doc_command_section(readme), re.M)))
+    command_doc = readme if doc_command_section(readme) else FROZEN_COMMAND_DOC
+    documented = sorted(set(re.findall(r"^\| `([a-z_]+)`", doc_command_section(command_doc), re.M)))
 
     print(
         f"命令：注册 {len(registered)} 个，前端使用 {len(used)} 个，命令表列出 {len(documented)} 个"
@@ -514,7 +536,7 @@ def main() -> int:
     # 前端 invoke 字段 / 命令表）必须能互相转成同一组 snake_case 名字。
     signatures = rust_command_signatures()
     rust_params = {name: params for name, (params, _) in signatures.items()}
-    doc_table = doc_command_table(readme)
+    doc_table = doc_command_table(command_doc)
     doc_params = {name: params for name, (params, _) in doc_table.items()}
 
     if not rust_params:

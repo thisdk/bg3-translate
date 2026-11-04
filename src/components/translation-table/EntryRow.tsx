@@ -124,6 +124,8 @@ export const EntryRow = memo(function EntryRow({
                     variant="ghost"
                     className="h-6 px-2"
                     onClick={() => onStartEdit(entry)}
+                    disabled={busy}
+                    title={busy ? "请等待本轮翻译结束后再人工校对" : undefined}
                   >
                     <Edit3 className="h-3 w-3" />
                     编辑
@@ -137,6 +139,8 @@ export const EntryRow = memo(function EntryRow({
                     variant="ghost"
                     className="h-6 px-2"
                     onClick={() => onRevert(entry)}
+                    disabled={busy}
+                    title={busy ? "请等待本轮翻译结束后再还原" : undefined}
                   >
                     <Eraser className="h-3 w-3" />
                     还原

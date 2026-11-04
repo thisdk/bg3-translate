@@ -131,6 +131,7 @@ function FilesPage() {
           files={files}
           selectedFiles={selectedFiles}
           onSelectionChange={setSelectedFiles}
+          disabled={runActive}
         />
       </div>
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
@@ -138,13 +139,22 @@ function FilesPage() {
           <TranslationTable />
         </div>
         <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-t bg-muted/30 px-4 py-3">
-          <Button variant="ghost" onClick={() => setStage("home")}>
+          <Button
+            variant="ghost"
+            onClick={() => setStage("home")}
+            disabled={runActive}
+            title={
+              runActive
+                ? "翻译仍在进行中：请先取消或等待翻译完成"
+                : undefined
+            }
+          >
             <ChevronRight className="h-4 w-4 rotate-180" />
             <span className="hidden sm:inline">返回</span>
           </Button>
           <Button
             onClick={onGoPack}
-            disabled={!workDir || selectedFiles.length === 0}
+            disabled={!workDir || selectedFiles.length === 0 || runActive}
             title={
               runActive
                 ? "翻译仍在进行中：请等待翻译结束或取消后再打包"

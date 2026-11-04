@@ -172,22 +172,34 @@ async function startAndStream(): Promise<void> {
 }
 
 describe("写回闸门（翻译进行中不得写回）", () => {
-  it("翻译仍在进行时点「完成翻译，去打包」不得写回半截译文", async () => {
+  it("翻译仍在进行时禁用「完成翻译，去打包」、「返回」与左侧文件树，不得写回半截译文", async () => {
     await renderApp();
     await startAndStream();
 
     const packButton = findButton(mounted.container, "完成翻译，去打包");
+    const backButton = findButton(mounted.container, "返回");
+    const fileRow = mounted.container.querySelector<HTMLElement>(
+      `[data-file-path="${FILE_NAME}"]`,
+    );
     expect(packButton).not.toBeNull();
-    expect(packButton!.disabled).toBe(false);
+    expect(packButton!.disabled).toBe(true);
+    expect(backButton).not.toBeNull();
+    expect(backButton!.disabled).toBe(true);
+    expect(fileRow).not.toBeNull();
+    expect(fileRow!.getAttribute("aria-disabled")).toBe("true");
+
     await act(async () => {
       click(packButton!);
+      click(backButton!);
+      click(fileRow!);
     });
     await waitMs(0);
 
-    // 半截译文是 translating 状态，后端会把它当成真译文写进 PAK
+    // 半截译文是 translating 状态，后端会把它当成真译文写进 PAK；
+    // 翻译期间按钮与文件树均被禁用，不会写盘、不会离开页面、也不会取消选中文件
     expect(tauri.writeFileEntries).not.toHaveBeenCalled();
     expect(useAppStore.getState().stage).toBe("files");
-    expect(mounted.container.textContent).toContain("翻译仍在进行中");
+    expect(useAppStore.getState().selectedFiles).toHaveLength(1);
   });
 
   it("翻译结束后可以正常写回（闸门不能挡住合法流程）", async () => {
@@ -248,9 +260,11 @@ describe("写回闸门（翻译进行中不得写回）", () => {
       status: "translating",
     });
 
-    // 这个窗口里打包 = 把半截译文写进 PAK，必须被拦住
+    // 这个窗口里打包 = 把半截译文写进 PAK，按钮必须保持禁用且被拦住
+    const packDuringCancel = findButton(mounted.container, "完成翻译，去打包")!;
+    expect(packDuringCancel.disabled).toBe(true);
     await act(async () => {
-      click(findButton(mounted.container, "完成翻译，去打包")!);
+      click(packDuringCancel);
     });
     await waitMs(0);
     expect(tauri.writeFileEntries).not.toHaveBeenCalled();
@@ -265,6 +279,7 @@ describe("写回闸门（翻译进行中不得写回）", () => {
     expect(storedEntry("g-0")).toMatchObject({ target: "", status: "pending" });
     expect(storedEntry("g-1")).toMatchObject({ target: "", status: "pending" });
     expect(useAppStore.getState().runToken).toBeNull();
+    expect(findButton(mounted.container, "完成翻译，去打包")!.disabled).toBe(false);
 
     // 回滚之后写回：translating 一律退回原文（target 为空 → 后端保留原文）
     await act(async () => {

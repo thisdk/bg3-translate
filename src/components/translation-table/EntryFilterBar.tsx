@@ -13,6 +13,8 @@ interface EntryFilterBarProps {
   onStyleHintChange: (value: string) => void;
   /** 没有可翻译条目时禁用搜索框 */
   disabled: boolean;
+  /** 翻译或加载进行中禁用语境提示编辑 */
+  busy?: boolean;
 }
 
 /** 搜索框 + 状态过滤 chips + 本次翻译的语境提示 */
@@ -25,6 +27,7 @@ export function EntryFilterBar({
   styleHint,
   onStyleHintChange,
   disabled,
+  busy = false,
 }: EntryFilterBarProps) {
   return (
     <>
@@ -60,6 +63,7 @@ export function EntryFilterBar({
           <Input
             value={styleHint}
             onChange={(e) => onStyleHintChange(e.target.value)}
+            disabled={disabled || busy}
             placeholder="本 MOD 语境：例如 XX 是姿势名称，相关名词按姿势类型翻译"
             className="h-8 pl-8 text-xs"
             aria-label="翻译风格提示"

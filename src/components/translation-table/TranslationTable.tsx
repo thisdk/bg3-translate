@@ -45,6 +45,7 @@ export function TranslationTable() {
 
   const { reset: resetEditing } = editing;
   const { resetSummary } = run;
+  const selectedKey = selectedFiles.map((f) => f.name).join("|");
 
   // 切换 MOD（workDir 变化）时重置界面态
   useEffect(() => {
@@ -55,13 +56,24 @@ export function TranslationTable() {
     resetEditing();
   }, [workDir, resetEditing, resetSummary]);
 
+  // 切换选中文件或开启翻译轮次时，收起尚未保存的行内编辑框
+  useEffect(() => {
+    resetEditing();
+  }, [selectedKey, resetEditing]);
+
+  useEffect(() => {
+    if (run.translating) {
+      resetEditing();
+    }
+  }, [run.translating, resetEditing]);
+
   if (selectedFiles.length === 0) {
     return (
       <Card variant="flat" className="flex h-full min-h-0 flex-col">
         <EmptyState
           icon={<Languages className="h-10 w-10" />}
           title="从左侧勾选本地化文件开始翻译"
-          description="支持勾选多个文件一起翻译；勾选后这里会列出所有可翻译条目。"
+          description="选择要翻译的本地化文件后，这里会列出该文件的所有可翻译条目。"
         />
       </Card>
     );
@@ -92,6 +104,7 @@ export function TranslationTable() {
           styleHint={styleHint}
           onStyleHintChange={setStyleHint}
           disabled={stats.total === 0}
+          busy={run.translating || loading}
         />
       </div>
 

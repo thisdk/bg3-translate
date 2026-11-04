@@ -107,10 +107,11 @@ function rowFor(index: number): HTMLElement {
   return row!;
 }
 
-/** 走真实 UI：点「编辑」→ 改 textarea → 点「保存」 */
+/** 走真实 UI（整轮翻译结束后）：点「编辑」→ 改 textarea → 点「保存」 */
 async function editRow(index: number, text: string): Promise<void> {
   const editButton = findButton(rowFor(index), "编辑");
   expect(editButton).not.toBeNull();
+  expect(editButton!.disabled).toBe(false);
   await act(async () => {
     click(editButton!);
   });
@@ -123,6 +124,21 @@ async function editRow(index: number, text: string): Promise<void> {
   expect(saveButton).not.toBeNull();
   await act(async () => {
     click(saveButton!);
+  });
+}
+
+/**
+ * 模拟条目处于人工编辑完成态（`edited`）。
+ * UI 层在翻译进行中已锁死行内「编辑/还原」按钮，这里直接走 store 更新以验证
+ * `useTranslationRun` 与 `app-store` 的底层「人工成果优先」并发防线仍然生效。
+ */
+async function markEditedInStore(id: string, text: string): Promise<void> {
+  await act(async () => {
+    useAppStore.getState().updateEntry(id, {
+      target: text,
+      status: "edited",
+      error: null,
+    });
   });
 }
 
@@ -162,12 +178,76 @@ async function streamBoth(send: (event: TranslationEvent) => void): Promise<void
   expect(storedEntry("e-1").target).toBe("半截 1");
 }
 
-describe("手工编辑与流式翻译并发", () => {
+describe("翻译期间的行内禁用与人工校对防线", () => {
+  it("翻译进行中禁用行内「编辑 / 还原 / 重试」与语境提示，整轮结束后才开放校对", async () => {
+    await renderTable();
+    const send = await startTranslation();
+    await act(async () => {
+      send({ type: "done", entryId: "e-0", text: "已翻好 0" });
+      send({
+        type: "error",
+        entryId: "e-1",
+        message: "结构校验未通过",
+      });
+      await Promise.resolve();
+    });
+
+    // 整轮还没结束（backend.finish 未返回）：所有行内操作按钮与语境提示均禁用，搜索框仍可用
+    expect(findButton(rowFor(0), "编辑")!.disabled).toBe(true);
+    expect(findButton(rowFor(0), "还原")!.disabled).toBe(true);
+    expect(findButton(rowFor(1), "重试")!.disabled).toBe(true);
+    expect(findButton(rowFor(1), "还原")!.disabled).toBe(true);
+    const styleInput = mounted.container.querySelector<HTMLInputElement>(
+      'input[aria-label="翻译风格提示"]',
+    )!;
+    const searchInput = mounted.container.querySelector<HTMLInputElement>(
+      'input[aria-label="搜索条目"]',
+    )!;
+    expect(styleInput.disabled).toBe(true);
+    expect(searchInput.disabled).toBe(false);
+
+    // 整轮翻译结束 → 按钮解除禁用，可以正常人工编辑
+    await act(async () => {
+      send({ type: "all_done", total: 2, failed: 1 });
+      backend.finish?.();
+      backend.finish = null;
+      await Promise.resolve();
+    });
+    await waitMs(0);
+
+    expect(findButton(rowFor(0), "编辑")!.disabled).toBe(false);
+    expect(findButton(rowFor(0), "还原")!.disabled).toBe(false);
+    expect(findButton(rowFor(1), "重试")!.disabled).toBe(false);
+    expect(styleInput.disabled).toBe(false);
+  });
+
+  it("开启新一轮翻译时自动收起尚未保存的行内编辑框", async () => {
+    backend.entries = [
+      { ...smallEntry("e-0"), target: "旧译文", status: "translated" },
+      smallEntry("e-1"),
+    ];
+    await renderTable();
+
+    // 先点开 e-0 的行内编辑框，不点保存
+    await act(async () => {
+      click(findButton(rowFor(0), "编辑")!);
+    });
+    expect(
+      rowFor(0).querySelector('textarea[aria-label="编辑译文"]'),
+    ).not.toBeNull();
+
+    // 启动翻译 → 未保存的编辑框自动收起
+    await startTranslation();
+    expect(
+      rowFor(0).querySelector('textarea[aria-label="编辑译文"]'),
+    ).toBeNull();
+  });
+
   it("保存之后到达的模型 delta 不得追加到用户译文上", async () => {
     await renderTable();
     const send = await startTranslation();
     await streamBoth(send);
-    await editRow(0, "用户手工译文");
+    await markEditedInStore("e-0", "用户手工译文");
     expect(storedEntry("e-0")).toMatchObject({
       target: "用户手工译文",
       status: "edited",
@@ -189,7 +269,7 @@ describe("手工编辑与流式翻译并发", () => {
     await renderTable();
     const send = await startTranslation();
     await streamBoth(send);
-    await editRow(0, "用户手工译文");
+    await markEditedInStore("e-0", "用户手工译文");
 
     await act(async () => {
       send({ type: "done", entryId: "e-0", text: "模型的权威译文" });
@@ -210,7 +290,7 @@ describe("手工编辑与流式翻译并发", () => {
     await renderTable();
     const send = await startTranslation();
     await streamBoth(send);
-    await editRow(0, "用户手工译文");
+    await markEditedInStore("e-0", "用户手工译文");
     expect(storedEntry("e-0")).toMatchObject({
       target: "用户手工译文",
       status: "edited",
@@ -242,11 +322,11 @@ describe("手工编辑与流式翻译并发", () => {
     });
   });
 
-  it("手工保存译文后，条目上不留上一轮的失败诊断", async () => {
+  it("整轮结束后手工保存译文，条目上不留上一轮的失败诊断", async () => {
     await renderTable();
     const send = await startTranslation();
 
-    // 这一轮以结构校验失败收尾：条目留下诊断文案
+    // 这一轮以结构校验失败收尾：条目留下诊断文案，并且整轮命令返回
     await act(async () => {
       send({ type: "progress", entryId: "e-0", status: "translating" });
       send({ type: "delta", entryId: "e-0", text: "坏译文" });
@@ -256,11 +336,14 @@ describe("手工编辑与流式翻译并发", () => {
         message: "大模型调用错误: 结构校验未通过：占位符 [1] 多出（已重试 1 次）",
       });
       send({ type: "all_done", total: 1, failed: 1 });
+      backend.finish?.();
+      backend.finish = null;
       await Promise.resolve();
     });
+    await waitMs(0);
     expect(storedEntry("e-0").error).toContain("占位符 [1] 多出");
 
-    // 用户手工改好并保存：错误已解决，诊断必须一起清掉
+    // 整轮翻译结束后，用户通过 UI 点「编辑 → 保存」：错误已解决，诊断必须一起清掉
     await editRow(0, "用户手工译文");
     expect(storedEntry("e-0")).toMatchObject({
       target: "用户手工译文",
@@ -273,7 +356,7 @@ describe("手工编辑与流式翻译并发", () => {
     await renderTable();
     const send = await startTranslation();
     await streamBoth(send);
-    await editRow(0, "用户手工译文");
+    await markEditedInStore("e-0", "用户手工译文");
 
     const cancelButton = findButton(mounted.container, "取消翻译");
     expect(cancelButton).not.toBeNull();

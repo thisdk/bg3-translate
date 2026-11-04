@@ -1,16 +1,12 @@
 import { useMemo } from "react";
 import {
-  Check,
   ChevronDown,
   FileText,
   Languages,
-  Minus,
   Package,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Card } from "@/components/ui/card";
-import { Checkbox, type CheckState } from "@/components/ui/checkbox";
-import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/ui/empty-state";
 import type { PakFile, PakFileKind } from "@/lib/types";
 
@@ -63,6 +59,10 @@ function buildTree(files: PakFile[]): TreeNode {
   return root;
 }
 
+function isEnglishName(name: string | null | undefined): boolean {
+  return (name ?? "").toLowerCase() === "english";
+}
+
 /** 收集一个节点（含子节点）下的所有文件 */
 function collectFiles(node: TreeNode): PakFile[] {
   if (node.file) return [node.file];
@@ -77,15 +77,14 @@ function TreeRow({
   node,
   depth,
   selectedPaths,
-  onToggleFile,
-  onToggleFiles,
+  disabled,
+  onSelectFile,
 }: {
   node: TreeNode;
   depth: number;
   selectedPaths: Set<string>;
-  onToggleFile: (file: PakFile) => void;
-  /** 整组勾选/取消（只回调一次，避免逐条回调互相覆盖） */
-  onToggleFiles: (files: PakFile[], checked: boolean) => void;
+  disabled: boolean;
+  onSelectFile: (file: PakFile) => void;
 }) {
   const isFolder = node.children.size > 0;
 
@@ -95,44 +94,26 @@ function TreeRow({
     childFiles.sort((a, b) => {
       const aFolder = a.children.size > 0 ? 0 : 1;
       const bFolder = b.children.size > 0 ? 0 : 1;
-      return aFolder - bFolder || a.name.localeCompare(b.name);
+      if (aFolder !== bFolder) return aFolder - bFolder;
+      const aEn = isEnglishName(a.file?.language ?? a.name) ? 0 : 1;
+      const bEn = isEnglishName(b.file?.language ?? b.name) ? 0 : 1;
+      if (aEn !== bEn) return aEn - bEn;
+      return a.name.localeCompare(b.name);
     });
 
-    // 计算文件夹的三态
     const filesInFolder = collectFiles(node);
-    const checkedCount = filesInFolder.filter((f) =>
-      selectedPaths.has(f.name),
-    ).length;
-    const folderState: CheckState =
-      checkedCount === 0
-        ? "unchecked"
-        : checkedCount === filesInFolder.length
-          ? "checked"
-          : "indeterminate";
-
-    const toggleFolder = () => {
-      // indeterminate 或 unchecked → 全选；checked → 全不选。
-      // 整组操作只回调一次：逐条调用会拿到同一份陈旧 props，
-      // 取消全选时最后一次回调会把前面的取消结果覆盖掉。
-      onToggleFiles(filesInFolder, folderState !== "checked");
-    };
 
     return (
       <div>
         <div
-          className="grid w-full grid-cols-[14px_auto_16px_minmax(0,1fr)_42px] items-center gap-1 rounded px-2 py-1 text-sm hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+          className="grid w-full grid-cols-[14px_16px_minmax(0,1fr)_auto] items-center gap-1.5 rounded px-2 py-1 text-sm text-muted-foreground"
           style={{ paddingLeft: depth * 16 + 4 }}
         >
-          <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
-          <Checkbox
-            state={folderState}
-            onToggle={toggleFolder}
-            aria-label={`${folderState === "checked" ? "取消全选" : "全选"} ${node.name}`}
-          />
-          <Package className="h-4 w-4 text-muted-foreground" />
-          <span className="min-w-0 truncate">{node.name}</span>
-          <span className="text-right text-[10px] tabular-nums text-muted-foreground">
-            {checkedCount}/{filesInFolder.length}
+          <ChevronDown className="h-3.5 w-3.5 shrink-0" />
+          <Package className="h-4 w-4 shrink-0" />
+          <span className="min-w-0 truncate text-foreground">{node.name}</span>
+          <span className="text-right text-[10px] tabular-nums">
+            {filesInFolder.length}
           </span>
         </div>
         {childFiles.map((child) => (
@@ -141,8 +122,8 @@ function TreeRow({
             node={child}
             depth={depth + 1}
             selectedPaths={selectedPaths}
-            onToggleFile={onToggleFile}
-            onToggleFiles={onToggleFiles}
+            disabled={disabled}
+            onSelectFile={onSelectFile}
           />
         ))}
       </div>
@@ -154,28 +135,43 @@ function TreeRow({
   return (
     <div
       className={cn(
-        "flex w-full items-center gap-2 rounded px-2 py-1 text-sm hover:bg-accent",
-        "cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
-        checked && "bg-accent",
+        "flex w-full items-center gap-2 rounded px-2 py-1 text-sm transition-colors",
+        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+        checked && "bg-accent font-medium",
+        disabled
+          ? "cursor-not-allowed opacity-50"
+          : "cursor-pointer hover:bg-accent",
       )}
       style={{ paddingLeft: depth * 16 + 20 }}
-      onClick={() => onToggleFile(file)}
+      onClick={() => {
+        if (!disabled) onSelectFile(file);
+      }}
       onKeyDown={(event) => {
+        if (disabled) return;
         if (event.key === "Enter" || event.key === " ") {
           event.preventDefault();
-          onToggleFile(file);
+          onSelectFile(file);
         }
       }}
-      role="button"
-      tabIndex={0}
-      aria-pressed={checked}
-      title={file.name}
+      role="radio"
+      aria-checked={checked}
+      aria-disabled={disabled || undefined}
+      aria-label={`选择 ${node.name}`}
+      tabIndex={disabled ? -1 : 0}
+      title={disabled ? `${file.name}（翻译进行中，无法切换文件）` : file.name}
+      data-file-path={file.name}
     >
-      <Checkbox
-        state={checked ? "checked" : "unchecked"}
-        onToggle={() => onToggleFile(file)}
-        aria-label={`选择 ${node.name}`}
-      />
+      <span
+        aria-hidden
+        className={cn(
+          "flex h-4 w-4 shrink-0 items-center justify-center rounded-full border transition-colors",
+          checked
+            ? "border-primary bg-primary text-primary-foreground"
+            : "border-input bg-background",
+        )}
+      >
+        {checked && <span className="h-1.5 w-1.5 rounded-full bg-current" />}
+      </span>
       {KIND_ICON[file.kind] ?? (
         <FileText className="h-4 w-4 text-muted-foreground" />
       )}
@@ -198,12 +194,15 @@ export function FileTree({
   files,
   selectedFiles,
   onSelectionChange,
+  disabled = false,
 }: {
   files: PakFile[];
-  /** 已选中的文件列表 */
+  /** 已选中的文件列表（单选：长度为 0 或 1） */
   selectedFiles: PakFile[];
   /** 选中状态变化回调 */
   onSelectionChange: (files: PakFile[]) => void;
+  /** 翻译进行中禁用文件切换 */
+  disabled?: boolean;
 }) {
   // 只展示本地化文件（隐藏元数据、脚本、数据等）
   const locFiles = useMemo(
@@ -212,6 +211,9 @@ export function FileTree({
         .filter((f) => LOCALIZATION_KINDS.includes(f.kind))
         // 按语言排序：英文优先，其余按字母序
         .sort((a, b) => {
+          const aEn = isEnglishName(a.language) ? 0 : 1;
+          const bEn = isEnglishName(b.language) ? 0 : 1;
+          if (aEn !== bEn) return aEn - bEn;
           const la = a.language ?? "zzz";
           const lb = b.language ?? "zzz";
           if (la !== lb) return la.localeCompare(lb);
@@ -226,46 +228,18 @@ export function FileTree({
     [selectedFiles],
   );
 
-  const onToggleFile = (file: PakFile) => {
-    if (selectedPaths.has(file.name)) {
-      onSelectionChange(selectedFiles.filter((f) => f.name !== file.name));
+  const onSelectFile = (file: PakFile) => {
+    if (disabled) return;
+    if (selectedPaths.has(file.name) && selectedFiles.length === 1) {
+      onSelectionChange([]);
     } else {
-      onSelectionChange([...selectedFiles, file]);
+      onSelectionChange([file]);
     }
-  };
-
-  /**
-   * 整组勾选 / 取消：一次算出结果并只回调一次。
-   * （逐条 onToggleFile 会读到同一份陈旧 props，多文件取消时会互相覆盖。）
-   */
-  const onToggleFiles = (files: PakFile[], checked: boolean) => {
-    const groupNames = new Set(files.map((f) => f.name));
-    if (!checked) {
-      onSelectionChange(selectedFiles.filter((f) => !groupNames.has(f.name)));
-      return;
-    }
-    // 已选中的保持原顺序，组内新勾选的按文件树顺序追加
-    const next = [...selectedFiles];
-    const picked = new Set(next.map((f) => f.name));
-    for (const file of files) {
-      if (!picked.has(file.name)) {
-        picked.add(file.name);
-        next.push(file);
-      }
-    }
-    onSelectionChange(next);
-  };
-
-  const allSelected = locFiles.length > 0 && selectedFiles.length === locFiles.length;
-  const noneSelected = selectedFiles.length === 0;
-
-  const toggleAll = () => {
-    onSelectionChange(allSelected ? [] : locFiles);
   };
 
   return (
     <Card variant="flat" className="flex h-full flex-col">
-      <div className="grid h-[104px] grid-rows-[1fr_32px] border-b p-3">
+      <div className="border-b p-3">
         <div className="flex items-center justify-between">
           <div>
             <h3 className="text-sm font-semibold">本地化文件</h3>
@@ -274,35 +248,12 @@ export function FileTree({
             </p>
           </div>
         </div>
-        {locFiles.length > 0 && (
-          <Button
-            size="sm"
-            variant={allSelected ? "default" : "outline"}
-            className="h-8 w-full"
-            onClick={toggleAll}
-          >
-            {/* 装饰性三态指示，避免 button 嵌套 button */}
-            <span
-              aria-hidden
-              className={cn(
-                "flex h-4 w-4 shrink-0 items-center justify-center rounded border",
-                allSelected || !noneSelected
-                  ? "border-primary bg-primary text-primary-foreground"
-                  : "border-input bg-background",
-              )}
-            >
-              {allSelected ? (
-                <Check className="h-3 w-3" strokeWidth={3} />
-              ) : noneSelected ? null : (
-                <Minus className="h-3 w-3" strokeWidth={3} />
-              )}
-            </span>
-            {allSelected ? "取消全选" : "全选"}
-            <span className="tabular-nums opacity-70">({locFiles.length})</span>
-          </Button>
-        )}
       </div>
-      <div className="flex-1 overflow-auto p-1">
+      <div
+        className="flex-1 overflow-auto p-1"
+        role="radiogroup"
+        aria-label="选择要翻译的本地化文件"
+      >
         {locFiles.length === 0 ? (
           <EmptyState
             icon={<Languages className="h-8 w-8" />}
@@ -316,8 +267,8 @@ export function FileTree({
               node={node}
               depth={0}
               selectedPaths={selectedPaths}
-              onToggleFile={onToggleFile}
-              onToggleFiles={onToggleFiles}
+              disabled={disabled}
+              onSelectFile={onSelectFile}
             />
           ))
         )}

@@ -71,13 +71,13 @@ pub fn resolve_data_dir(
             };
         }
     }
-    if let Some(dir) = exe_dir {
-        if exe_dir_writable {
-            return DataDir {
-                path: dir.join(PORTABLE_DIR_NAME),
-                source: DataDirSource::Portable,
-            };
-        }
+    if let Some(dir) = exe_dir
+        && exe_dir_writable
+    {
+        return DataDir {
+            path: dir.join(PORTABLE_DIR_NAME),
+            source: DataDirSource::Portable,
+        };
     }
     DataDir {
         path: system_dir.to_path_buf(),

@@ -23,11 +23,11 @@ pub async fn open_mod(state: State<'_, AppState>, file_path: String) -> Result<E
 
     // 记下新工作目录，并把上一个目录删掉（每次都是新建的唯一目录，
     // 相同只可能出现在极端并发下，所以顺手判一下再删）
-    if let Some(previous) = state.replace_work_dir(PathBuf::from(&work_dir)) {
-        if previous.as_os_str() != work_dir.as_str() {
-            log::info!("清理上一个工作目录: {}", previous.display());
-            pak::remove_work_dir(&previous);
-        }
+    if let Some(previous) = state.replace_work_dir(PathBuf::from(&work_dir))
+        && previous.as_os_str() != work_dir.as_str()
+    {
+        log::info!("清理上一个工作目录: {}", previous.display());
+        pak::remove_work_dir(&previous);
     }
 
     Ok(ExtractResult { work_dir, files })

@@ -1,36 +1,39 @@
 import * as React from "react";
 import { cn } from "@/lib/utils";
 
-interface ProgressProps extends React.HTMLAttributes<HTMLDivElement> {
+interface ProgressProps extends React.ComponentProps<"div"> {
   value?: number;
   max?: number;
 }
 
-const Progress = React.forwardRef<HTMLDivElement, ProgressProps>(
-  ({ className, value = 0, max = 100, ...props }, ref) => {
-    const pct = Math.min(100, Math.max(0, (value / max) * 100));
-    return (
+function Progress({
+  className,
+  value = 0,
+  max = 100,
+  ref,
+  ...props
+}: ProgressProps) {
+  const pct = Math.min(100, Math.max(0, (value / max) * 100));
+  return (
+    <div
+      ref={ref}
+      // 无障碍：进度条必须带 role/aria-value*，否则屏幕阅读器读不出翻译进度
+      role="progressbar"
+      aria-valuemin={0}
+      aria-valuemax={max}
+      aria-valuenow={value}
+      className={cn(
+        "relative h-2 w-full overflow-hidden rounded-full bg-secondary",
+        className,
+      )}
+      {...props}
+    >
       <div
-        ref={ref}
-        // 无障碍：进度条必须带 role/aria-value*，否则屏幕阅读器读不出翻译进度
-        role="progressbar"
-        aria-valuemin={0}
-        aria-valuemax={max}
-        aria-valuenow={value}
-        className={cn(
-          "relative h-2 w-full overflow-hidden rounded-full bg-secondary",
-          className,
-        )}
-        {...props}
-      >
-        <div
-          className="h-full bg-primary transition-all duration-300 ease-out"
-          style={{ width: `${pct}%` }}
-        />
-      </div>
-    );
-  },
-);
-Progress.displayName = "Progress";
+        className="h-full bg-primary transition-all duration-300 ease-out"
+        style={{ width: `${pct}%` }}
+      />
+    </div>
+  );
+}
 
 export { Progress };

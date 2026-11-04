@@ -3,12 +3,12 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { readTextFile } from "@tauri-apps/plugin-fs";
 import {
   Check,
-  Edit3,
-  Loader2,
+  LoaderCircle,
+  PenLine,
   Plus,
   RotateCcw,
   Search,
-  Trash2,
+  Trash,
   Upload,
   X,
 } from "lucide-react";
@@ -307,7 +307,7 @@ export function GlossaryPanel({
       <div className="min-h-0 flex-1 overflow-auto">
         {loading ? (
           <EmptyState
-            icon={<Loader2 className="h-6 w-6 animate-spin" />}
+            icon={<LoaderCircle className="h-6 w-6 animate-spin" />}
             title="加载术语表…"
           />
         ) : visible.length === 0 ? (
@@ -364,7 +364,7 @@ export function GlossaryPanel({
                           aria-label={`编辑术语 ${t.source}`}
                           title="编辑"
                         >
-                          <Edit3 className="h-3 w-3" />
+                          <PenLine className="h-3 w-3" />
                         </Button>
                         {t.sourceKind !== "official" && (
                           <Button
@@ -376,7 +376,7 @@ export function GlossaryPanel({
                             aria-label={`删除术语 ${t.source}`}
                             title="删除"
                           >
-                            <Trash2 className="h-3 w-3" />
+                            <Trash className="h-3 w-3" />
                           </Button>
                         )}
                       </div>

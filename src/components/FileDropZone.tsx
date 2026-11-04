@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { DragDropEvent } from "@tauri-apps/api/webview";
-import { Archive, CheckCircle2, FolderOpen, Loader2 } from "lucide-react";
+import { Archive, CircleCheck, FolderOpen, LoaderCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import {
@@ -187,7 +187,7 @@ export function FileDropZone({ className }: { className?: string }) {
           }`}
         >
           {busy ? (
-            <Loader2 className="h-12 w-12 animate-spin text-primary" />
+            <LoaderCircle className="h-12 w-12 animate-spin text-primary" />
           ) : (
             <FolderOpen className="h-12 w-12 text-primary" />
           )}
@@ -235,7 +235,7 @@ export function FileDropZone({ className }: { className?: string }) {
         )}
         {extractResult && (
           <div className="flex max-w-xl items-start gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-left text-xs leading-5">
-            <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
+            <CircleCheck className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
             <div className="min-w-0">
               <div className="font-medium text-foreground">
                 已解压 {extractResult.count} 个文件

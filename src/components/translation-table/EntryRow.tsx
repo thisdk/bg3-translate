@@ -1,5 +1,5 @@
 import { memo } from "react";
-import { AlertCircle, Check, Edit3, Eraser, Loader2, RotateCcw, X } from "lucide-react";
+import { CircleAlert, Check, Eraser, LoaderCircle, PenLine, RotateCcw, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -55,10 +55,10 @@ export const EntryRow = memo(function EntryRow({
           <span className="text-[10px] text-muted-foreground">原文</span>
           <Badge variant={meta.variant} className="text-[10px]">
             {entry.status === "translating" && (
-              <Loader2 className="mr-1 h-2.5 w-2.5 animate-spin" />
+              <LoaderCircle className="mr-1 h-2.5 w-2.5 animate-spin" />
             )}
             {entry.status === "error" && (
-              <AlertCircle className="mr-1 h-2.5 w-2.5" />
+              <CircleAlert className="mr-1 h-2.5 w-2.5" />
             )}
             {meta.label}
           </Badge>
@@ -127,7 +127,7 @@ export const EntryRow = memo(function EntryRow({
                     disabled={busy}
                     title={busy ? "请等待本轮翻译结束后再人工校对" : undefined}
                   >
-                    <Edit3 className="h-3 w-3" />
+                    <PenLine className="h-3 w-3" />
                     编辑
                   </Button>
                 )}

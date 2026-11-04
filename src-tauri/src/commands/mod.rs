@@ -176,17 +176,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&b);
     }
 
-    /// 大小写：Linux 敏感（本机行为），Windows 不敏感。
+    /// 大小写：与当前文件系统大小写敏感性一致（Windows / macOS 默认不敏感，Linux 敏感）。
     #[test]
     fn same_dir_case_sensitivity_matches_platform() {
         let dir = temp_dir("case");
         let upper = dir.to_string_lossy().to_uppercase();
-        if cfg!(windows) {
+        if cfg!(windows) || Path::new(&upper).exists() {
             assert!(is_same_dir(&dir, Path::new(&upper)));
         } else {
             assert!(
                 !is_same_dir(&dir, Path::new(&upper)),
-                "Linux 上大小写不同就是不同目录"
+                "大小写敏感文件系统上大小写不同就是不同目录"
             );
         }
         let _ = std::fs::remove_dir_all(&dir);

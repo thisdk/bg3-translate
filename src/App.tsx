@@ -1,7 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import {
   ArrowLeft,
-  CheckCircle2,
+  CircleCheck,
   ChevronRight,
   FileArchive,
   GripVertical,
@@ -161,7 +161,7 @@ function FilesPage() {
                 : undefined
             }
           >
-            <CheckCircle2 className="h-4 w-4" />
+            <CircleCheck className="h-4 w-4" />
             完成翻译，去打包
           </Button>
         </div>
@@ -255,7 +255,7 @@ function DonePage() {
               {outputPath ? (
                 <div className="flex h-full min-w-0 flex-col">
                   <div className="flex items-center gap-2 text-sm font-medium text-emerald-600 dark:text-emerald-400">
-                    <CheckCircle2 className="h-4 w-4" />
+                    <CircleCheck className="h-4 w-4" />
                     打包完成
                   </div>
                   <div className="mt-3 min-h-0 flex-1 overflow-auto break-all text-sm leading-6 text-muted-foreground">

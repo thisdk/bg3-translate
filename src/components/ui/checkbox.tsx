@@ -5,13 +5,20 @@ import { cn } from "@/lib/utils";
 type CheckState = "unchecked" | "checked" | "indeterminate";
 
 interface CheckboxProps
-  extends Omit<React.ButtonHTMLAttributes<HTMLButtonElement>, "onChange"> {
+  extends Omit<React.ComponentProps<"button">, "onChange"> {
   state?: CheckState;
   onToggle?: () => void;
 }
 
-const Checkbox = React.forwardRef<HTMLButtonElement, CheckboxProps>(
-  ({ className, state = "unchecked", onToggle, disabled, ...props }, ref) => (
+function Checkbox({
+  className,
+  state = "unchecked",
+  onToggle,
+  disabled,
+  ref,
+  ...props
+}: CheckboxProps) {
+  return (
     <button
       ref={ref}
       type="button"
@@ -39,9 +46,8 @@ const Checkbox = React.forwardRef<HTMLButtonElement, CheckboxProps>(
         <Minus className="h-3 w-3" strokeWidth={3} />
       )}
     </button>
-  ),
-);
-Checkbox.displayName = "Checkbox";
+  );
+}
 
 export { Checkbox };
 export type { CheckState };

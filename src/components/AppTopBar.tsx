@@ -1,6 +1,6 @@
 import {
   BookOpen,
-  CheckCircle2,
+  CircleCheck,
   ChevronRight,
   Languages,
   Minus,
@@ -26,7 +26,7 @@ import { THEMES } from "@/store/app-store";
 const STEPS: { stage: AppStage; label: string; icon: React.ReactNode }[] = [
   { stage: "home", label: "选择 MOD", icon: <Package className="h-4 w-4" /> },
   { stage: "files", label: "翻译", icon: <Languages className="h-4 w-4" /> },
-  { stage: "done", label: "打包", icon: <CheckCircle2 className="h-4 w-4" /> },
+  { stage: "done", label: "打包", icon: <CircleCheck className="h-4 w-4" /> },
 ];
 
 function Stepper() {

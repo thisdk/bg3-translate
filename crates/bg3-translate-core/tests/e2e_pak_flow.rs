@@ -267,8 +267,8 @@ fn zip_wrapped_mod_is_unwrapped_transparently() {
     {
         let file = fs::File::create(&zip_path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
-        let options: zip::write::FileOptions<'_, ()> =
-            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
 
         zip.start_file("README.txt", options).unwrap();
         zip.write_all(b"install me").unwrap();

@@ -1,6 +1,6 @@
 import * as React from "react";
 import { cva, type VariantProps } from "class-variance-authority";
-import { Loader2 } from "lucide-react";
+import { LoaderCircle } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const buttonVariants = cva(
@@ -33,17 +33,23 @@ const buttonVariants = cva(
 );
 
 export interface ButtonProps
-  extends React.ButtonHTMLAttributes<HTMLButtonElement>,
+  extends React.ComponentProps<"button">,
     VariantProps<typeof buttonVariants> {
   /** 统一 loading 态：自动禁用并显示 spinner */
   loading?: boolean;
 }
 
-const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
-  (
-    { className, variant, size, loading = false, disabled, children, ...props },
-    ref,
-  ) => (
+function Button({
+  className,
+  variant,
+  size,
+  loading = false,
+  disabled,
+  children,
+  ref,
+  ...props
+}: ButtonProps) {
+  return (
     <button
       className={cn(buttonVariants({ variant, size, className }))}
       ref={ref}
@@ -51,11 +57,10 @@ const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
       aria-busy={loading || undefined}
       {...props}
     >
-      {loading && <Loader2 className="animate-spin" aria-hidden />}
+      {loading && <LoaderCircle className="animate-spin" aria-hidden />}
       {children}
     </button>
-  ),
-);
-Button.displayName = "Button";
+  );
+}
 
 export { Button, buttonVariants };

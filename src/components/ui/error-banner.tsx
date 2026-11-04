@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { AlertTriangle, Check, ChevronDown, ChevronUp, Copy, X } from "lucide-react";
+import { Check, ChevronDown, ChevronUp, Copy, TriangleAlert, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -85,7 +85,7 @@ export function ErrorBanner({
       )}
     >
       <div className={cn("flex items-start gap-2", compact ? "px-3 py-2" : "px-4 py-2.5")}>
-        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
+        <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
         <div className="min-w-0 flex-1">
           <div className="text-xs font-semibold">出错了</div>
           <ul

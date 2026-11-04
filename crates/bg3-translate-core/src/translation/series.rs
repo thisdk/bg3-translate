@@ -124,10 +124,10 @@ pub fn build_consistency_memory(entries: &[TranslationEntry]) -> HashMap<String,
             continue;
         }
         add_consistency_term(&mut memory, &entry.source, &entry.target);
-        if let Some(variant) = split_series_variant(&entry.source) {
-            if let Some(base_target) = strip_target_suffix(&entry.target, &variant.suffix) {
-                add_consistency_term(&mut memory, &variant.base, &base_target);
-            }
+        if let Some(variant) = split_series_variant(&entry.source)
+            && let Some(base_target) = strip_target_suffix(&entry.target, &variant.suffix)
+        {
+            add_consistency_term(&mut memory, &variant.base, &base_target);
         }
     }
     memory

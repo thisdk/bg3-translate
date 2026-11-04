@@ -14,20 +14,20 @@ resolver = "3"
 [workspace.package]
 version = "1.5.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.90"
 license = "MIT"
 authors = ["thisdk"]
 repository = "https://github.com/thisdk/bg3-translate"
 
 [workspace.dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = "1.0.154"
 thiserror = "2.0.21"
-log = "0.4.34"
+log = "0.4.35"
 regex = "1.13.1"
 aho-corasick = "1.1.5"
 quick-xml = "0.42.0"
-zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+zip = { version = "9.3.0", default-features = false, features = ["deflate"] }
 bg3rustpaklib = "0.1.5"
 
 # LLM：只借 OpenAI 兼容协议的**类型定义**，不借它的 HTTP 客户端。
@@ -37,19 +37,19 @@ bg3rustpaklib = "0.1.5"
 # 实测：`Cargo.lock` 比对下来，本仓库依赖图的增量是 7 个包（async-openai +
 # derive_builder 一脉 + darling 一脉）；改开自带 HTTP 客户端的 `chat-completion`
 # 特性集则是 35 个包。
-async-openai = { version = "0.42.0", default-features = false, features = [
+async-openai = { version = "0.43.0", default-features = false, features = [
     "chat-completion-types",
 ] }
-tokio = { version = "1.53.1", features = ["sync", "time", "macros"] }
+tokio = { version = "1.54.1", features = ["sync", "time", "macros"] }
 futures-util = "0.3.34"
 directories = "6.0.0"
-tempfile = "3"
+tempfile = "3.27.0"
 
-tauri = "2.11.6"
-tauri-build = "2.6.3"
-tauri-plugin-dialog = "2.7.3"
-tauri-plugin-fs = "2.5.2"
-tauri-plugin-log = "2.9.2"
+tauri = "2.12.5"
+tauri-build = "2.7.4"
+tauri-plugin-dialog = "2.8.4"
+tauri-plugin-fs = "2.7.1"
+tauri-plugin-log = "2.10.1"
 
 # ── 发布配置 ──
 # 只发布 Windows，产物用 LTO + 体积优化，尽量压小安装包。

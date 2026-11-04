@@ -1,6 +1,9 @@
 import { useEffect, useRef } from "react";
-import { useVirtualizer } from "@tanstack/react-virtual";
-import { Languages, Loader2, Search } from "lucide-react";
+import {
+  observeElementRect,
+  useVirtualizer,
+} from "@tanstack/react-virtual";
+import { Languages, LoaderCircle, Search } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/ui/empty-state";
 import { ESTIMATED_ROW_HEIGHT } from "./constants";
@@ -58,6 +61,15 @@ export function EntryList({
     getScrollElement: () => scrollRef.current,
     estimateSize: () => ESTIMATED_ROW_HEIGHT,
     overscan: 8,
+    initialRect: { width: 800, height: ESTIMATED_ROW_HEIGHT * 5 },
+    observeElementRect: (instance, cb) =>
+      observeElementRect(instance, (rect) => {
+        const el = instance.scrollElement;
+        cb({
+          width: rect.width || el?.offsetWidth || 800,
+          height: rect.height || el?.offsetHeight || ESTIMATED_ROW_HEIGHT * 5,
+        });
+      }),
     getItemKey: (index) => visibleEntries[index]?.id ?? index,
   });
 
@@ -74,7 +86,7 @@ export function EntryList({
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-auto">
         {loading ? (
           <EmptyState
-            icon={<Loader2 className="h-6 w-6 animate-spin" />}
+            icon={<LoaderCircle className="h-6 w-6 animate-spin" />}
             title="加载条目…"
           />
         ) : total === 0 ? (

@@ -508,12 +508,12 @@ fn keep_placeholders(text: &str) -> String {
             '[' => Some(']'),
             _ => None,
         };
-        if let Some(closer) = closer {
-            if let Some(offset) = chars[index..].iter().position(|c| *c == closer) {
-                out.extend(&chars[index..=index + offset]);
-                index += offset + 1;
-                continue;
-            }
+        if let Some(closer) = closer
+            && let Some(offset) = chars[index..].iter().position(|c| *c == closer)
+        {
+            out.extend(&chars[index..=index + offset]);
+            index += offset + 1;
+            continue;
         }
         if !out.ends_with('字') {
             out.push('字');

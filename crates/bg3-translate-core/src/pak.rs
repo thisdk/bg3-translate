@@ -410,15 +410,17 @@ fn extract_zip_to_find_pak_limited(
         let mut entry = archive
             .by_index(i)
             .map_err(|e| AppError::pak(format!("读取 zip 条目失败: {e}")))?;
+        let entry_name = entry
+            .name()
+            .map(std::borrow::Cow::into_owned)
+            .unwrap_or_else(|_| String::from_utf8_lossy(entry.name_raw()).into_owned());
 
         // ① 先看声明大小：压缩炸弹的声明通常就是几 GB，连文件都不用创建
         let declared = entry.size();
         if declared > limits.max_entry_bytes {
             return Err(AppError::pak(format!(
                 "zip 条目 {} 声明解压后 {} 字节，超过单文件上限 {}，已中止解压",
-                entry.name(),
-                declared,
-                limits.max_entry_bytes
+                entry_name, declared, limits.max_entry_bytes
             )));
         }
         if written_total.saturating_add(declared) > limits.max_total_bytes {
@@ -430,7 +432,7 @@ fn extract_zip_to_find_pak_limited(
 
         // enclosed_name() 已经过滤了 `..` 与绝对路径
         let Some(relative) = entry.enclosed_name() else {
-            log::warn!("跳过 zip 中的危险路径: {}", entry.name());
+            log::warn!("跳过 zip 中的危险路径: {}", entry_name);
             continue;
         };
         let output_path = zip_extract.join(relative);
@@ -452,15 +454,23 @@ fn extract_zip_to_find_pak_limited(
         let entry_budget = limits.max_entry_bytes;
         let budget = total_budget.min(entry_budget);
         let mut limited = std::io::Read::take(&mut entry, budget.saturating_add(1));
-        let copied = std::io::copy(&mut limited, &mut output)?;
+        let copied = match std::io::copy(&mut limited, &mut output) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                drop(output);
+                let _ = std::fs::remove_file(&output_path);
+                return Err(AppError::pak(format!(
+                    "zip 条目 {entry_name} 解压失败（可能超过单文件上限或声明大小与内容不符）: {err}"
+                )));
+            }
+        };
         drop(output);
         if copied > entry_budget {
             // 及时收尾：失败时不要在工作目录里留下一个已经写了几 GB 的文件
             let _ = std::fs::remove_file(&output_path);
             return Err(AppError::pak(format!(
                 "zip 条目 {} 实际解压超过单文件上限 {} 字节，已中止解压（声明大小与内容不符）",
-                entry.name(),
-                limits.max_entry_bytes
+                entry_name, limits.max_entry_bytes
             )));
         }
         if copied > total_budget {
@@ -468,8 +478,7 @@ fn extract_zip_to_find_pak_limited(
             let _ = std::fs::remove_file(&output_path);
             return Err(AppError::pak(format!(
                 "zip 条目 {} 解压超过总量上限 {} 字节，已中止解压（疑似压缩炸弹）",
-                entry.name(),
-                limits.max_total_bytes
+                entry_name, limits.max_total_bytes
             )));
         }
         written_total += copied;
@@ -692,10 +701,10 @@ pub fn repack(work_dir: &str, output_path: &str) -> Result<()> {
     }
 
     let output = Path::new(output_path);
-    if let Some(parent) = output.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
 
     let priority = read_priority(work_dir);
@@ -795,14 +804,14 @@ fn collect_pack_files(root: &Path) -> Result<Vec<(PathBuf, String)>> {
                 .map(str::to_owned);
             // 只在能拿到 UTF-8 文件名时判定：判不出来就照常打包
             // （漏打用户内容是比多打一个临时文件严重得多的错误）。
-            if let Some(name) = file_name {
-                if crate::config::is_atomic_temp_name(&name) {
-                    log::warn!(
-                        "跳过原子写残留的临时文件（不打包，可能是上次写回失败/进程被杀留下的）: {}",
-                        archive_path
-                    );
-                    continue;
-                }
+            if let Some(name) = file_name
+                && crate::config::is_atomic_temp_name(&name)
+            {
+                log::warn!(
+                    "跳过原子写残留的临时文件（不打包，可能是上次写回失败/进程被杀留下的）: {}",
+                    archive_path
+                );
+                continue;
             }
             out.push((path, archive_path));
         }
@@ -1475,7 +1484,7 @@ mod tests {
         {
             let file = std::fs::File::create(&zip_path).unwrap();
             let mut writer = zip::ZipWriter::new(file);
-            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            let options: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated);
             writer.start_file("bomb.bin", options).unwrap();
             let chunk = vec![0u8; 1 << 20];
@@ -1523,7 +1532,7 @@ mod tests {
         {
             let file = std::fs::File::create(&zip_path).unwrap();
             let mut writer = zip::ZipWriter::new(file);
-            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            let options: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated);
             let chunk = vec![0u8; 600 * 1024];
             for name in ["a.bin", "b.bin"] {
@@ -1581,7 +1590,7 @@ mod tests {
         {
             let file = std::fs::File::create(&zip_path).unwrap();
             let mut writer = zip::ZipWriter::new(file);
-            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            let options: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated);
             writer.start_file("liar.bin", options).unwrap();
             std::io::Write::write_all(&mut writer, &vec![0u8; 4 << 20]).unwrap();
@@ -1632,7 +1641,7 @@ mod tests {
         {
             let file = std::fs::File::create(&zip_path).unwrap();
             let mut writer = zip::ZipWriter::new(file);
-            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            let options: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default();
             for i in 0..3 {
                 writer.start_file(format!("f{i}.txt"), options).unwrap();
                 std::io::Write::write_all(&mut writer, b"x").unwrap();
@@ -1675,7 +1684,7 @@ mod tests {
         {
             let file = std::fs::File::create(&zip_path).unwrap();
             let mut writer = zip::ZipWriter::new(file);
-            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            let options: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated);
             writer.start_file("bomb.bin", options).unwrap();
             std::io::Write::write_all(&mut writer, &vec![0u8; 4 << 20]).unwrap();
@@ -1746,7 +1755,7 @@ mod tests {
         {
             let file = std::fs::File::create(&zip_path).unwrap();
             let mut writer = zip::ZipWriter::new(file);
-            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default()
+            let options: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated);
             writer.start_file("README.txt", options).unwrap();
             std::io::Write::write_all(&mut writer, b"install me").unwrap();
